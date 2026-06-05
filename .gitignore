@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+dist/
+output/
+tmp/
+config/production.json
+config/desktop.local.json

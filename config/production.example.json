@@ -1,0 +1,6 @@
+{
+  "SOFT_ACCOUNT_PROVIDER": "newapi",
+  "SOFT_MODEL_GPT_BASE_URL": "https://smoke2.learn-flow.cn/v1",
+  "SOFT_MODEL_GPT_API_KEY": "sk-your-newapi-token",
+  "SOFT_MODEL_GPT_NAME": "gpt-4o-mini"
+}

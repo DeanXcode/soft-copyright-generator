@@ -1,0 +1,24 @@
+{
+  "name": "soft-copyright-generator-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "desktop/electron/main.cjs",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "mock:account": "node mock-account-server.cjs",
+    "mock:gateway": "node mock-account-server.cjs",
+    "preview": "vite preview --host 127.0.0.1",
+    "electron": "electron ."
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.1.1",
+    "electron": "^39.2.7",
+    "lucide-react": "^0.556.0",
+    "vite": "^7.2.7",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
+  "devDependencies": {}
+}
