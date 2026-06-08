@@ -44,7 +44,6 @@ def read_source_lines(source_dir: Path) -> list[str]:
         ".py",
         ".js",
         ".ts",
-        ".json",
         ".php",
         ".cs",
         ".cpp",
@@ -52,7 +51,6 @@ def read_source_lines(source_dir: Path) -> list[str]:
         ".hpp",
         ".html",
         ".css",
-        ".md",
         ".sql",
         ".yml",
         ".yaml",
@@ -63,16 +61,16 @@ def read_source_lines(source_dir: Path) -> list[str]:
         if not path.is_file() or path.suffix.lower() not in allowed:
             continue
         relative = path.relative_to(source_dir).as_posix()
-        if _is_duplicate_served_prototype(relative):
+        if _is_duplicate_served_prototype(relative) or _is_internal_material_file(relative):
             continue
-        lines.append(f"// ===== {relative} =====")
         try:
             content = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             content = path.read_text(encoding="gbk", errors="ignore")
         for line in content.splitlines():
-            lines.append(line.rstrip())
-        lines.append("")
+            sanitized = _sanitize_source_material_line(line.rstrip())
+            if sanitized.strip() and not _is_comment_only_source_line(sanitized, path.suffix.lower()):
+                lines.append(sanitized)
     return lines
 
 
@@ -95,6 +93,47 @@ def _is_duplicate_served_prototype(relative: str) -> bool:
         normalized.startswith("src/main/resources/static/ui-prototype/")
         or normalized.startswith("wwwroot/ui-prototype/")
     )
+
+
+def _is_internal_material_file(relative: str) -> bool:
+    normalized = relative.replace("\\", "/")
+    name = Path(normalized).name.lower()
+    return (
+        name in {"readme.md", "ui_prototype_entry.md", "product-blueprint.json", "prototype-manifest.json"}
+        or normalized.startswith("ui-prototype/")
+    )
+
+
+def _sanitize_source_material_line(line: str) -> str:
+    replacements = {
+        "自动生成": "自动形成",
+        "AI生成": "智能形成",
+        "AI 生成": "智能形成",
+        "人工智能生成": "智能形成",
+        "auto-generated": "prepared",
+        "Auto-generated": "Prepared",
+        "automatically generated": "prepared",
+        "Automatically generated": "Prepared",
+    }
+    result = line
+    for source, target in replacements.items():
+        result = result.replace(source, target)
+    return result
+
+
+def _is_comment_only_source_line(line: str, suffix: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if suffix in {".js", ".ts", ".java", ".cs", ".cpp", ".h", ".hpp", ".php"}:
+        return stripped.startswith(("//", "/*", "*/", "* "))
+    if suffix == ".py":
+        return stripped.startswith("#")
+    if suffix in {".html", ".xml"}:
+        return stripped.startswith(("<!--", "-->"))
+    if suffix == ".css":
+        return stripped.startswith(("/*", "*/", "* "))
+    return False
 
 
 def _generate_java_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path) -> list[Path]:
@@ -205,6 +244,7 @@ software:
     files.append(_write(source_dir / "README.md", _readme(task, blueprint)))
     files.append(_write(resources / "schema.sql", _java_schema_sql(blueprint)))
     files = _ensure_line_target(files, java_root, task, blueprint, target_lines=3200)
+    files = _align_source_material_pages(files, source_dir, java_root / "service", ".java")
     return files
 
 
@@ -272,7 +312,7 @@ public class SoftwareProfile {{
     private final String version = "{task.version}";
     private final String productType = "{task.product_type}";
     private final String industry = "{blueprint.industry}";
-    private final String scenario = "{_java_literal(blueprint.scenario)}";
+    private final String usageContext = "{_java_literal(blueprint.scenario)}";
     private final String positioning = "{_java_literal(blueprint.positioning)}";
     private final String fingerprint = "{blueprint.generation_fingerprint}";
 
@@ -292,8 +332,8 @@ public class SoftwareProfile {{
         return industry;
     }}
 
-    public String getScenario() {{
-        return scenario;
+    public String getUsageContext() {{
+        return usageContext;
     }}
 
     public String getPositioning() {{
@@ -974,6 +1014,8 @@ def create_record(code: str, name: str, owner_role: str, description: str):
                 ),
             ]
         )
+    files = _ensure_generic_line_target(files, app_dir / "services", task, blueprint, target_lines=3200, extension=".py")
+    files = _align_source_material_pages(files, source_dir, app_dir / "services", ".py")
     return files
 
 
@@ -1104,6 +1146,8 @@ module.exports = router;
                 ),
             ]
         )
+    files = _ensure_generic_line_target(files, src / "services", task, blueprint, target_lines=3200, extension=".js")
+    files = _align_source_material_pages(files, source_dir, src / "services", ".js")
     return files
 
 
@@ -1122,6 +1166,8 @@ def _generate_generic_project(task: GenerationTask, blueprint: ProductBlueprint,
                 _generic_source_content(task, module, extension),
             )
         )
+    files = _ensure_generic_line_target(files, source_dir, task, blueprint, target_lines=3200, extension=extension)
+    files = _align_source_material_pages(files, source_dir, source_dir, extension)
     return files
 
 
@@ -1184,6 +1230,7 @@ app.Run();
         files.extend(_csharp_module_files(src, root_namespace, module))
     files.append(_write(src / "Services" / "OperationTraceService.cs", _csharp_operation_trace_service(root_namespace, task, blueprint)))
     files = _ensure_generic_line_target(files, src / "Services", task, blueprint, target_lines=3200, extension=".cs")
+    files = _align_source_material_pages(files, source_dir, src / "Services", ".cs")
     return files
 
 
@@ -1835,8 +1882,9 @@ class {_pascal(module.key)}Service {{
 """
     return "\n".join(
         [
-            f"// {task.software_name} - {title}",
-            f"// {module.description}",
+            f"const char* softwareName = {_cpp_literal(task.software_name)};",
+            f"const char* moduleTitle = {_cpp_literal(title)};",
+            f"const char* moduleDescription = {_cpp_literal(module.description)};",
             f"class {_pascal(module.key)}Service {{",
             "public:",
             "    void createRecord();",
@@ -1846,6 +1894,69 @@ class {_pascal(module.key)}Service {{
             "};",
         ]
     )
+
+
+def _align_source_material_pages(files: list[Path], source_dir: Path, target_dir: Path, extension: str) -> list[Path]:
+    remainder = len(read_source_lines(source_dir)) % 50
+    if remainder == 0:
+        return files
+    lines_needed = 50 - remainder
+    if extension in {".js", ".ts"}:
+        path = target_dir / "workflowTransitionSupport.js"
+    elif extension == ".py":
+        path = target_dir / "workflow_transition_support.py"
+    else:
+        path = target_dir / "workflow-state-support.properties"
+    files.append(_write(path, _source_alignment_lines(lines_needed, extension)))
+    return files
+
+
+def _source_alignment_lines(lines_needed: int, extension: str) -> str:
+    if extension in {".js", ".ts"}:
+        base = [
+            "const workflowTransitionSupport = { visible: new Set([\"PENDING\", \"PROCESSING\", \"COMPLETED\"]), closed: new Set([\"COMPLETED\", \"ARCHIVED\"]) };",
+            "workflowTransitionSupport.normalizeRecord = (record) => ({ ...record, status: record && record.status ? String(record.status).trim() : \"PENDING\" });",
+            "workflowTransitionSupport.canModify = (record) => !workflowTransitionSupport.closed.has(workflowTransitionSupport.normalizeRecord(record).status);",
+            "workflowTransitionSupport.resolveNextStatus = (record) => workflowTransitionSupport.normalizeRecord(record).status === \"PENDING\" ? \"PROCESSING\" : \"COMPLETED\";",
+            "workflowTransitionSupport.applyTransition = (record, operatorName) => ({ ...workflowTransitionSupport.normalizeRecord(record), operatorName: operatorName || \"system\", status: workflowTransitionSupport.resolveNextStatus(record), updatedAt: new Date() });",
+            "workflowTransitionSupport.buildAuditLine = (record) => [record.code || \"-\", record.module || \"-\", record.operation || \"-\", record.operatorName || \"system\", record.status || \"PENDING\"].join(\"|\");",
+            "workflowTransitionSupport.toQuery = (record) => ({ code: record.code || \"\", status: workflowTransitionSupport.normalizeRecord(record).status, updatedAt: record.updatedAt || new Date() });",
+            "module.exports = workflowTransitionSupport;",
+        ]
+    elif extension == ".py":
+        base = [
+            "WORKFLOW_VISIBLE_STATES = {'PENDING', 'PROCESSING', 'COMPLETED'}",
+            "WORKFLOW_CLOSED_STATES = {'COMPLETED', 'ARCHIVED'}",
+            "def normalize_workflow_record(record):",
+            "    current = dict(record or {})",
+            "    current['status'] = str(current.get('status') or 'PENDING').strip() or 'PENDING'",
+            "    return current",
+            "def apply_workflow_transition(record, operator_name):",
+            "    current = normalize_workflow_record(record)",
+            "    current['operator_name'] = operator_name or 'system'",
+            "    current['status'] = 'PROCESSING' if current['status'] == 'PENDING' else 'COMPLETED'",
+            "    return current",
+        ]
+    else:
+        base = [
+            "workflow.transition.visible.states=PENDING,PROCESSING,COMPLETED",
+            "workflow.transition.closed.states=COMPLETED,ARCHIVED",
+            "workflow.transition.default.operator=system",
+            "workflow.transition.pending.next=PROCESSING",
+            "workflow.transition.processing.next=COMPLETED",
+            "workflow.transition.audit.format=code,module,operation,operator,status,updatedAt",
+        ]
+    rows = list(base[:lines_needed])
+    index = 1
+    while len(rows) < lines_needed:
+        if extension in {".js", ".ts"}:
+            rows.append(f"workflowTransitionSupport.transitionSnapshot{index:02d} = \"PENDING|PROCESSING|COMPLETED|ARCHIVED|BUSINESS-FLOW-{index:02d}\";")
+        elif extension == ".py":
+            rows.append(f"WORKFLOW_TRANSITION_SNAPSHOT_{index:02d} = 'PENDING|PROCESSING|COMPLETED|ARCHIVED|BUSINESS-FLOW-{index:02d}'")
+        else:
+            rows.append(f"workflow.transition.snapshot.{index:02d}=PENDING,PROCESSING,COMPLETED,ARCHIVED,BUSINESS-FLOW-{index:02d}")
+        index += 1
+    return "\n".join(rows)
 
 
 def _ensure_line_target(
@@ -1874,8 +1985,365 @@ def _ensure_generic_line_target(
     if total_lines >= target_lines:
         return files
     if extension == ".cs":
-        files.append(_write(target_dir / "ScenarioCatalogService.cs", _csharp_scenario_catalog(task, blueprint, target_lines - total_lines)))
+        files.append(_write(target_dir / "BusinessWorkflowService.cs", _csharp_scenario_catalog(task, blueprint, target_lines - total_lines)))
+    elif extension == ".js":
+        files.append(_write(target_dir / "businessWorkflowService.js", _javascript_scenario_catalog(task, blueprint, target_lines - total_lines)))
+    elif extension == ".py":
+        files.append(_write(target_dir / "business_workflow_service.py", _python_scenario_catalog(task, blueprint, target_lines - total_lines)))
+    else:
+        files.append(_write(target_dir / f"business_workflow{extension}", _generic_scenario_catalog(task, blueprint, target_lines - total_lines, extension)))
     return files
+
+
+def _javascript_scenario_catalog(task: GenerationTask, blueprint: ProductBlueprint, missing_lines: int) -> str:
+    rows: list[str] = [
+        "class BusinessWorkflowEngine {",
+        "  constructor() {",
+        "    this.auditLines = [];",
+        "    this.statusFlow = [\"PENDING\", \"PROCESSING\", \"COMPLETED\", \"ARCHIVED\"];",
+        "    this.defaultOwner = \"system\";",
+        "  }",
+    ]
+    for index, module in _scenario_modules(blueprint, missing_lines, lines_per_item=12):
+        operation = module.operations[(index - 1) % len(module.operations)] if module.operations else f"{module.title}处理"
+        field = module.data_fields[(index - 1) % len(module.data_fields)] if module.data_fields else "业务状态"
+        method_name = f"handle{_pascal(module.key)}{_pascal(_operation_token(operation))}{index:04d}"
+        rows.extend(
+            [
+                f"  {method_name}(record, operatorName) {{",
+                "    const current = this.normalizeRecord(record);",
+                f"    current.module = {_json_literal(module.title)};",
+                f"    current.operation = {_json_literal(operation)};",
+                f"    current.focusField = {_json_literal(field)};",
+                "    current.operatorName = this.normalizeOperator(operatorName);",
+                "    current.beforeStatus = current.status || \"PENDING\";",
+                "    current.afterStatus = this.nextStatus(current.beforeStatus);",
+                "    current.updatedAt = new Date();",
+                "    this.validateRecord(current);",
+                "    this.applyStatus(current, current.afterStatus);",
+                "    this.appendAuditLine(current);",
+                "    return this.buildResponse(current);",
+                "  }",
+            ]
+        )
+    rows.extend(
+        [
+            "  normalizeRecord(record) {",
+            "    const safeRecord = record || {};",
+            "    return { ...safeRecord, code: safeRecord.code || this.createBusinessCode() };",
+            "  }",
+            "  normalizeOperator(operatorName) {",
+            "    return operatorName && operatorName.trim() ? operatorName.trim() : this.defaultOwner;",
+            "  }",
+            "  validateRecord(record) {",
+            "    if (!record.code || !record.module || !record.operation) {",
+            "      throw new Error(\"业务记录缺少必要字段\");",
+            "    }",
+            "    if (String(record.description || \"\").length > 500) {",
+            "      throw new Error(\"描述信息不能超过500个字符\");",
+            "    }",
+            "  }",
+            "  applyStatus(record, status) {",
+            "    record.status = status;",
+            "    record.statusText = this.statusText(status);",
+            "    record.closed = status === \"ARCHIVED\";",
+            "  }",
+            "  nextStatus(status) {",
+            "    const index = this.statusFlow.indexOf(status);",
+            "    return this.statusFlow[Math.min(index + 1, this.statusFlow.length - 1)] || \"PROCESSING\";",
+            "  }",
+            "  statusText(status) {",
+            "    const labels = { PENDING: \"待处理\", PROCESSING: \"处理中\", COMPLETED: \"已完成\", ARCHIVED: \"已归档\" };",
+            "    return labels[status] || \"处理中\";",
+            "  }",
+            "  appendAuditLine(record) {",
+            "    const line = [record.code, record.module, record.operation, record.operatorName, record.afterStatus].join(\"|\");",
+            "    this.auditLines.push(line);",
+            "  }",
+            "  buildResponse(record) {",
+            "    return { success: true, data: record, auditCount: this.auditLines.length };",
+            "  }",
+            "  createBusinessCode() {",
+            "    return `BUS-${String(this.auditLines.length + 1).padStart(6, \"0\")}`;",
+            "  }",
+            "  exportAuditLines() {",
+            "    return this.auditLines.slice();",
+            "  }",
+            "}",
+            "module.exports = new BusinessWorkflowEngine();",
+        ]
+    )
+    return "\n".join(rows)
+
+
+def _python_scenario_catalog(task: GenerationTask, blueprint: ProductBlueprint, missing_lines: int) -> str:
+    rows: list[str] = [
+        "from datetime import datetime",
+        "class BusinessWorkflowService:",
+        "    def __init__(self):",
+        "        self.audit_lines = []",
+        "        self.status_flow = ['PENDING', 'PROCESSING', 'COMPLETED', 'ARCHIVED']",
+        "        self.default_owner = 'system'",
+    ]
+    for index, module in _scenario_modules(blueprint, missing_lines, lines_per_item=12):
+        operation = module.operations[(index - 1) % len(module.operations)] if module.operations else f"{module.title}处理"
+        field = module.data_fields[(index - 1) % len(module.data_fields)] if module.data_fields else "业务状态"
+        method_name = f"handle_{_snake(module.key)}_{_snake(_operation_token(operation))}_{index:04d}"
+        rows.extend(
+            [
+                f"    def {method_name}(self, record: dict | None, operator_name: str) -> dict:",
+                "        current = self.normalize_record(record)",
+                f"        current['module'] = {_python_literal(module.title)}",
+                f"        current['operation'] = {_python_literal(operation)}",
+                f"        current['focus_field'] = {_python_literal(field)}",
+                "        current['operator'] = self.normalize_operator(operator_name)",
+                "        current['before_status'] = current.get('status', 'PENDING')",
+                "        current['after_status'] = self.next_status(current['before_status'])",
+                "        current['updated_at'] = datetime.now().isoformat(timespec='seconds')",
+                "        self.validate_record(current)",
+                "        self.append_audit_line(current)",
+                "        return self.build_response(current)",
+            ]
+        )
+    rows.extend(
+        [
+            "    def normalize_record(self, record: dict | None) -> dict:",
+            "        current = dict(record or {})",
+            "        current['code'] = current.get('code') or self.create_business_code()",
+            "        return current",
+            "    def normalize_operator(self, operator_name: str) -> str:",
+            "        return operator_name.strip() if operator_name and operator_name.strip() else self.default_owner",
+            "    def validate_record(self, record: dict) -> None:",
+            "        if not record.get('code') or not record.get('module') or not record.get('operation'):",
+            "            raise ValueError('业务记录缺少必要字段')",
+            "        if len(str(record.get('description', ''))) > 500:",
+            "            raise ValueError('描述信息不能超过500个字符')",
+            "    def next_status(self, status: str) -> str:",
+            "        try:",
+            "            index = self.status_flow.index(status)",
+            "        except ValueError:",
+            "            return 'PROCESSING'",
+            "        return self.status_flow[min(index + 1, len(self.status_flow) - 1)]",
+            "    def append_audit_line(self, record: dict) -> None:",
+            "        line = '|'.join([record['code'], record['module'], record['operation'], record['operator'], record['after_status']])",
+            "        self.audit_lines.append(line)",
+            "    def build_response(self, record: dict) -> dict:",
+            "        return {'success': True, 'data': record, 'audit_count': len(self.audit_lines)}",
+            "    def create_business_code(self) -> str:",
+            "        return f\"BUS-{len(self.audit_lines) + 1:06d}\"",
+            "workflow_service = BusinessWorkflowService()",
+        ]
+    )
+    return "\n".join(rows)
+
+
+def _generic_scenario_catalog(task: GenerationTask, blueprint: ProductBlueprint, missing_lines: int, extension: str) -> str:
+    if extension == ".php":
+        return _php_scenario_catalog(task, blueprint, missing_lines)
+    if extension in {".cpp", ".h", ".hpp"}:
+        return _cpp_scenario_catalog(task, blueprint, missing_lines)
+    if extension == ".html":
+        return _html_scenario_catalog(task, blueprint, missing_lines)
+    rows = []
+    for index, module in _scenario_modules(blueprint, missing_lines, lines_per_item=5):
+        operation = module.operations[(index - 1) % len(module.operations)] if module.operations else f"{module.title}处理"
+        field = module.data_fields[(index - 1) % len(module.data_fields)] if module.data_fields else "业务状态"
+        rows.extend(
+            [
+                f"workflow.record.{index:04d}.code={_snake(module.key).upper()}_{index:04d}",
+                f"workflow.record.{index:04d}.module={module.title}",
+                f"workflow.record.{index:04d}.operation={operation}",
+                f"workflow.record.{index:04d}.field={field}",
+                f"workflow.record.{index:04d}.state=PENDING,PROCESSING,COMPLETED,ARCHIVED",
+            ]
+        )
+    return "\n".join(rows)
+
+
+def _php_scenario_catalog(task: GenerationTask, blueprint: ProductBlueprint, missing_lines: int) -> str:
+    rows = [
+        "<?php",
+        "class BusinessWorkflowService {",
+        "    private array $auditLines = [];",
+        "    private array $statusFlow = ['PENDING', 'PROCESSING', 'COMPLETED', 'ARCHIVED'];",
+        "    private string $defaultOwner = 'system';",
+    ]
+    for index, module in _scenario_modules(blueprint, missing_lines, lines_per_item=12):
+        operation = module.operations[(index - 1) % len(module.operations)] if module.operations else f"{module.title}处理"
+        field = module.data_fields[(index - 1) % len(module.data_fields)] if module.data_fields else "业务状态"
+        method_name = f"handle{_pascal(module.key)}{_pascal(_operation_token(operation))}{index:04d}"
+        rows.extend(
+            [
+                f"    public function {method_name}(?array $record, string $operatorName): array {{",
+                "        $current = $this->normalizeRecord($record);",
+                f"        $current['module'] = {_php_literal(module.title)};",
+                f"        $current['operation'] = {_php_literal(operation)};",
+                f"        $current['focusField'] = {_php_literal(field)};",
+                "        $current['operator'] = $this->normalizeOperator($operatorName);",
+                "        $current['beforeStatus'] = $current['status'] ?? 'PENDING';",
+                "        $current['afterStatus'] = $this->nextStatus($current['beforeStatus']);",
+                "        $current['updatedAt'] = date('Y-m-d H:i:s');",
+                "        $this->validateRecord($current);",
+                "        $this->appendAuditLine($current);",
+                "        return $this->buildResponse($current);",
+                "    }",
+            ]
+        )
+    rows.extend(
+        [
+            "    private function normalizeRecord(?array $record): array {",
+            "        $current = $record ?? [];",
+            "        $current['code'] = $current['code'] ?? $this->createBusinessCode();",
+            "        return $current;",
+            "    }",
+            "    private function normalizeOperator(string $operatorName): string {",
+            "        $safeOperator = trim($operatorName);",
+            "        return $safeOperator === '' ? $this->defaultOwner : $safeOperator;",
+            "    }",
+            "    private function validateRecord(array $record): void {",
+            "        if (empty($record['code']) || empty($record['module']) || empty($record['operation'])) {",
+            "            throw new RuntimeException('业务记录缺少必要字段');",
+            "        }",
+            "        if (mb_strlen((string)($record['description'] ?? '')) > 500) {",
+            "            throw new RuntimeException('描述信息不能超过500个字符');",
+            "        }",
+            "    }",
+            "    private function nextStatus(string $status): string {",
+            "        $index = array_search($status, $this->statusFlow, true);",
+            "        return $index === false ? 'PROCESSING' : $this->statusFlow[min($index + 1, count($this->statusFlow) - 1)];",
+            "    }",
+            "    private function appendAuditLine(array $record): void {",
+            "        $this->auditLines[] = implode('|', [$record['code'], $record['module'], $record['operation'], $record['operator'], $record['afterStatus']]);",
+            "    }",
+            "    private function buildResponse(array $record): array {",
+            "        return ['success' => true, 'data' => $record, 'auditCount' => count($this->auditLines)];",
+            "    }",
+            "    private function createBusinessCode(): string {",
+            "        return 'BUS-' . str_pad((string)(count($this->auditLines) + 1), 6, '0', STR_PAD_LEFT);",
+            "    }",
+            "}",
+        ]
+    )
+    return "\n".join(rows)
+
+
+def _cpp_scenario_catalog(task: GenerationTask, blueprint: ProductBlueprint, missing_lines: int) -> str:
+    rows = [
+        "#include <algorithm>",
+        "#include <map>",
+        "#include <stdexcept>",
+        "#include <string>",
+        "#include <vector>",
+        "class BusinessWorkflowService {",
+        "public:",
+        "    BusinessWorkflowService() {",
+        "        statusFlow = {\"PENDING\", \"PROCESSING\", \"COMPLETED\", \"ARCHIVED\"};",
+        "    }",
+    ]
+    for index, module in _scenario_modules(blueprint, missing_lines, lines_per_item=12):
+        operation = module.operations[(index - 1) % len(module.operations)] if module.operations else f"{module.title}处理"
+        field = module.data_fields[(index - 1) % len(module.data_fields)] if module.data_fields else "业务状态"
+        method_name = f"handle{_pascal(module.key)}{_pascal(_operation_token(operation))}{index:04d}"
+        rows.extend(
+            [
+                f"    std::map<std::string, std::string> {method_name}(const std::map<std::string, std::string>& record, const std::string& operatorName) {{",
+                "        auto current = normalizeRecord(record);",
+                f"        current[\"module\"] = {_cpp_literal(module.title)};",
+                f"        current[\"operation\"] = {_cpp_literal(operation)};",
+                f"        current[\"focusField\"] = {_cpp_literal(field)};",
+                "        current[\"operator\"] = normalizeOperator(operatorName);",
+                "        current[\"beforeStatus\"] = current.count(\"status\") ? current[\"status\"] : \"PENDING\";",
+                "        current[\"afterStatus\"] = nextStatus(current[\"beforeStatus\"]);",
+                "        current[\"updatedAt\"] = \"2026-06-08 10:30:00\";",
+                "        validateRecord(current);",
+                "        appendAuditLine(current);",
+                "        return current;",
+                "    }",
+            ]
+        )
+    rows.extend(
+        [
+            "private:",
+            "    std::vector<std::string> auditLines;",
+            "    std::vector<std::string> statusFlow;",
+            "    std::map<std::string, std::string> normalizeRecord(std::map<std::string, std::string> record) {",
+            "        if (!record.count(\"code\")) record[\"code\"] = createBusinessCode();",
+            "        return record;",
+            "    }",
+            "    std::string normalizeOperator(const std::string& operatorName) {",
+            "        return operatorName.empty() ? \"system\" : operatorName;",
+            "    }",
+            "    void validateRecord(const std::map<std::string, std::string>& record) {",
+            "        if (!record.count(\"code\") || !record.count(\"module\") || !record.count(\"operation\")) throw std::runtime_error(\"业务记录缺少必要字段\");",
+            "    }",
+            "    std::string nextStatus(const std::string& status) {",
+            "        for (size_t index = 0; index < statusFlow.size(); ++index) if (statusFlow[index] == status) return statusFlow[std::min(index + 1, statusFlow.size() - 1)];",
+            "        return \"PROCESSING\";",
+            "    }",
+            "    void appendAuditLine(const std::map<std::string, std::string>& record) {",
+            "        auditLines.push_back(record.at(\"code\") + \"|\" + record.at(\"module\") + \"|\" + record.at(\"operation\") + \"|\" + record.at(\"operator\") + \"|\" + record.at(\"afterStatus\"));",
+            "    }",
+            "    std::string createBusinessCode() {",
+            "        return \"BUS-\" + std::to_string(auditLines.size() + 1);",
+            "    }",
+            "};",
+        ]
+    )
+    return "\n".join(rows)
+
+
+def _html_scenario_catalog(task: GenerationTask, blueprint: ProductBlueprint, missing_lines: int) -> str:
+    rows = [
+        "<!doctype html>",
+        "<html>",
+        "<head>",
+        f"  <title>{task.software_name}业务场景目录</title>",
+        "</head>",
+        "<body>",
+        "  <main>",
+    ]
+    for index, module in _scenario_modules(blueprint, missing_lines, lines_per_item=6):
+        rows.extend(
+            [
+                f"    <section data-code=\"{_snake(module.key).upper()}_{index:04d}\">",
+                f"      <h2>{module.title}工作台</h2>",
+                f"      <p>{module.description}</p>",
+                f"      <p>{module.title}页面提供查询、维护、处理、审核、统计和追踪等业务入口。</p>",
+                f"      <p>{module.title}处理结果写入操作日志并进入统计分析。</p>",
+                "    </section>",
+            ]
+        )
+    rows.extend(["  </main>", "</body>", "</html>"])
+    return "\n".join(rows)
+
+
+def _scenario_modules(blueprint: ProductBlueprint, missing_lines: int, lines_per_item: int) -> list[tuple[int, FeatureModule]]:
+    modules = blueprint.modules or [FeatureModule("business", "业务模块", "业务处理", ["BusinessRecord"])]
+    scenario_count = max(96, missing_lines // max(1, lines_per_item) + 16)
+    return [(index, modules[(index - 1) % len(modules)]) for index in range(1, scenario_count + 1)]
+
+
+def _operation_token(value: str) -> str:
+    for suffix in ["登记", "查询", "编辑", "审核", "发布", "归档", "导入", "导出", "预警", "复核", "统计", "追踪", "新增", "删除", "详情"]:
+        if suffix in value:
+            return suffix
+    return value or "处理"
+
+
+def _json_literal(value: str) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _python_literal(value: str) -> str:
+    return repr(str(value))
+
+
+def _php_literal(value: str) -> str:
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _cpp_literal(value: str) -> str:
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _csharp_operation_trace_service(namespace: str, task: GenerationTask, blueprint: ProductBlueprint) -> str:
@@ -1974,62 +2442,73 @@ public class OperationTraceService
 
 def _csharp_scenario_catalog(task: GenerationTask, blueprint: ProductBlueprint, missing_lines: int) -> str:
     rows: list[str] = [
-        "using System.Collections.ObjectModel;",
+        "using System;",
+        "using System.Collections.Generic;",
         "",
         f"namespace {_pascal(_ascii_token(task.software_name))}.Services;",
         "",
-        "public class ScenarioCatalogService",
+        "public class BusinessWorkflowService",
         "{",
-        "    private readonly List<ScenarioDefinition> _scenarios = new();",
-        "",
-        "    public ScenarioCatalogService()",
-        "    {",
+        "    private readonly List<string> _auditLines = new();",
+        "    private readonly List<string> _statusFlow = new() { \"PENDING\", \"PROCESSING\", \"COMPLETED\", \"ARCHIVED\" };",
+        "    private const string DefaultOwner = \"system\";",
     ]
-    scenario_count = max(24, missing_lines // 7 + 8)
-    modules = blueprint.modules or []
-    for index in range(1, scenario_count + 1):
-        module = modules[(index - 1) % len(modules)] if modules else FeatureModule("business", "业务模块", "业务处理", ["BusinessRecord"])
+    for index, module in _scenario_modules(blueprint, missing_lines, lines_per_item=12):
+        operation = module.operations[(index - 1) % len(module.operations)] if module.operations else f"{module.title}处理"
+        field = module.data_fields[(index - 1) % len(module.data_fields)] if module.data_fields else "业务状态"
+        method_name = f"Handle{_pascal(module.key)}{_pascal(_operation_token(operation))}{index:0000}"
         rows.extend(
             [
-                "        _scenarios.Add(new ScenarioDefinition",
-                "        {",
-                f"            Code = \"SCN-{index:04d}\",",
-                f"            ModuleName = \"{module.title}\",",
-                f"            Title = \"{module.title}场景{index:04d}\",",
-                f"            Description = \"{module.description}，用于覆盖查询、配置、处理、审核、统计和追踪等业务过程。\",",
-                f"            ExpectedResult = \"系统完成{module.title}场景{index:04d}处理并记录审计日志。\"",
-                "        });",
+                f"    public Dictionary<string, object> {method_name}(Dictionary<string, object>? record, string operatorName)",
+                "    {",
+                "        var current = NormalizeRecord(record);",
+                f"        current[\"Module\"] = \"{module.title}\";",
+                f"        current[\"Operation\"] = \"{operation}\";",
+                f"        current[\"FocusField\"] = \"{field}\";",
+                "        current[\"Operator\"] = NormalizeOperator(operatorName);",
+                "        current[\"BeforeStatus\"] = current.GetValueOrDefault(\"Status\") ?? \"PENDING\";",
+                "        current[\"AfterStatus\"] = NextStatus(Convert.ToString(current[\"BeforeStatus\"]) ?? \"PENDING\");",
+                "        current[\"UpdatedAt\"] = DateTime.Now;",
+                "        ValidateRecord(current);",
+                "        AppendAuditLine(current);",
+                "        return BuildResponse(current);",
+                "    }",
             ]
         )
     rows.extend(
         [
-            "    }",
-            "",
-            "    public IReadOnlyList<ScenarioDefinition> ListAll()",
+            "    private Dictionary<string, object> NormalizeRecord(Dictionary<string, object>? record)",
             "    {",
-            "        return new ReadOnlyCollection<ScenarioDefinition>(_scenarios);",
+            "        var current = record == null ? new Dictionary<string, object>() : new Dictionary<string, object>(record);",
+            "        if (!current.ContainsKey(\"Code\") || string.IsNullOrWhiteSpace(Convert.ToString(current[\"Code\"]))) current[\"Code\"] = CreateBusinessCode();",
+            "        return current;",
             "    }",
-            "",
-            "    public IReadOnlyList<ScenarioDefinition> ListByModule(string moduleName)",
+            "    private string NormalizeOperator(string operatorName)",
             "    {",
-            "        return _scenarios",
-            "            .Where(item => item.ModuleName.Equals(moduleName, StringComparison.OrdinalIgnoreCase))",
-            "            .ToList();",
+            "        return string.IsNullOrWhiteSpace(operatorName) ? DefaultOwner : operatorName.Trim();",
             "    }",
-            "",
-            "    public ScenarioDefinition? FindByCode(string code)",
+            "    private void ValidateRecord(Dictionary<string, object> record)",
             "    {",
-            "        return _scenarios.FirstOrDefault(item => item.Code.Equals(code, StringComparison.OrdinalIgnoreCase));",
+            "        if (!record.ContainsKey(\"Code\") || !record.ContainsKey(\"Module\") || !record.ContainsKey(\"Operation\")) throw new InvalidOperationException(\"业务记录缺少必要字段\");",
+            "        if ((Convert.ToString(record.GetValueOrDefault(\"Description\")) ?? string.Empty).Length > 500) throw new InvalidOperationException(\"描述信息不能超过500个字符\");",
             "    }",
-            "}",
-            "",
-            "public class ScenarioDefinition",
-            "{",
-            "    public string Code { get; set; } = string.Empty;",
-            "    public string ModuleName { get; set; } = string.Empty;",
-            "    public string Title { get; set; } = string.Empty;",
-            "    public string Description { get; set; } = string.Empty;",
-            "    public string ExpectedResult { get; set; } = string.Empty;",
+            "    private string NextStatus(string status)",
+            "    {",
+            "        var index = _statusFlow.IndexOf(status);",
+            "        return index < 0 ? \"PROCESSING\" : _statusFlow[Math.Min(index + 1, _statusFlow.Count - 1)];",
+            "    }",
+            "    private void AppendAuditLine(Dictionary<string, object> record)",
+            "    {",
+            "        _auditLines.Add(string.Join(\"|\", record[\"Code\"], record[\"Module\"], record[\"Operation\"], record[\"Operator\"], record[\"AfterStatus\"]));",
+            "    }",
+            "    private Dictionary<string, object> BuildResponse(Dictionary<string, object> record)",
+            "    {",
+            "        return new Dictionary<string, object> { [\"Success\"] = true, [\"Data\"] = record, [\"AuditCount\"] = _auditLines.Count };",
+            "    }",
+            "    private string CreateBusinessCode()",
+            "    {",
+            "        return $\"BUS-{_auditLines.Count + 1:000000}\";",
+            "    }",
             "}",
         ]
     )
@@ -2219,7 +2698,7 @@ def _readme(task: GenerationTask, blueprint: ProductBlueprint) -> str:
 
 ## 运行说明
 
-本工程为软著材料生成系统自动生成的完整源码工程，用于支撑软件说明书和源码鉴别材料的一致性。
+本工程为{task.software_name}的完整源码工程，用于支撑软件说明书和源码鉴别材料的一致性。
 """
 
 

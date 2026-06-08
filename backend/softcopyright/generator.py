@@ -129,6 +129,7 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         "renderer": ui_blueprint.renderer,
         "visual_style": ui_blueprint.visual_style,
         "source": ui_blueprint.source,
+        "design_brief": getattr(ui_blueprint, "design_brief", {}) or {},
         "path": str(output_dir / "ui_screenshots" / "ui_blueprint.json"),
         "prototype_dir": source_info.get("ui_prototype_dir", ""),
         "project_entry": source_info.get("ui_project_entry", {}),
@@ -149,6 +150,18 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     report["checks"]["ui_blueprint_source"] = ui_blueprint.source
     report["checks"]["ui_renderer"] = ui_blueprint.renderer
     report["checks"]["ui_layout_variant"] = report["ui_blueprint"]["layout_variant"]
+    design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
+    report["checks"]["ui_industry_subtype"] = design_brief.get("industry_subtype", getattr(blueprint, "industry_subtype", ""))
+    report["checks"]["ui_nav_model"] = design_brief.get("nav_model", "")
+    report["checks"]["ui_visual_mood"] = design_brief.get("visual_mood", ui_blueprint.visual_style)
+    report["checks"]["ui_dashboard_pattern"] = design_brief.get("dashboard_pattern", "")
+    report["checks"]["ui_module_pattern"] = design_brief.get("module_pattern", "")
+    report["checks"]["ui_workspace_shape"] = design_brief.get("workspace_shape", "")
+    report["checks"]["ui_login_pattern"] = design_brief.get("login_pattern", "")
+    report["checks"]["ui_structure_id"] = (design_brief.get("structure_blueprint") or {}).get("id", "")
+    report["checks"]["ui_domain_bias"] = (design_brief.get("design_dna") or {}).get("domain_bias", "")
+    report["checks"]["ui_layout_signature"] = design_brief.get("layout_signature", "")
+    report["checks"]["ui_secondary_mix"] = "、".join(str(item) for item in design_brief.get("secondary_mix", []) if str(item).strip())
     report["checks"]["ui_software_type_match"] = ui_matches_software_type(task, blueprint, ui_blueprint)
     report["checks"].update(_ui_project_entry_checks(source_info))
     if ui_blueprint.renderer == "game":
@@ -174,6 +187,7 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
             output_dir,
             manual_content=manual_content,
             ui_screenshots=ui_screenshots,
+            design_brief=design_brief,
         )
         mark("manual_docx")
         send("source_doc", 62, "生成源码鉴别材料")
@@ -304,6 +318,9 @@ def _ui_project_entry_checks(source_info) -> dict:
 def _ui_layout_variant(ui_blueprint, ui_screenshots) -> str:
     if getattr(ui_blueprint, "renderer", "") == "game":
         return "game"
+    design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
+    if design_brief.get("layout_family"):
+        return str(design_brief.get("layout_family"))
     dashboard = ui_screenshots.get("dashboard") if isinstance(ui_screenshots, dict) else None
     html_path = getattr(dashboard, "html_path", "") if dashboard else ""
     if not html_path:

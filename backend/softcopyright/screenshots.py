@@ -502,6 +502,7 @@ def _build_pages(task: GenerationTask, blueprint: ProductBlueprint, ui_dir: Path
     if ui_blueprint.renderer == "game":
         return _build_game_pages(task, blueprint, ui_dir, ui_blueprint)
 
+    design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
     screen_by_key = {screen.key: screen for screen in ui_blueprint.screens}
     screen_by_module_key = {screen.module_key: screen for screen in ui_blueprint.screens if screen.module_key}
     login_screen = screen_by_key.get("login")
@@ -513,7 +514,7 @@ def _build_pages(task: GenerationTask, blueprint: ProductBlueprint, ui_dir: Path
             "login",
             login_screen.title if login_screen else "登录界面",
             login_screen.caption if login_screen else "用户输入账号、密码和验证码后进入系统。",
-            _login_body(task, blueprint),
+            _login_body(task, blueprint, design_brief),
             renderer="admin",
         ),
         _write_page(
@@ -521,11 +522,11 @@ def _build_pages(task: GenerationTask, blueprint: ProductBlueprint, ui_dir: Path
             "dashboard",
             dashboard_screen.title if dashboard_screen else "系统首页",
             dashboard_screen.caption if dashboard_screen else "首页集中展示核心指标、待办事项、异常提醒和快捷入口。",
-            _dashboard_body(task, blueprint),
+            _dashboard_body(task, blueprint, design_brief),
             renderer="admin",
         ),
     ]
-    for module in blueprint.modules[:6]:
+    for module in blueprint.modules:
         screen = screen_by_module_key.get(module.key) or screen_by_key.get(module.key)
         pages.append(
             _write_page(
@@ -533,17 +534,29 @@ def _build_pages(task: GenerationTask, blueprint: ProductBlueprint, ui_dir: Path
                 screen.key if screen else _module_page_key(module.key),
                 screen.title if screen else module.title,
                 screen.caption if screen else module.description,
-                _module_body(task, blueprint, module),
+                _module_body(task, blueprint, module, design_brief),
                 renderer="admin",
             )
         )
+        for operation_index, operation in enumerate(_module_operation_items(module, design_brief)[:4], start=2):
+            action = _operation_action_label(operation)
+            pages.append(
+                _write_page(
+                    ui_dir,
+                    _module_operation_page_key(module.key, action, operation_index),
+                    f"{module.title}{action}界面",
+                    f"{module.title}{action}窗口展示业务字段、处理状态和操作按钮。",
+                    _module_operation_body(task, blueprint, module, action, design_brief),
+                    renderer="admin",
+                )
+            )
     pages.append(
         _write_page(
             ui_dir,
             "statistics",
             statistics_screen.title if statistics_screen else "统计报表界面",
             statistics_screen.caption if statistics_screen else "系统按日期、模块、状态和角色维度生成统计结果。",
-            _statistics_body(task, blueprint),
+            _statistics_body(task, blueprint, design_brief),
             renderer="admin",
         )
     )
@@ -554,6 +567,328 @@ def _module_page_key(module_key: str) -> str:
     if module_key in {"login", "dashboard", "statistics"}:
         return f"module_{module_key}"
     return module_key
+
+
+def _module_operation_page_key(module_key: str, action: str, operation_index: int) -> str:
+    token = re.sub(r"[^a-zA-Z0-9]+", "_", action).strip("_").lower()
+    token = token or f"operation_{operation_index}"
+    return f"{_module_page_key(module_key)}_{token}_{operation_index}"
+
+
+def _module_operation_items(module: FeatureModule, design_brief: dict[str, Any] | None = None) -> list[str]:
+    operations = [str(item).strip() for item in module.operations if str(item).strip()]
+    if not operations:
+        operations = [
+            f"{module.title}详情",
+            f"{module.title}记录",
+            f"{module.title}编辑",
+            f"{module.title}新增",
+        ]
+    secondary_mix = [str(item).strip() for item in (design_brief or {}).get("secondary_mix", []) if str(item).strip()]
+    if not secondary_mix:
+        return operations
+    selected: list[str] = []
+    used: set[int] = set()
+    for preferred_action in secondary_mix:
+        for index, operation in enumerate(operations):
+            if index in used:
+                continue
+            if _operation_action_label(operation) == preferred_action or preferred_action in operation:
+                selected.append(operation)
+                used.add(index)
+                break
+    for index, operation in enumerate(operations):
+        if index not in used:
+            selected.append(operation)
+    return selected
+
+
+def _operation_action_label(operation: str) -> str:
+    for suffix in [
+        "详情",
+        "记录",
+        "编辑",
+        "新增",
+        "删除",
+        "登记",
+        "查询",
+        "审核",
+        "发布",
+        "归档",
+        "导入",
+        "导出",
+        "预警",
+        "复核",
+        "统计",
+        "追踪",
+        "配置",
+        "定位",
+        "调度",
+        "训练",
+        "道具",
+        "结算",
+        "活动",
+        "确认",
+        "处置",
+    ]:
+        if suffix in operation:
+            return suffix
+    return str(operation).strip() or "处理"
+
+
+def _module_operation_body(task: GenerationTask, blueprint: ProductBlueprint, module: FeatureModule, action: str, design_brief: dict[str, Any] | None = None) -> str:
+    profile = _profile_for_blueprint(task, blueprint, design_brief)
+    fields = module.data_fields[:6] or ["业务编号", "业务名称", "业务状态", "责任角色", "更新时间", "处理备注"]
+    title = f"{module.title}{action}界面"
+    dialog = _operation_dialog(module, action, title, fields)
+    background = _module_content(profile, blueprint, module)
+    content = f"""
+<div class="operation-preview">
+  <div class="operation-background">{background}</div>
+  <div class="modal-backdrop">
+{dialog}
+  </div>
+</div>
+"""
+    return _layout(task, blueprint, title, content, module.title, design_brief)
+
+
+def _operation_dialog(module: FeatureModule, action: str, title: str, fields: list[str]) -> str:
+    if action == "查询":
+        return _query_dialog(module, title, fields)
+    if action == "导入":
+        return _import_dialog(module, title)
+    if action == "导出":
+        return _export_dialog(module, title)
+    if action == "统计":
+        return _statistics_dialog(module, title)
+    if action == "预警":
+        return _warning_dialog(module, title, fields)
+    if action in {"审核", "复核", "发布"}:
+        return _review_dialog(module, action, title, fields)
+    if action in {"删除", "归档"}:
+        return _confirm_dialog(module, action)
+    if action in {"详情", "记录", "追踪"}:
+        return _detail_dialog(module, action, title, fields)
+    return _form_dialog(module, action, title, fields)
+
+
+def _dialog_head(title: str) -> str:
+    return f'<div class="dialog-head"><strong>{escape(title)}</strong><span class="dialog-close">×</span></div>'
+
+
+def _field_rows(module: FeatureModule, fields: list[str]) -> str:
+    return "".join(
+        f"<div class='detail-row'><span>{escape(field)}</span><strong>{escape(_operation_sample_value(module, field, index))}</strong></div>"
+        for index, field in enumerate(fields)
+    )
+
+
+def _form_items(module: FeatureModule, fields: list[str]) -> str:
+    return "".join(
+        f"<div class='form-item'><span>{escape(field)}</span><div class='form-value'>{escape(_operation_sample_value(module, field, index))}</div></div>"
+        for index, field in enumerate(fields)
+    )
+
+
+def _query_dialog(module: FeatureModule, title: str, fields: list[str]) -> str:
+    query_fields = fields[:4] or ["业务编号", "业务名称", "业务状态", "责任角色"]
+    filters = "".join(f"<div class='query-filter'><span>{escape(field)}</span><div>请输入{escape(field)}</div></div>" for field in query_fields)
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(_operation_sample_value(module, query_fields[0], index))}</td>"
+        f"<td>{escape(module.title)}记录{index + 1:03d}</td>"
+        f"<td><span class='status {'warn' if index % 3 == 1 else ''}'>{'待复核' if index % 3 == 1 else '已处理'}</span></td>"
+        f"<td>2026-06-0{index + 3}</td>"
+        "</tr>"
+        for index in range(4)
+    )
+    return f"""
+    <section class="dialog query-dialog">
+      {_dialog_head(title)}
+      <div class="dialog-body">
+        <div class="query-grid">{filters}</div>
+        <div class="query-actions"><span class="button">查询</span><span class="button ghost">重置</span><span class="button ghost">高级筛选</span></div>
+        <div class="result-box"><table><thead><tr><th>编号</th><th>名称</th><th>状态</th><th>更新时间</th></tr></thead><tbody>{rows}</tbody></table></div>
+      </div>
+      <div class="dialog-footer"><span class="muted">共 128 条记录，当前显示前 4 条</span><span class="button">打开详情</span></div>
+    </section>
+"""
+
+
+def _import_dialog(module: FeatureModule, title: str) -> str:
+    return f"""
+    <section class="dialog import-dialog">
+      {_dialog_head(title)}
+      <div class="dialog-body">
+        <div class="upload-zone">
+          <strong>选择{escape(module.title)}导入文件</strong>
+          <span>支持 xlsx、csv 文件，系统会先完成字段匹配和重复校验。</span>
+        </div>
+        <div class="file-row"><span>import_{escape(_module_page_key(module.key))}_20260608.xlsx</span><b>已选择</b></div>
+        <div class="progress-line"><span style="width:72%"></span></div>
+        <div class="validation-list">
+          <div><b>字段匹配</b><span>已匹配 12 个字段</span></div>
+          <div><b>重复校验</b><span>发现 2 条待确认记录</span></div>
+          <div><b>导入方式</b><span>追加写入并保留原状态</span></div>
+        </div>
+      </div>
+      <div class="dialog-footer"><span class="button ghost">取消</span><span class="button">开始导入</span></div>
+    </section>
+"""
+
+
+def _export_dialog(module: FeatureModule, title: str) -> str:
+    return f"""
+    <section class="dialog export-dialog">
+      {_dialog_head(title)}
+      <div class="dialog-body">
+        <div class="export-layout">
+          <div>
+            <div class="section-label">导出范围</div>
+            <div class="option-list">
+              <div><span class="check-mark">✓</span>当前查询结果</div>
+              <div><span class="check-mark">✓</span>{escape(module.title)}明细字段</div>
+              <div><span class="check-mark muted-check"> </span>操作日志与审批记录</div>
+            </div>
+          </div>
+          <div>
+            <div class="section-label">文件格式</div>
+            <div class="format-tabs"><span class="active">Excel</span><span>PDF</span><span>CSV</span></div>
+            <div class="export-preview">预计导出 128 条数据<br>文件名：{escape(_module_page_key(module.key))}_export_20260608.xlsx</div>
+          </div>
+        </div>
+      </div>
+      <div class="dialog-footer"><span class="button ghost">取消</span><span class="button">确认导出</span></div>
+    </section>
+"""
+
+
+def _statistics_dialog(module: FeatureModule, title: str) -> str:
+    bars = "".join(f"<span style='height:{54 + index * 18}px'></span>" for index in range(6))
+    return f"""
+    <section class="dialog statistics-dialog">
+      {_dialog_head(title)}
+      <div class="dialog-body">
+        <div class="stat-dialog-grid">
+          <div><span>本月处理量</span><strong>1,286</strong></div>
+          <div><span>完成率</span><strong>86.4%</strong></div>
+          <div><span>异常记录</span><strong>72</strong></div>
+        </div>
+        <div class="dialog-chart">{bars}</div>
+        <div class="legend-row"><span>待处理</span><span>处理中</span><span>已完成</span><span>已归档</span></div>
+      </div>
+      <div class="dialog-footer"><span class="button ghost">导出图表</span><span class="button">查看明细</span></div>
+    </section>
+"""
+
+
+def _warning_dialog(module: FeatureModule, title: str, fields: list[str]) -> str:
+    rows = "".join(
+        f"<div><span>{escape(field)}</span><strong>{80 + index * 6}%</strong></div>"
+        for index, field in enumerate((fields[:4] or ["业务状态", "更新时间", "处理备注", "责任角色"]))
+    )
+    return f"""
+    <section class="dialog warning-dialog">
+      {_dialog_head(title)}
+      <div class="dialog-body">
+        <div class="warning-banner"><strong>{escape(module.title)}预警触发</strong><span>请确认阈值、责任人和处理时限。</span></div>
+        <div class="threshold-grid">{rows}</div>
+        <div class="dialog-note">系统根据阈值规则、状态变化和处理时长生成预警，确认后写入待办任务。</div>
+      </div>
+      <div class="dialog-footer"><span class="button ghost">暂不处理</span><span class="button">生成待办</span></div>
+    </section>
+"""
+
+
+def _review_dialog(module: FeatureModule, action: str, title: str, fields: list[str]) -> str:
+    return f"""
+    <section class="dialog review-dialog">
+      {_dialog_head(title)}
+      <div class="dialog-body review-layout">
+        <div class="detail-grid">{_field_rows(module, fields[:4])}</div>
+        <div class="approval-panel">
+          <div class="approval-step done"><b>提交</b><span>系统管理员 10:12</span></div>
+          <div class="approval-step active"><b>{escape(action)}</b><span>等待当前用户处理</span></div>
+          <div class="approval-step"><b>归档</b><span>处理完成后自动进入</span></div>
+        </div>
+        <div class="opinion-box">请输入{escape(action)}意见或处理说明</div>
+      </div>
+      <div class="dialog-footer"><span class="button ghost">退回</span><span class="button">通过{escape(action)}</span></div>
+    </section>
+"""
+
+
+def _confirm_dialog(module: FeatureModule, action: str) -> str:
+    note = f"窗口要求用户确认{action}原因，系统提交前校验权限范围并记录操作日志。"
+    return f"""
+    <section class="dialog confirm-dialog">
+      {_dialog_head("信息")}
+      <div class="confirm-body">
+        <div class="confirm-icon">!</div>
+        <div>
+          <strong>确认{escape(action)}{escape(module.title)}记录？</strong>
+          <p>{escape(note)}</p>
+        </div>
+      </div>
+      <div class="dialog-footer"><span class="button">确定</span><span class="button ghost">取消</span></div>
+    </section>
+"""
+
+
+def _detail_dialog(module: FeatureModule, action: str, title: str, fields: list[str]) -> str:
+    note = f"窗口用于查看{module.title}的基础信息、处理轨迹、状态变化和关联记录，便于用户核对业务结果。"
+    return f"""
+    <section class="dialog detail-dialog">
+      {_dialog_head(title)}
+      <div class="dialog-body">
+        <div class="detail-grid">{_field_rows(module, fields)}</div>
+        <div class="track-list">
+          <div><b>{escape(action)}记录</b><span>提交人：系统管理员　时间：2026-06-08 10:30</span></div>
+          <div><b>状态变化</b><span>待处理 → 处理中，已写入操作日志</span></div>
+          <div><b>关联说明</b><span>{escape(note)}</span></div>
+        </div>
+      </div>
+      <div class="dialog-footer"><span class="button ghost">导出记录</span><span class="button">关闭</span></div>
+    </section>
+"""
+
+
+def _form_dialog(module: FeatureModule, action: str, title: str, fields: list[str]) -> str:
+    note = f"窗口用于填写或维护{module.title}数据，系统按必填项、状态流转和业务编码规则进行校验。"
+    primary = "提交" if action in {"登记", "新增"} else "保存"
+    return f"""
+    <section class="dialog form-dialog">
+      {_dialog_head(title)}
+      <div class="dialog-body">
+        <div class="form-grid">{_form_items(module, fields)}</div>
+        <div class="dialog-note">{escape(note)}</div>
+      </div>
+      <div class="dialog-footer"><span class="button ghost">取消</span><span class="button">{escape(primary)}</span></div>
+    </section>
+"""
+
+
+def _operation_sample_value(module: FeatureModule, field: str, index: int) -> str:
+    values = [
+        f"{_module_page_key(module.key).upper()}-{index + 1001}",
+        f"{module.title}记录{index + 1:03d}",
+        "待处理",
+        "系统管理员",
+        "2026-06-08 10:30",
+        "业务数据已完成初步校验",
+    ]
+    if "状态" in field:
+        return "待处理"
+    if "时间" in field:
+        return "2026-06-08 10:30"
+    if "角色" in field or "责任" in field:
+        return "系统管理员"
+    if "编号" in field or "编码" in field:
+        return values[0]
+    if "名称" in field:
+        return values[1]
+    return values[index % len(values)]
 
 
 def _build_game_pages(task: GenerationTask, blueprint: ProductBlueprint, ui_dir: Path, ui_blueprint: UiBlueprint) -> list[UiScreenshot]:
@@ -587,9 +922,21 @@ def _page_shell(title: str, body: str, renderer: str = "admin") -> str:
     .app {{ min-height: 100vh; display: grid; grid-template-columns: 220px 1fr; }}
     .sidebar {{ background: var(--sidebar, #1f314f); color: #dce7f7; padding: 24px 18px; }}
     .brand {{ font-size: 18px; font-weight: 800; line-height: 1.35; margin-bottom: 22px; }}
+    .sidebar-subtitle {{ margin: -12px 0 18px; color: rgba(220,231,247,.76); font-size: 12px; line-height: 1.45; }}
     .nav {{ display: grid; gap: 8px; }}
     .nav span {{ display: block; padding: 10px 12px; border-radius: 6px; background: rgba(255,255,255,.06); font-size: 13px; }}
     .nav span.active {{ background: var(--accent, #2f6fed); color: white; }}
+    .topbar {{ min-height: 76px; display: grid; grid-template-columns: 250px 1fr auto; align-items: center; gap: 18px; padding: 12px 24px; background: var(--sidebar, #1f314f); color: #dce7f7; }}
+    .topbar .brand {{ margin: 0 0 4px; color: #ffffff; }}
+    .topbar .nav {{ display: flex; gap: 8px; overflow: hidden; }}
+    .topbar .nav span {{ white-space: nowrap; }}
+    .app.nav-top_tabs {{ grid-template-columns: 1fr; grid-template-rows: auto 1fr; }}
+    .app.nav-top_tabs .main {{ padding: 20px 24px; }}
+    .app.nav-rail {{ grid-template-columns: 92px 1fr; }}
+    .app.nav-rail .sidebar {{ padding: 18px 12px; }}
+    .app.nav-rail .brand {{ font-size: 13px; writing-mode: vertical-rl; min-height: 120px; margin: 0 auto 16px; }}
+    .app.nav-rail .sidebar-subtitle {{ display: none; }}
+    .app.nav-rail .nav span {{ min-height: 48px; display: grid; place-items: center; padding: 6px; font-size: 12px; text-align: center; }}
     .main {{ padding: 24px; }}
     .top {{ height: 58px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; background: white; border: 1px solid #dde5ef; border-radius: 8px; margin-bottom: 18px; }}
     .title {{ font-size: 22px; font-weight: 800; }}
@@ -607,6 +954,89 @@ def _page_shell(title: str, body: str, renderer: str = "admin") -> str:
     .button {{ height: 36px; padding: 0 14px; border-radius: 6px; background: var(--accent, #2f6fed); color: white; display: inline-flex; align-items: center; font-weight: 700; }}
     .status {{ padding: 4px 8px; border-radius: 999px; background: #e8f6ef; color: #157347; font-weight: 700; font-size: 12px; }}
     .warn {{ background: #fff3cd; color: #8a5a00; }}
+    .operation-preview {{ position: relative; min-height: 620px; }}
+    .operation-background {{ filter: saturate(.82); pointer-events: none; }}
+    .modal-backdrop {{ position: fixed; inset: 0; display: grid; place-items: center; padding: 38px; background: rgba(0,0,0,.38); }}
+    .dialog {{ width: min(620px, calc(100vw - 96px)); max-height: calc(100vh - 76px); overflow: hidden; border-radius: 4px; background: #ffffff; border: 1px solid #b8c2d0; box-shadow: 0 18px 52px rgba(0,0,0,.24); }}
+    .detail-dialog {{ width: min(690px, calc(100vw - 96px)); }}
+    .confirm-dialog {{ width: 360px; }}
+    .form-dialog {{ width: 450px; }}
+    .query-dialog {{ width: min(780px, calc(100vw - 96px)); }}
+    .import-dialog {{ width: 500px; }}
+    .export-dialog {{ width: 560px; }}
+    .statistics-dialog {{ width: 620px; }}
+    .warning-dialog {{ width: 520px; }}
+    .review-dialog {{ width: min(720px, calc(100vw - 96px)); }}
+    .dialog-head {{ height: 48px; padding: 0 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #e5e7eb; background: #f8fafc; }}
+    .dialog-head strong {{ font-size: 18px; color: #1f2937; }}
+    .dialog-close {{ width: 22px; height: 22px; display: grid; place-items: center; color: #64748b; font-size: 20px; line-height: 1; }}
+    .dialog-body {{ padding: 16px; display: grid; gap: 14px; }}
+    .form-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 14px; }}
+    .form-item {{ display: grid; gap: 7px; }}
+    .form-item span {{ font-size: 12px; color: #52637a; font-weight: 700; }}
+    .form-value {{ min-height: 38px; display: flex; align-items: center; padding: 0 10px; border: 1px solid #ccd6e3; border-radius: 6px; background: #fbfdff; color: #1f2937; font-size: 13px; }}
+    .dialog-note {{ min-height: 64px; padding: 10px; border: 1px solid #ccd6e3; border-radius: 6px; background: #fbfdff; color: #52637a; line-height: 1.6; font-size: 13px; }}
+    .detail-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid #d7dee8; border-bottom: 0; border-right: 0; }}
+    .detail-row {{ min-height: 38px; display: grid; grid-template-columns: 104px 1fr; border-right: 1px solid #d7dee8; border-bottom: 1px solid #d7dee8; }}
+    .detail-row span {{ padding: 9px 10px; background: #f7f9fc; color: #52637a; font-size: 12px; }}
+    .detail-row strong {{ padding: 9px 10px; color: #1f2937; font-size: 13px; font-weight: 600; }}
+    .track-list {{ display: grid; gap: 8px; }}
+    .track-list div {{ min-height: 42px; padding: 9px 10px; border: 1px solid #e1e7ef; border-radius: 4px; background: #fbfdff; }}
+    .track-list b {{ display: block; margin-bottom: 4px; color: #1f2937; font-size: 13px; }}
+    .track-list span {{ color: #64748b; font-size: 12px; line-height: 1.45; }}
+    .confirm-body {{ min-height: 112px; display: grid; grid-template-columns: 38px 1fr; gap: 14px; align-items: start; padding: 22px 18px 12px; }}
+    .confirm-body strong {{ display: block; margin-bottom: 10px; color: #1f2937; font-size: 16px; }}
+    .confirm-body p {{ margin: 0; color: #64748b; line-height: 1.55; font-size: 13px; }}
+    .confirm-icon {{ width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; background: #eaf4ff; color: #1d8cff; font-weight: 900; font-size: 20px; }}
+    .dialog-footer {{ height: 54px; padding: 0 16px; display: flex; align-items: center; justify-content: flex-end; gap: 10px; border-top: 1px solid #e5e7eb; background: #ffffff; }}
+    .ghost {{ background: #eef2f7; color: #334155; }}
+    .query-grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }}
+    .query-filter {{ min-height: 58px; display: grid; gap: 6px; }}
+    .query-filter span, .section-label {{ color: #52637a; font-size: 12px; font-weight: 800; }}
+    .query-filter div {{ height: 32px; display: flex; align-items: center; padding: 0 9px; border: 1px solid #ccd6e3; border-radius: 4px; color: #94a3b8; background: #fbfdff; font-size: 12px; }}
+    .query-actions {{ display: flex; gap: 8px; justify-content: flex-end; }}
+    .result-box {{ max-height: 210px; overflow: hidden; border: 1px solid #e1e7ef; border-radius: 4px; }}
+    .upload-zone {{ min-height: 116px; display: grid; place-items: center; gap: 8px; text-align: center; border: 1px dashed #8ab4f8; background: #f4f8ff; color: #365375; }}
+    .upload-zone strong {{ font-size: 16px; color: #1f2937; }}
+    .upload-zone span, .file-row span {{ color: #64748b; font-size: 13px; }}
+    .file-row {{ height: 42px; display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border: 1px solid #e1e7ef; border-radius: 4px; background: #ffffff; }}
+    .file-row b {{ color: #157347; font-size: 13px; }}
+    .progress-line {{ height: 8px; overflow: hidden; border-radius: 999px; background: #e5edf6; }}
+    .progress-line span {{ display: block; height: 100%; border-radius: 999px; background: var(--accent, #2f6fed); }}
+    .validation-list {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }}
+    .validation-list div {{ min-height: 70px; padding: 10px; border: 1px solid #e1e7ef; border-radius: 4px; background: #fbfdff; }}
+    .validation-list b, .approval-step b {{ display: block; margin-bottom: 5px; color: #1f2937; font-size: 13px; }}
+    .validation-list span, .approval-step span {{ color: #64748b; font-size: 12px; line-height: 1.45; }}
+    .export-layout {{ display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; }}
+    .option-list {{ display: grid; gap: 10px; margin-top: 10px; }}
+    .option-list div {{ min-height: 36px; display: flex; gap: 9px; align-items: center; padding: 0 10px; border: 1px solid #e1e7ef; border-radius: 4px; background: #fbfdff; color: #334155; font-size: 13px; }}
+    .check-mark {{ width: 18px; height: 18px; display: grid; place-items: center; border-radius: 3px; background: var(--accent, #2f6fed); color: white; font-size: 12px; }}
+    .muted-check {{ background: #eef2f7; color: #eef2f7; }}
+    .format-tabs {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 10px 0 12px; }}
+    .format-tabs span {{ height: 34px; display: grid; place-items: center; border: 1px solid #ccd6e3; border-radius: 4px; color: #52637a; font-weight: 700; font-size: 12px; }}
+    .format-tabs .active {{ background: var(--accent, #2f6fed); border-color: var(--accent, #2f6fed); color: #ffffff; }}
+    .export-preview {{ min-height: 86px; padding: 12px; border: 1px solid #e1e7ef; border-radius: 4px; background: #fbfdff; color: #52637a; line-height: 1.7; font-size: 13px; }}
+    .stat-dialog-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }}
+    .stat-dialog-grid div {{ min-height: 82px; padding: 12px; border-radius: 4px; background: #f8fafc; border: 1px solid #e1e7ef; }}
+    .stat-dialog-grid span {{ display: block; color: #52637a; font-size: 12px; margin-bottom: 8px; }}
+    .stat-dialog-grid strong {{ color: var(--accent, #2f6fed); font-size: 24px; }}
+    .dialog-chart {{ height: 180px; display: flex; align-items: end; gap: 14px; padding: 16px; border-radius: 4px; background: linear-gradient(180deg, #fbfdff, #f1f5f9); border: 1px solid #e1e7ef; }}
+    .dialog-chart span {{ flex: 1; border-radius: 5px 5px 0 0; background: linear-gradient(180deg, var(--accent, #2f6fed), rgba(47,111,237,.32)); }}
+    .legend-row {{ display: flex; gap: 14px; color: #64748b; font-size: 12px; }}
+    .warning-banner {{ min-height: 74px; padding: 14px; border-left: 5px solid #f59e0b; background: #fff7ed; }}
+    .warning-banner strong {{ display: block; margin-bottom: 7px; color: #92400e; font-size: 15px; }}
+    .warning-banner span {{ color: #8a5a00; font-size: 13px; }}
+    .threshold-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }}
+    .threshold-grid div {{ min-height: 62px; display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border: 1px solid #e1e7ef; border-radius: 4px; background: #fbfdff; }}
+    .threshold-grid span {{ color: #52637a; font-size: 12px; }}
+    .threshold-grid strong {{ color: #dc2626; font-size: 18px; }}
+    .review-layout {{ grid-template-columns: 1.2fr .8fr; }}
+    .review-layout .detail-grid {{ grid-column: 1; }}
+    .approval-panel {{ grid-column: 2; display: grid; gap: 10px; }}
+    .approval-step {{ min-height: 58px; padding: 10px 12px; border-left: 4px solid #cbd5e1; background: #fbfdff; border-radius: 4px; }}
+    .approval-step.done {{ border-left-color: #16a34a; }}
+    .approval-step.active {{ border-left-color: var(--accent, #2f6fed); background: var(--accent-soft, #eef6ff); }}
+    .opinion-box {{ grid-column: 1 / -1; min-height: 70px; padding: 12px; border: 1px solid #ccd6e3; border-radius: 4px; background: #fbfdff; color: #94a3b8; font-size: 13px; }}
     .two-col {{ display: grid; grid-template-columns: 1.4fr .9fr; gap: 16px; align-items: start; }}
     .focus-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
     .focus-card {{ min-height: 88px; border: 1px solid #e3ebf5; border-radius: 8px; padding: 12px; background: linear-gradient(180deg, #ffffff, var(--accent-soft, #f7fbff)); }}
@@ -630,6 +1060,10 @@ def _page_shell(title: str, body: str, renderer: str = "admin") -> str:
     .app.map .sidebar {{ background: #14352b; }}
     .app.pipeline {{ background: #f6f7fb; grid-template-columns: 205px 1fr; }}
     .app.pipeline .sidebar {{ background: #251b4d; }}
+    .app.nav-top_tabs {{ grid-template-columns: 1fr; grid-template-rows: auto 1fr; }}
+    .app.nav-top_tabs .main {{ padding: 20px 24px; }}
+    .app.nav-rail {{ grid-template-columns: 92px 1fr; }}
+    .app.nav-rail .sidebar {{ padding: 18px 12px; }}
     .dashboard-split {{ display: grid; grid-template-columns: 1.15fr .85fr; gap: 16px; align-items: stretch; margin-bottom: 16px; }}
     .queue-list {{ display: grid; gap: 10px; }}
     .queue-item {{ min-height: 56px; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; padding: 11px 12px; border: 1px solid #e3ebf5; border-radius: 8px; background: #fbfdff; }}
@@ -651,16 +1085,105 @@ def _page_shell(title: str, body: str, renderer: str = "admin") -> str:
     .pipeline-card {{ min-height: 118px; display: grid; align-content: space-between; padding: 14px; border-radius: 8px; background: white; border: 1px solid #dde5ef; box-shadow: inset 0 4px 0 var(--accent-soft, #eef6ff); }}
     .pipeline-card span {{ color: #52637a; font-size: 12px; }}
     .pipeline-card strong {{ color: var(--accent, #4f46e5); font-size: 22px; }}
+    .command-strip {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }}
+    .command-strip .card {{ background: #111827; color: #dbeafe; border-color: rgba(255,255,255,.08); }}
+    .command-strip .metric strong {{ color: #ffffff; }}
+    .command-grid {{ display: grid; grid-template-columns: 1.4fr .8fr; gap: 16px; align-items: start; }}
+    .command-main {{ grid-row: span 2; min-height: 420px; }}
+    .app.command .top {{ border-left: 5px solid var(--accent, #334155); }}
+    .kanban-board {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }}
+    .kanban-col {{ min-height: 318px; padding: 12px; border: 1px solid #e1e7ef; border-radius: 8px; background: #f8fafc; }}
+    .kanban-col h3 {{ margin: 0 0 10px; color: #334155; font-size: 14px; }}
+    .kanban-card {{ min-height: 86px; display: grid; gap: 6px; padding: 10px; margin-bottom: 10px; border-radius: 6px; background: #ffffff; border-left: 4px solid var(--accent, #ca8a04); box-shadow: 0 6px 14px rgba(15,23,42,.06); }}
+    .kanban-card strong {{ color: #1f2937; font-size: 13px; }}
+    .kanban-card span, .kanban-card small {{ color: #64748b; font-size: 12px; line-height: 1.45; }}
+    .matrix-layout {{ display: grid; grid-template-columns: 1.35fr .9fr; gap: 16px; align-items: start; }}
+    .matrix-main {{ grid-row: span 2; }}
+    .matrix-board {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
+    .matrix-cell {{ min-height: 118px; display: grid; align-content: space-between; padding: 12px; border-radius: 8px; background: linear-gradient(180deg, #ffffff, var(--accent-soft, #faf5ff)); border: 1px solid #e1e7ef; }}
+    .matrix-cell span {{ color: #52637a; font-size: 12px; }}
+    .matrix-cell strong {{ color: var(--accent, #9333ea); font-size: 24px; }}
+    .matrix-cell small {{ color: #64748b; line-height: 1.45; }}
+    .shape-triage {{ display: grid; grid-template-columns: 280px 1fr 300px; gap: 14px; align-items: stretch; }}
+    .shape-triage .panel {{ margin: 0; }}
+    .triage-stack {{ display: grid; gap: 10px; }}
+    .triage-item {{ min-height: 68px; padding: 12px; border-left: 5px solid var(--accent, #2f6fed); background: #ffffff; box-shadow: 0 6px 16px rgba(15,23,42,.06); }}
+    .triage-item strong {{ display: block; color: #172033; font-size: 13px; }}
+    .triage-item span {{ display: block; margin-top: 6px; color: #64748b; font-size: 12px; }}
+    .shape-ledger {{ display: grid; grid-template-columns: 1.2fr .8fr; grid-template-rows: auto 1fr; gap: 14px; }}
+    .shape-ledger .ledger-toolbar {{ grid-column: 1 / -1; display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }}
+    .ledger-box {{ min-height: 54px; display: grid; align-content: center; padding: 8px 12px; border: 1px solid #dbe3ef; background: #fff; color: #52637a; font-size: 12px; }}
+    .shape-wall {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; padding: 14px; background: #111827; color: #dbeafe; }}
+    .shape-wall .panel {{ margin: 0; background: #172033; border-color: rgba(255,255,255,.10); color: #dbeafe; }}
+    .shape-wall .panel h2, .shape-wall strong {{ color: #ffffff; }}
+    .shape-wall .wall-wide {{ grid-column: span 2; min-height: 300px; }}
+    .shape-wall .wall-full {{ grid-column: 1 / -1; }}
+    .shape-lane {{ display: grid; gap: 14px; }}
+    .lane-strip {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }}
+    .lane-step {{ min-height: 118px; padding: 12px; background: linear-gradient(180deg, #ffffff, var(--accent-soft, #eef6ff)); border-top: 5px solid var(--accent, #2f6fed); }}
+    .lane-step b {{ display: block; color: var(--accent, #2f6fed); font-size: 22px; margin-bottom: 8px; }}
+    .lane-step span {{ color: #52637a; font-size: 12px; line-height: 1.5; }}
+    .shape-case {{ display: grid; grid-template-columns: 330px 1fr 310px; gap: 14px; align-items: start; }}
+    .case-card {{ min-height: 96px; padding: 14px; background: #ffffff; border: 1px solid #e1e7ef; border-radius: 4px; }}
+    .case-card span {{ color: #52637a; font-size: 12px; }}
+    .case-card strong {{ display: block; margin-top: 8px; color: #172033; font-size: 18px; }}
+    .shape-board {{ display: grid; grid-template-columns: 1fr 340px; gap: 14px; align-items: start; }}
+    .shape-board .board-side {{ display: grid; gap: 14px; }}
+    .freeform-grid {{ display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 14px; align-items: start; }}
+    .app.shape-freeform_grid {{ height: 100vh; overflow: hidden; }}
+    .app.shape-freeform_grid .main {{ min-height: 0; overflow: hidden; }}
+    .app.shape-freeform_grid .top {{ height: 52px; margin-bottom: 12px; }}
+    .freeform-slot {{ min-height: 128px; max-height: 300px; margin: 0; overflow: hidden; padding: 12px; }}
+    .freeform-slot h2 {{ margin-bottom: 8px; font-size: 15px; }}
+    .freeform-slot .grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 0; }}
+    .freeform-slot .card {{ padding: 10px; }}
+    .freeform-slot .metric strong {{ font-size: 20px; }}
+    .freeform-slot .mini-chart {{ height: 112px; padding: 8px; }}
+    .freeform-slot .queue-list {{ max-height: 230px; overflow: hidden; }}
+    .freeform-slot .queue-item {{ min-height: 48px; padding: 8px 10px; }}
+    .freeform-slot .map-board {{ min-height: 210px; }}
+    .freeform-slot .kanban-col {{ min-height: 210px; }}
+    .freeform-slot .timeline-step {{ min-height: 50px; padding-top: 8px; padding-bottom: 8px; }}
+    .freeform-slot th, .freeform-slot td {{ padding: 7px 8px; font-size: 12px; }}
+    .freeform-slot .ledger-toolbar {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    .freeform-dense_console {{ padding: 14px; background: #111827; }}
+    .freeform-dense_console .freeform-slot {{ background: #172033; border-color: rgba(255,255,255,.10); color: #dbeafe; }}
+    .freeform-dense_console .freeform-slot h2, .freeform-dense_console .freeform-slot strong {{ color: #ffffff; }}
+    .freeform-document_desk .freeform-slot {{ border-radius: 2px; box-shadow: none; border-left: 5px solid var(--accent, #2f6fed); }}
+    .freeform-wide_board .freeform-slot:first-child {{ min-height: 360px; }}
     .timeline {{ display: grid; gap: 11px; }}
     .timeline-step {{ position: relative; min-height: 62px; padding: 11px 12px 11px 42px; border: 1px solid #e3ebf5; border-radius: 8px; background: #ffffff; }}
     .timeline-step::before {{ content: attr(data-step); position: absolute; left: 12px; top: 13px; width: 22px; height: 22px; border-radius: 50%; background: var(--accent, #2f6fed); color: white; display: grid; place-items: center; font-size: 12px; font-weight: 800; }}
     .timeline-step strong {{ display: block; margin-bottom: 4px; }}
     .timeline-step small {{ color: #64748b; }}
-    .login-wrap {{ min-height: 100vh; display: grid; grid-template-columns: 1fr 430px; background: linear-gradient(135deg, #1f314f, #2f6fed); }}
-    .login-hero {{ color: white; padding: 80px 70px; display: flex; flex-direction: column; justify-content: center; }}
-    .login-hero h1 {{ font-size: 34px; margin: 0 0 16px; }}
-    .login-box {{ background: white; padding: 48px 42px; display: flex; flex-direction: column; justify-content: center; }}
-    .login-box h2 {{ margin: 0 0 24px; }}
+    .login-wrap {{ min-height: 100vh; color: #172033; background: var(--login-bg, linear-gradient(135deg, #1f314f, #2f6fed)); }}
+    .login-wrap .button {{ height: 42px; display: grid; place-items: center; border-radius: 6px; background: var(--accent, #2f6fed); color: white; font-weight: 800; }}
+    .login-brand h1, .login-hero h1 {{ font-size: 34px; line-height: 1.18; margin: 0 0 14px; color: inherit; }}
+    .login-brand p, .login-hero p {{ margin: 0; line-height: 1.7; color: inherit; opacity: .82; }}
+    .login-box {{ background: white; padding: 42px; display: flex; flex-direction: column; justify-content: center; box-shadow: 0 18px 48px rgba(15,23,42,.14); }}
+    .login-box h2 {{ margin: 0 0 24px; font-size: 24px; color: #172033; }}
+    .login-split_brand {{ display: grid; grid-template-columns: 1fr 430px; --login-bg: linear-gradient(135deg, var(--sidebar, #1f314f), var(--accent, #2f6fed)); }}
+    .login-split_brand .login-hero {{ color: white; padding: 80px 70px; display: flex; flex-direction: column; justify-content: center; }}
+    .login-center_card {{ display: grid; place-items: center; padding: 64px; --login-bg: linear-gradient(180deg, #f8fafc, var(--accent-soft, #eef6ff)); }}
+    .login-center_card .login-box {{ width: 460px; min-height: 490px; border-radius: 8px; }}
+    .login-center_card .login-brand {{ width: 720px; max-width: calc(100vw - 620px); position: absolute; left: 70px; top: 86px; color: var(--sidebar, #1f314f); }}
+    .login-console_gate {{ display: grid; grid-template-columns: 1.15fr .85fr; padding: 54px; gap: 30px; --login-bg: #0f172a; color: #dbeafe; }}
+    .login-console_gate .login-box {{ background: #111827; border: 1px solid rgba(255,255,255,.12); box-shadow: none; color: #e5eefc; }}
+    .login-console_gate .login-box h2 {{ color: #ffffff; }}
+    .login-console_gate .field label {{ color: #9fb3ca; }}
+    .login-console_gate .field div {{ background: #0b1220; border-color: #334155; color: #94a3b8; }}
+    .login-console {{ border: 1px solid rgba(255,255,255,.12); background: #111827; padding: 24px; display: grid; align-content: start; gap: 14px; }}
+    .login-console div {{ min-height: 44px; padding: 12px; background: #0b1220; color: #9fb3ca; border-left: 4px solid var(--accent, #2f6fed); font-size: 13px; }}
+    .login-portal_grid {{ display: grid; grid-template-columns: .9fr 1.1fr; gap: 28px; padding: 56px; --login-bg: #eef2f7; }}
+    .login-portal_grid .login-box {{ border-radius: 0; min-height: 520px; }}
+    .login-portal {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-content: center; }}
+    .login-portal div {{ min-height: 132px; padding: 18px; display: grid; align-content: space-between; background: white; border-left: 5px solid var(--accent, #2f6fed); box-shadow: 0 10px 24px rgba(15,23,42,.08); }}
+    .login-portal span {{ color: #64748b; font-size: 12px; }}
+    .login-portal strong {{ color: #172033; font-size: 20px; }}
+    .login-side_preview {{ display: grid; grid-template-columns: 520px 1fr; min-height: 100vh; --login-bg: #f8fafc; }}
+    .login-side_preview .login-box {{ box-shadow: none; border-right: 1px solid #d9e2ef; }}
+    .login-preview {{ padding: 56px; display: grid; gap: 16px; align-content: center; }}
+    .login-preview .panel {{ margin: 0; }}
     .field {{ display: grid; gap: 8px; margin-bottom: 16px; }}
     .field label {{ color: #52637a; font-size: 13px; font-weight: 700; }}
     .field div {{ height: 42px; border: 1px solid #ccd6e3; border-radius: 7px; padding: 0 12px; display: flex; align-items: center; color: #64748b; }}
@@ -725,20 +1248,71 @@ def _page_shell(title: str, body: str, renderer: str = "admin") -> str:
 </html>"""
 
 
-def _login_body(task: GenerationTask, blueprint: ProductBlueprint) -> str:
-    return f"""
-<div class="login-wrap">
-  <section class="login-hero">
-    <h1>{escape(task.software_name)}</h1>
-    <p>{escape(blueprint.summary)}</p>
-  </section>
+def _login_body(task: GenerationTask, blueprint: ProductBlueprint, design_brief: dict[str, Any] | None = None) -> str:
+    profile = _profile_for_blueprint(task, blueprint, design_brief)
+    pattern = str(profile.get("login_pattern") or "split_brand")
+    style = f"--accent:{profile['accent']};--accent-soft:{profile['accent_soft']};--sidebar:{profile['sidebar']};"
+    form = f"""
   <section class="login-box">
-    <h2>系统登录</h2>
+    <h2>{escape(str(profile.get("industry_subtype") or "系统"))}登录</h2>
     <div class="field"><label>账号</label><div>请输入用户名</div></div>
     <div class="field"><label>密码</label><div>请输入密码</div></div>
     <div class="field"><label>验证码</label><div>请输入右侧图形验证码</div></div>
     <div class="button">登录系统</div>
+  </section>"""
+    brand = f"""
+  <section class="login-brand">
+    <h1>{escape(task.software_name)}</h1>
+    <p>{escape(str(profile.get("visual_mood") or blueprint.summary))}</p>
+  </section>"""
+    if pattern == "center_card":
+        return f"""
+<div class="login-wrap login-center_card" style="{style}">
+{brand}
+{form}
+</div>"""
+    if pattern == "console_gate":
+        console = "".join(
+            f"<div>{escape(label)}：{escape(value)} / {escape(desc)}</div>"
+            for label, value, desc in profile.get("focus_cards", [])[:5]
+        )
+        return f"""
+<div class="login-wrap login-console_gate" style="{style}">
+  <section class="login-console">
+    <div><strong>{escape(task.software_name)}</strong></div>
+    {console}
   </section>
+{form}
+</div>"""
+    if pattern == "portal_grid":
+        cards = "".join(
+            f"<div><span>{escape(label)}</span><strong>{escape(value)}</strong><small>{escape(desc)}</small></div>"
+            for label, value, desc in profile.get("focus_cards", [])[:4]
+        )
+        return f"""
+<div class="login-wrap login-portal_grid" style="{style}">
+{form}
+  <section class="login-portal">
+    {cards}
+  </section>
+</div>"""
+    if pattern == "side_preview":
+        return f"""
+<div class="login-wrap login-side_preview" style="{style}">
+{form}
+  <section class="login-preview">
+    <div class="panel"><h2>{escape(task.software_name)}</h2><p class="muted">{escape(blueprint.summary)}</p></div>
+    <div class="grid">{_metric_cards(profile["metrics"])}</div>
+    <div class="panel"><h2>{escape(profile["todo_title"])}</h2>{_queue_list(profile, blueprint.modules, 4)}</div>
+  </section>
+</div>"""
+    return f"""
+<div class="login-wrap login-split_brand" style="{style}">
+  <section class="login-hero">
+    <h1>{escape(task.software_name)}</h1>
+    <p>{escape(blueprint.summary)}</p>
+  </section>
+{form}
 </div>"""
 
 
@@ -1076,6 +1650,13 @@ def _admin_profile(task: GenerationTask) -> dict[str, Any]:
         "accent_soft": "#eef6ff",
         "sidebar": "#1f314f",
         "layout_variant": "classic",
+        "nav_model": "side_menu",
+        "workspace_shape": "",
+        "login_pattern": "split_brand",
+        "industry_subtype": "",
+        "visual_mood": "桌面业务系统界面",
+        "dashboard_pattern": "指标总览+待办队列",
+        "module_pattern": "列表详情",
         "user_label": "当前用户：系统管理员",
         "metrics": [("今日新增", "128"), ("待办审核", "36"), ("异常预警", "7"), ("本月处理", "2,406")],
         "filters": ["关键字", "状态", "时间范围"],
@@ -1410,23 +1991,26 @@ def _admin_profile(task: GenerationTask) -> dict[str, Any]:
     return profile
 
 
-def _dashboard_body(task: GenerationTask, blueprint: ProductBlueprint) -> str:
-    profile = _profile_for_blueprint(task, blueprint)
-    return _layout(task, blueprint, "系统首页", _dashboard_content(profile, blueprint), active="系统首页")
+def _dashboard_body(task: GenerationTask, blueprint: ProductBlueprint, design_brief: dict[str, Any] | None = None) -> str:
+    profile = _profile_for_blueprint(task, blueprint, design_brief)
+    return _layout(task, blueprint, "系统首页", _dashboard_content(profile, blueprint), active="系统首页", design_brief=design_brief)
 
 
-def _module_body(task: GenerationTask, blueprint: ProductBlueprint, module: FeatureModule) -> str:
-    profile = _profile_for_blueprint(task, blueprint)
-    return _layout(task, blueprint, module.title, _module_content(profile, blueprint, module), active=module.title)
+def _module_body(task: GenerationTask, blueprint: ProductBlueprint, module: FeatureModule, design_brief: dict[str, Any] | None = None) -> str:
+    profile = _profile_for_blueprint(task, blueprint, design_brief)
+    return _layout(task, blueprint, module.title, _module_content(profile, blueprint, module), active=module.title, design_brief=design_brief)
 
 
-def _statistics_body(task: GenerationTask, blueprint: ProductBlueprint) -> str:
-    profile = _profile_for_blueprint(task, blueprint)
-    return _layout(task, blueprint, "统计报表界面", _statistics_content(profile, blueprint), active="统计报表页")
+def _statistics_body(task: GenerationTask, blueprint: ProductBlueprint, design_brief: dict[str, Any] | None = None) -> str:
+    profile = _profile_for_blueprint(task, blueprint, design_brief)
+    return _layout(task, blueprint, "统计报表界面", _statistics_content(profile, blueprint), active="统计报表页", design_brief=design_brief)
 
 
 def _dashboard_content(profile: dict[str, Any], blueprint: ProductBlueprint) -> str:
     variant = str(profile.get("layout_variant") or "classic")
+    shaped = _dashboard_shape_content(profile, blueprint)
+    if shaped:
+        return shaped
     if variant == "risk":
         return f"""
 {_risk_tiles(profile)}
@@ -1463,6 +2047,32 @@ def _dashboard_content(profile: dict[str, Any], blueprint: ProductBlueprint) -> 
 </div>
 <div class="panel"><h2>{escape(profile["todo_title"])}</h2>{_queue_list(profile, blueprint.modules, 5)}</div>
 """
+    if variant == "command":
+        return f"""
+<div class="command-strip">{_metric_cards(profile["metrics"])}</div>
+<div class="command-grid">
+  <div class="panel command-main"><h2>{escape(profile["dashboard_pattern"])}</h2>{_mini_chart(profile)}<div class="process">{_process(profile)}</div></div>
+  <div class="panel"><h2>{escape(profile["todo_title"])}</h2>{_queue_list(profile, blueprint.modules, 5)}</div>
+  <div class="panel"><h2>{escape(profile["focus_title"])}</h2>{_focus_panel(profile, compact=True)}</div>
+</div>
+"""
+    if variant == "kanban":
+        return f"""
+<div class="grid">{_metric_cards(profile["metrics"])}</div>
+<div class="panel"><h2>{escape(profile["dashboard_pattern"])}</h2>{_kanban_board(profile, blueprint.modules)}</div>
+<div class="dashboard-split">
+  <div class="panel"><h2>{escape(profile["focus_title"])}</h2>{_focus_panel(profile, compact=True)}</div>
+  <div class="panel"><h2>近期趋势</h2>{_mini_chart(profile)}</div>
+</div>
+"""
+    if variant == "matrix":
+        return f"""
+<div class="matrix-layout">
+  <div class="panel matrix-main"><h2>{escape(profile["dashboard_pattern"])}</h2>{_matrix_board(profile, blueprint.modules)}</div>
+  <div class="panel"><h2>{escape(profile["todo_title"])}</h2>{_queue_list(profile, blueprint.modules, 4)}</div>
+  <div class="panel"><h2>指标趋势</h2>{_mini_chart(profile)}</div>
+</div>
+"""
     return f"""
 <div class="grid">{_metric_cards(profile["metrics"])}</div>
 <div class="two-col">
@@ -1476,6 +2086,9 @@ def _dashboard_content(profile: dict[str, Any], blueprint: ProductBlueprint) -> 
 def _module_content(profile: dict[str, Any], blueprint: ProductBlueprint, module: FeatureModule) -> str:
     variant = str(profile.get("layout_variant") or "classic")
     filters = _filter_toolbar(profile)
+    shaped = _module_shape_content(profile, blueprint, module, filters)
+    if shaped:
+        return shaped
     if variant == "risk":
         return f"""
 {_risk_tiles(profile)}
@@ -1518,6 +2131,31 @@ def _module_content(profile: dict[str, Any], blueprint: ProductBlueprint, module
 </div>
 <div class="panel"><h2>模块说明</h2><p class="muted">{escape(module.description)}</p></div>
 """
+    if variant == "command":
+        return f"""
+<div class="command-strip">{_metric_cards(profile["metrics"])}</div>
+<div class="command-grid">
+  <div class="panel command-main"><h2>{escape(module.title)}指挥区</h2><div class="toolbar">{filters}<span class="button">处置</span><span class="button">联动</span></div>{_table(profile["table_headers"], _module_rows(module, profile))}</div>
+  <div class="panel"><h2>处置步骤</h2>{_timeline(profile)}</div>
+  <div class="panel"><h2>专题规则</h2>{_focus_panel(profile, compact=True)}</div>
+</div>
+"""
+    if variant == "kanban":
+        return f"""
+<div class="panel"><h2>{escape(module.title)}任务看板</h2>{_kanban_board(profile, [module] + blueprint.modules[:5])}</div>
+<div class="dashboard-split">
+  <div class="panel"><div class="toolbar">{filters}<span class="button">新增任务</span><span class="button">批量处理</span></div>{_table(profile["table_headers"], _module_rows(module, profile))}</div>
+  <div class="panel"><h2>模块说明</h2><p class="muted">{escape(module.description)}</p>{_focus_panel(profile, compact=True)}</div>
+</div>
+"""
+    if variant == "matrix":
+        return f"""
+<div class="matrix-layout">
+  <div class="panel matrix-main"><h2>{escape(module.title)}矩阵</h2>{_matrix_board(profile, [module] + blueprint.modules[:5])}</div>
+  <div class="panel"><h2>处理列表</h2>{_table(profile["table_headers"], _module_rows(module, profile))}</div>
+  <div class="panel"><h2>{escape(profile["module_focus_title"])}</h2>{_timeline(profile)}</div>
+</div>
+"""
     return f"""
 <div class="panel">
   <div class="toolbar">{filters}<span class="button">查询</span><span class="button">新增</span></div>
@@ -1533,6 +2171,9 @@ def _module_content(profile: dict[str, Any], blueprint: ProductBlueprint, module
 def _statistics_content(profile: dict[str, Any], blueprint: ProductBlueprint) -> str:
     variant = str(profile.get("layout_variant") or "classic")
     rows = _stat_rows(profile)
+    shaped = _statistics_shape_content(profile, blueprint, rows)
+    if shaped:
+        return shaped
     if variant == "risk":
         return f"""
 {_risk_tiles(profile)}
@@ -1565,6 +2206,31 @@ def _statistics_content(profile: dict[str, Any], blueprint: ProductBlueprint) ->
   <div class="panel"><h2>流程完成趋势</h2>{_timeline(profile)}</div>
 </div>
 """
+    if variant == "command":
+        return f"""
+<div class="command-strip">{_metric_cards(profile["metrics"])}</div>
+<div class="command-grid">
+  <div class="panel command-main"><h2>{escape(profile["stat_title"])}</h2>{_mini_chart(profile)}<div class="process">{_process(profile)}</div></div>
+  <div class="panel"><h2>统计明细</h2>{_table(profile["stat_headers"], rows)}</div>
+  <div class="panel"><h2>重点指标</h2>{_focus_panel(profile, compact=True)}</div>
+</div>
+"""
+    if variant == "kanban":
+        return f"""
+<div class="panel"><h2>{escape(profile["stat_title"])}看板</h2>{_kanban_board(profile, blueprint.modules)}</div>
+<div class="dashboard-split">
+  <div class="panel"><h2>统计明细</h2>{_table(profile["stat_headers"], rows)}</div>
+  <div class="panel"><h2>趋势分析</h2>{_mini_chart(profile)}</div>
+</div>
+"""
+    if variant == "matrix":
+        return f"""
+<div class="matrix-layout">
+  <div class="panel matrix-main"><h2>{escape(profile["stat_title"])}</h2>{_matrix_board(profile, blueprint.modules)}</div>
+  <div class="panel"><h2>统计明细</h2>{_table(profile["stat_headers"], rows)}</div>
+  <div class="panel"><h2>趋势分析</h2>{_mini_chart(profile)}</div>
+</div>
+"""
     return f"""
 <div class="grid">{_metric_cards(profile["metrics"])}</div>
 <div class="two-col">
@@ -1574,26 +2240,309 @@ def _statistics_content(profile: dict[str, Any], blueprint: ProductBlueprint) ->
 """
 
 
-def _layout(task: GenerationTask, blueprint: ProductBlueprint, title: str, content: str, active: str) -> str:
-    profile = _profile_for_blueprint(task, blueprint)
-    nav = ["系统首页"] + [module.title for module in blueprint.modules[:6]] + ["统计报表页", "系统设置页"]
+def _dashboard_shape_content(profile: dict[str, Any], blueprint: ProductBlueprint) -> str:
+    shape = str(profile.get("workspace_shape") or "")
+    if shape == "freeform_grid":
+        return _freeform_structure_content(profile, blueprint, "dashboard")
+    if shape == "triage_console":
+        return f"""
+<div class="shape-triage">
+  <section class="panel"><h2>{escape(profile["todo_title"])}</h2>{_triage_stack(profile, blueprint.modules)}</section>
+  <section class="panel"><h2>{escape(profile["dashboard_pattern"])}</h2>{_table(profile["table_headers"], _domain_rows(blueprint.modules, profile, 8))}</section>
+  <section class="panel"><h2>{escape(profile["focus_title"])}</h2>{_focus_panel(profile, compact=True)}{_mini_chart(profile)}</section>
+</div>
+"""
+    if shape == "ledger_split":
+        return f"""
+<div class="shape-ledger">
+  <div class="ledger-toolbar">{_ledger_boxes(profile)}</div>
+  <section class="panel"><h2>{escape(profile["dashboard_pattern"])}</h2>{_table(profile["table_headers"], _domain_rows(blueprint.modules, profile, 9))}</section>
+  <section class="panel"><h2>{escape(profile["focus_title"])}</h2>{_focus_panel(profile)}<div class="process">{_process(profile)}</div></section>
+</div>
+"""
+    if shape == "monitor_wall":
+        return f"""
+<div class="shape-wall">
+  <section class="panel wall-wide"><h2>{escape(profile["dashboard_pattern"])}</h2>{_mini_chart(profile)}</section>
+  <section class="panel wall-wide"><h2>{escape(profile["todo_title"])}</h2>{_queue_list(profile, blueprint.modules, 5)}</section>
+  <section class="panel">{_focus_panel(profile, compact=True)}</section>
+  <section class="panel wall-full"><h2>{escape(profile["module_focus_title"])}</h2>{_timeline(profile)}</section>
+</div>
+"""
+    if shape == "process_lane":
+        return f"""
+<div class="shape-lane">
+  <div class="lane-strip">{_lane_steps(profile)}</div>
+  <section class="panel"><h2>{escape(profile["todo_title"])}</h2>{_queue_list(profile, blueprint.modules, 6)}</section>
+  <section class="panel"><h2>{escape(profile["focus_title"])}</h2>{_mini_chart(profile)}</section>
+</div>
+"""
+    if shape == "case_desk":
+        return f"""
+<div class="shape-case">
+  <section class="panel"><h2>业务档案</h2>{_case_cards(profile)}</section>
+  <section class="panel"><h2>{escape(profile["dashboard_pattern"])}</h2>{_table(profile["table_headers"], _domain_rows(blueprint.modules, profile, 8))}</section>
+  <section class="panel"><h2>{escape(profile["module_focus_title"])}</h2>{_timeline(profile)}</section>
+</div>
+"""
+    if shape == "board_columns":
+        return f"""
+<div class="shape-board">
+  <section class="panel"><h2>{escape(profile["dashboard_pattern"])}</h2>{_kanban_board(profile, blueprint.modules)}</section>
+  <aside class="board-side">
+    <section class="panel"><h2>{escape(profile["focus_title"])}</h2>{_focus_panel(profile, compact=True)}</section>
+    <section class="panel"><h2>趋势</h2>{_mini_chart(profile)}</section>
+  </aside>
+</div>
+"""
+    return ""
+
+
+def _module_shape_content(profile: dict[str, Any], blueprint: ProductBlueprint, module: FeatureModule, filters: str) -> str:
+    shape = str(profile.get("workspace_shape") or "")
+    if shape == "freeform_grid":
+        return _freeform_structure_content(profile, blueprint, "module", module=module, filters=filters)
+    if shape == "triage_console":
+        return f"""
+<div class="shape-triage">
+  <section class="panel"><h2>{escape(module.title)}待处理</h2>{_triage_stack(profile, [module] + blueprint.modules[:5])}</section>
+  <section class="panel"><div class="toolbar">{filters}<span class="button">复核</span><span class="button">分派</span></div>{_table(profile["table_headers"], _module_rows(module, profile))}</section>
+  <section class="panel"><h2>处置依据</h2>{_focus_panel(profile, compact=True)}{_timeline(profile)}</section>
+</div>
+"""
+    if shape == "ledger_split":
+        return f"""
+<div class="shape-ledger">
+  <div class="ledger-toolbar">{_ledger_boxes(profile)}</div>
+  <section class="panel"><div class="toolbar">{filters}<span class="button">查询</span><span class="button">导出</span></div>{_table(profile["table_headers"], _module_rows(module, profile))}</section>
+  <section class="panel"><h2>{escape(module.title)}详情</h2>{_case_cards(profile)}<p class="muted">{escape(module.description)}</p></section>
+</div>
+"""
+    if shape == "monitor_wall":
+        return f"""
+<div class="shape-wall">
+  <section class="panel wall-wide"><h2>{escape(module.title)}监控</h2>{_mini_chart(profile)}</section>
+  <section class="panel wall-wide"><h2>实时队列</h2>{_queue_list(profile, [module] + blueprint.modules[:5], 5)}</section>
+  <section class="panel wall-full"><div class="toolbar">{filters}<span class="button">处置</span><span class="button">联动</span></div>{_table(profile["table_headers"], _module_rows(module, profile))}</section>
+</div>
+"""
+    if shape == "process_lane":
+        return f"""
+<div class="shape-lane">
+  <div class="lane-strip">{_lane_steps(profile)}</div>
+  <section class="panel"><div class="toolbar">{filters}<span class="button">提交</span><span class="button">审核</span></div>{_table(profile["table_headers"], _module_rows(module, profile))}</section>
+  <section class="panel"><h2>{escape(module.title)}说明</h2><p class="muted">{escape(module.description)}</p></section>
+</div>
+"""
+    if shape == "case_desk":
+        return f"""
+<div class="shape-case">
+  <section class="panel"><h2>{escape(module.title)}档案</h2>{_case_cards(profile)}</section>
+  <section class="panel"><div class="toolbar">{filters}<span class="button">保存</span><span class="button">流转</span></div>{_table(profile["table_headers"], _module_rows(module, profile))}</section>
+  <section class="panel"><h2>规则与流转</h2>{_timeline(profile)}{_focus_panel(profile, compact=True)}</section>
+</div>
+"""
+    if shape == "board_columns":
+        return f"""
+<div class="shape-board">
+  <section class="panel"><h2>{escape(module.title)}看板</h2>{_kanban_board(profile, [module] + blueprint.modules[:5])}</section>
+  <aside class="board-side">
+    <section class="panel"><div class="toolbar">{filters}<span class="button">新增</span></div>{_queue_list(profile, [module] + blueprint.modules[:5], 4)}</section>
+    <section class="panel"><h2>模块指标</h2>{_focus_panel(profile, compact=True)}</section>
+  </aside>
+</div>
+"""
+    return ""
+
+
+def _statistics_shape_content(profile: dict[str, Any], blueprint: ProductBlueprint, rows: list[list[str]]) -> str:
+    shape = str(profile.get("workspace_shape") or "")
+    if shape == "freeform_grid":
+        return _freeform_structure_content(profile, blueprint, "statistics", rows=rows)
+    if shape == "monitor_wall":
+        return f"""
+<div class="shape-wall">
+  <section class="panel wall-wide"><h2>{escape(profile["stat_title"])}</h2>{_mini_chart(profile)}</section>
+  <section class="panel wall-wide"><h2>统计明细</h2>{_table(profile["stat_headers"], rows)}</section>
+  <section class="panel wall-full"><h2>流程状态</h2>{_timeline(profile)}</section>
+</div>
+"""
+    if shape in {"triage_console", "case_desk"}:
+        return f"""
+<div class="shape-case">
+  <section class="panel"><h2>统计对象</h2>{_case_cards(profile)}</section>
+  <section class="panel"><h2>{escape(profile["stat_title"])}</h2>{_table(profile["stat_headers"], rows)}</section>
+  <section class="panel"><h2>趋势分析</h2>{_mini_chart(profile)}{_focus_panel(profile, compact=True)}</section>
+</div>
+"""
+    if shape == "process_lane":
+        return f"""
+<div class="shape-lane">
+  <div class="lane-strip">{_lane_steps(profile)}</div>
+  <section class="panel"><h2>{escape(profile["stat_title"])}</h2>{_table(profile["stat_headers"], rows)}</section>
+</div>
+"""
+    if shape == "board_columns":
+        return f"""
+<div class="shape-board">
+  <section class="panel"><h2>{escape(profile["stat_title"])}</h2>{_kanban_board(profile, blueprint.modules)}</section>
+  <aside class="board-side"><section class="panel">{_table(profile["stat_headers"], rows)}</section><section class="panel">{_mini_chart(profile)}</section></aside>
+</div>
+"""
+    if shape == "ledger_split":
+        return f"""
+<div class="shape-ledger">
+  <div class="ledger-toolbar">{_ledger_boxes(profile)}</div>
+  <section class="panel"><h2>{escape(profile["stat_title"])}</h2>{_table(profile["stat_headers"], rows)}</section>
+  <section class="panel"><h2>趋势分析</h2>{_mini_chart(profile)}<div class="process">{_process(profile)}</div></section>
+</div>
+"""
+    return ""
+
+
+def _freeform_structure_content(
+    profile: dict[str, Any],
+    blueprint: ProductBlueprint,
+    page_kind: str,
+    module: FeatureModule | None = None,
+    rows: list[list[str]] | None = None,
+    filters: str = "",
+) -> str:
+    structure = dict(profile.get("structure_blueprint") or {})
+    page = dict(structure.get(page_kind) or {})
+    slots = list(page.get("slots") or [])
+    if not slots:
+        return ""
+    layout = str(page.get("layout") or "asymmetric_grid")
+    rendered = []
+    for index, slot in enumerate(slots):
+        rendered.append(_render_structure_slot(profile, blueprint, page_kind, slot, index, module=module, rows=rows, filters=filters))
+    return f"<div class='freeform-grid freeform-{escape(layout)}'>{''.join(rendered)}</div>"
+
+
+def _render_structure_slot(
+    profile: dict[str, Any],
+    blueprint: ProductBlueprint,
+    page_kind: str,
+    slot: dict[str, Any],
+    index: int,
+    module: FeatureModule | None = None,
+    rows: list[list[str]] | None = None,
+    filters: str = "",
+) -> str:
+    kind = str(slot.get("kind") or "focus")
+    title = str(slot.get("title") or "业务区域")
+    span = _slot_span(slot.get("span"), index)
+    modules = ([module] + blueprint.modules[:5]) if module else blueprint.modules
+    table_rows = rows or (_module_rows(module, profile) if module else _domain_rows(blueprint.modules, profile, 7))
+    if kind == "metrics":
+        body = f"<div class='grid'>{_metric_cards(profile['metrics'])}</div>"
+    elif kind == "queue":
+        body = _queue_list(profile, modules, 6)
+    elif kind == "table":
+        headers = profile["stat_headers"] if page_kind == "statistics" else profile["table_headers"]
+        toolbar = f"<div class='toolbar'>{filters}<span class='button'>处理</span></div>" if filters else ""
+        body = f"{toolbar}{_table(headers, table_rows)}"
+    elif kind == "chart":
+        body = f"{_mini_chart(profile)}<div class='process'>{_process(profile)}</div>"
+    elif kind == "timeline":
+        body = _timeline(profile)
+    elif kind == "map":
+        body = _map_board(profile, modules)
+    elif kind == "matrix":
+        body = _matrix_board(profile, modules)
+    elif kind == "ledger":
+        body = f"<div class='ledger-toolbar'>{_ledger_boxes(profile)}</div>{_table(profile['table_headers'], table_rows[:5])}"
+    elif kind == "kanban":
+        body = _kanban_board(profile, modules)
+    elif kind == "case":
+        body = _case_cards(profile)
+    else:
+        body = _focus_panel(profile, compact=span <= 4)
+    return f"<section class='panel freeform-slot freeform-slot-{escape(kind)}' style='grid-column: span {span};'><h2>{escape(title)}</h2>{body}</section>"
+
+
+def _slot_span(value: Any, index: int) -> int:
+    try:
+        span = int(value)
+    except Exception:
+        span = [8, 4, 6, 6, 4, 4][index % 6]
+    return max(3, min(12, span))
+
+
+def _layout(task: GenerationTask, blueprint: ProductBlueprint, title: str, content: str, active: str, design_brief: dict[str, Any] | None = None) -> str:
+    profile = _profile_for_blueprint(task, blueprint, design_brief)
+    nav = ["系统首页"] + [module.title for module in blueprint.modules[:8]] + ["统计报表页", "系统设置页"]
     nav_html = "".join(f"<span class='{'active' if item == active else ''}'>{escape(item)}</span>" for item in nav)
     variant = str(profile.get("layout_variant") or "classic")
+    nav_model = str(profile.get("nav_model") or "side_menu")
+    workspace_shape = str(profile.get("workspace_shape") or "")
+    app_class = f"{variant} nav-{nav_model}"
+    if workspace_shape:
+        app_class = f"{app_class} shape-{workspace_shape}"
+    if nav_model == "top_tabs":
+        return f"""
+<div class="app {escape(app_class)}" style="--accent:{profile['accent']};--accent-soft:{profile['accent_soft']};--sidebar:{profile['sidebar']};">
+  <header class="topbar">
+    <div><div class="brand">{escape(task.software_name)}</div><div class="muted">{escape(task.version)} / {escape(task.product_type)} / {escape(str(profile.get("industry_subtype") or ""))}</div></div>
+    <nav class="nav">{nav_html}</nav>
+    <div class="muted">{escape(profile["user_label"])}</div>
+  </header>
+  <main class="main">
+    <div class="top"><div><div class="title">{escape(title)}</div><div class="muted">{escape(str(profile.get("dashboard_pattern") or profile.get("visual_mood") or ""))}</div></div><div class="muted">{escape(profile["user_label"])}</div></div>
+    {content}
+  </main>
+</div>"""
     return f"""
-<div class="app {escape(variant)}" style="--accent:{profile['accent']};--accent-soft:{profile['accent_soft']};--sidebar:{profile['sidebar']};">
+<div class="app {escape(app_class)}" style="--accent:{profile['accent']};--accent-soft:{profile['accent_soft']};--sidebar:{profile['sidebar']};">
   <aside class="sidebar">
     <div class="brand">{escape(task.software_name)}</div>
+    <div class="sidebar-subtitle">{escape(str(profile.get("industry_subtype") or task.product_type))}</div>
     <nav class="nav">{nav_html}</nav>
   </aside>
   <main class="main">
-    <div class="top"><div><div class="title">{escape(title)}</div><div class="muted">{escape(task.version)} / {escape(task.product_type)}</div></div><div class="muted">{escape(profile["user_label"])}</div></div>
+    <div class="top"><div><div class="title">{escape(title)}</div><div class="muted">{escape(task.version)} / {escape(task.product_type)} / {escape(str(profile.get("visual_mood") or ""))}</div></div><div class="muted">{escape(profile["user_label"])}</div></div>
     {content}
   </main>
 </div>"""
 
 
-def _profile_for_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> dict[str, Any]:
+def _profile_for_blueprint(task: GenerationTask, blueprint: ProductBlueprint, design_brief: dict[str, Any] | None = None) -> dict[str, Any]:
     profile = _admin_profile(task)
+    brief = design_brief or {}
+    if brief:
+        for key in ["accent", "accent_soft", "sidebar"]:
+            if brief.get(key):
+                profile[key] = str(brief[key])
+        if brief.get("layout_family"):
+            profile["layout_variant"] = str(brief["layout_family"])
+        if brief.get("nav_model"):
+            profile["nav_model"] = str(brief["nav_model"])
+        if brief.get("workspace_shape"):
+            profile["workspace_shape"] = str(brief["workspace_shape"])
+        if brief.get("login_pattern"):
+            profile["login_pattern"] = str(brief["login_pattern"])
+        if brief.get("structure_blueprint"):
+            profile["structure_blueprint"] = dict(brief.get("structure_blueprint") or {})
+        if brief.get("semantic_terms"):
+            profile["semantic_terms"] = [str(item) for item in list(brief.get("semantic_terms") or []) if str(item).strip()]
+        if brief.get("optimized_prompt"):
+            profile["optimized_prompt"] = str(brief.get("optimized_prompt") or "")
+        profile["industry_subtype"] = str(brief.get("industry_subtype") or getattr(blueprint, "industry_subtype", ""))
+        profile["visual_mood"] = str(brief.get("visual_mood") or "")
+        profile["dashboard_pattern"] = str(brief.get("dashboard_pattern") or "")
+        profile["module_pattern"] = str(brief.get("module_pattern") or "")
+        if brief.get("domain_terms"):
+            terms = [str(item) for item in list(brief.get("domain_terms") or []) if str(item).strip()]
+            if terms:
+                profile["subjects"] = terms[:6]
+                profile["objects"] = (terms[3:9] or terms)[:6]
+        if brief.get("metrics"):
+            metrics = [str(item) for item in list(brief.get("metrics") or []) if str(item).strip()]
+            if metrics:
+                profile["metrics"] = [(metric, _metric_value(index)) for index, metric in enumerate(metrics[:4])]
+                profile["stat_subjects"] = metrics[:6]
+                profile["stat_title"] = str(brief.get("dashboard_pattern") or "产品指标统计")
     if blueprint.target_users:
         profile["user_label"] = f"当前用户：{blueprint.target_users[0]}"
     if blueprint.business_objects:
@@ -1651,6 +2600,78 @@ def _operation_label(value: str) -> str:
     if text.startswith("{") and text.endswith("}"):
         return ""
     return text
+
+
+def _triage_stack(profile: dict[str, Any], modules: list[FeatureModule]) -> str:
+    items = []
+    states = list(profile.get("states") or ["待处理", "处理中", "已完成"])
+    for index, module in enumerate((modules or [])[:6]):
+        state = states[index % len(states)]
+        items.append(
+            f"<div class='triage-item'><strong>{escape(module.title)}</strong><span>{escape(state)} / {escape(_metric_value(index))}</span></div>"
+        )
+    if not items:
+        items.append("<div class='triage-item'><strong>暂无待处理事项</strong><span>0</span></div>")
+    return f"<div class='triage-stack'>{''.join(items)}</div>"
+
+
+def _ledger_boxes(profile: dict[str, Any]) -> str:
+    metrics = list(profile.get("metrics") or [])[:5]
+    return "".join(
+        f"<div class='ledger-box'><span>{escape(label)}</span><strong>{escape(value)}</strong></div>"
+        for label, value in metrics
+    )
+
+
+def _lane_steps(profile: dict[str, Any]) -> str:
+    steps = list(profile.get("process") or ["提交", "校验", "审核", "归档"])[:5]
+    return "".join(
+        f"<div class='lane-step'><b>{index + 1:02d}</b><strong>{escape(str(step))}</strong><span>{escape(_pipeline_detail(profile, None, index))}</span></div>"
+        for index, step in enumerate(steps)
+    )
+
+
+def _case_cards(profile: dict[str, Any]) -> str:
+    subjects = list(profile.get("subjects") or [])[:4]
+    states = list(profile.get("states") or ["正常", "待处理", "已归档"])
+    cards = []
+    for index, subject in enumerate(subjects):
+        cards.append(
+            f"<div class='case-card'><span>{escape(str(subject))}</span><strong>{escape(_metric_value(index))}</strong><small>{escape(states[index % len(states)])}</small></div>"
+        )
+    return "".join(cards)
+
+
+def _kanban_board(profile: dict[str, Any], modules: list[FeatureModule]) -> str:
+    stages = list(profile.get("process") or ["待处理", "处理中", "待审核", "已完成"])[:4]
+    cards: list[str] = []
+    source_modules = modules or []
+    for stage_index, stage in enumerate(stages):
+        items = []
+        for item_index, module in enumerate(source_modules[stage_index:: max(1, len(stages))][:3]):
+            status = profile["states"][(stage_index + item_index) % len(profile["states"])]
+            items.append(
+                f"<div class='kanban-card'><strong>{escape(module.title)}</strong><span>{escape(module.description)}</span><small>{escape(status)} · {escape(_metric_value(stage_index + item_index))}</small></div>"
+            )
+        if not items:
+            items.append(f"<div class='kanban-card'><strong>{escape(stage)}任务</strong><span>暂无新的处理事项</span><small>0</small></div>")
+        cards.append(f"<div class='kanban-col'><h3>{escape(str(stage))}</h3>{''.join(items)}</div>")
+    return f"<div class='kanban-board'>{''.join(cards)}</div>"
+
+
+def _matrix_board(profile: dict[str, Any], modules: list[FeatureModule]) -> str:
+    subjects = list(profile.get("subjects") or [])
+    modules = modules or []
+    cells = []
+    for index in range(9):
+        module = modules[index % len(modules)] if modules else None
+        label = subjects[index % len(subjects)] if subjects else (module.title if module else f"业务项{index + 1}")
+        value = _metric_value(index)
+        state = profile["states"][index % len(profile["states"])]
+        cells.append(
+            f"<div class='matrix-cell'><span>{escape(label)}</span><strong>{escape(value)}</strong><small>{escape(module.title if module else state)} · {escape(state)}</small></div>"
+        )
+    return f"<div class='matrix-board'>{''.join(cells)}</div>"
 
 
 def _metric_value(index: int) -> str:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -26,6 +27,7 @@ def generate_manual_docx(
     output_dir: Path,
     manual_content: dict | None = None,
     ui_screenshots: dict | None = None,
+    design_brief: dict | None = None,
 ) -> Path:
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -93,7 +95,9 @@ def generate_manual_docx(
         cells[1].text = value
 
     _add_heading(document, "三、登录与主界面")
+    _add_heading(document, "3.1 登录界面", level=2)
     _add_ui_figure(document, ui_screenshots, "login", "登录界面", "用户输入账号、密码和验证码后进入系统。")
+    _add_heading(document, "3.2 系统首页", level=2)
     _add_ui_figure(document, ui_screenshots, "dashboard", "系统首页", "首页集中展示核心指标、待办事项、异常提醒和快捷入口。")
     login_paragraphs = _content_paragraphs(
         manual_content,
@@ -101,7 +105,7 @@ def generate_manual_docx(
         [
             "用户打开系统后首先进入登录界面，系统对账号、密码、验证码和账号状态进行校验。",
             f"登录成功后进入系统首页，首页集中展示{_join_items(blueprint.report_metrics[:4]) or '核心指标、待办事项、异常提醒和快捷入口'}。",
-            f"主界面采用左侧菜单和右侧工作区布局，{_join_items(blueprint.target_users or blueprint.roles)}登录后展示对应权限范围内的功能模块。",
+            f"主界面采用{_navigation_description(design_brief)}，{_join_items(blueprint.target_users or blueprint.roles)}登录后展示对应权限范围内的功能模块。",
             f"首页围绕{_join_items(blueprint.business_objects[:5]) or '业务记录'}展示待处理状态、最近操作和统计摘要。",
         ],
         min_count=8,
@@ -112,7 +116,6 @@ def generate_manual_docx(
     _add_heading(document, "四、功能模块说明")
     for index, module in enumerate(blueprint.modules, start=1):
         _add_heading(document, f"4.{index} {module.title}", level=2)
-        _add_ui_figure(document, ui_screenshots, _module_figure_key(module.key), module.title, module.description)
         module_paragraphs = _module_content_paragraphs(manual_content, module.key) or [
             module.description,
             f"进入{module.title}页面后，用户可围绕{_join_items(module.data_fields[:6]) or '业务字段'}进行条件筛选和详情查看。",
@@ -123,15 +126,17 @@ def generate_manual_docx(
         ]
         for text in _expand_paragraphs(module_paragraphs, min_count=10):
             document.add_paragraph(text)
+        _add_module_operation_sections(document, module, index, ui_screenshots, design_brief)
 
     _add_heading(document, "五、统计分析")
+    _add_heading(document, "5.1 统计报表界面", level=2)
     _add_ui_figure(document, ui_screenshots, "statistics", "统计报表界面", "系统按日期、模块、状态和角色维度生成统计结果。")
     statistics_paragraphs = _content_paragraphs(
         manual_content,
         "statistics",
         [
             f"统计分析功能围绕{_join_items(blueprint.report_metrics[:8]) or '系统运行过程中的业务数据'}进行汇总，帮助管理人员掌握整体运行情况。",
-            f"用户可以选择统计周期、业务模块、组织范围和状态条件，系统按{_join_items(blueprint.business_objects[:6]) or '业务对象'}自动生成列表和图表数据。",
+            f"用户可以选择统计周期、业务模块、组织范围和状态条件，系统按{_join_items(blueprint.business_objects[:6]) or '业务对象'}形成列表和图表数据。",
             "报表结果支持导出、打印和归档，便于形成日常运营分析材料。",
             f"统计页会结合{_workflow_summary(blueprint)}展示各流程节点的处理数量、完成率和异常情况。",
         ],
@@ -180,8 +185,8 @@ def generate_source_docx(task: GenerationTask, source_dir: Path, output_dir: Pat
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.shared import Pt
 
-    lines = read_source_lines(source_dir)
-    lines_per_page = 52
+    lines = [line for line in read_source_lines(source_dir) if line.strip()]
+    lines_per_page = 50
     pages = [lines[index : index + lines_per_page] for index in range(0, len(lines), lines_per_page)]
     if len(pages) > 60:
         selected_pages = pages[:30] + pages[-30:]
@@ -210,7 +215,7 @@ def generate_source_docx(task: GenerationTask, source_dir: Path, output_dir: Pat
             paragraph.paragraph_format.space_before = Pt(0)
             paragraph.paragraph_format.space_after = Pt(0)
             paragraph.paragraph_format.line_spacing = 1
-            run = paragraph.add_run(line if line else " ")
+            run = paragraph.add_run(line)
             run.font.name = "宋体"
             run.font.size = Pt(8)
         footer = document.sections[0].footer.paragraphs[0]
@@ -449,16 +454,13 @@ def _add_heading(document, text: str, level: int = 1) -> None:
 
 
 def _add_ui_placeholder(document, title: str, caption: str) -> None:
-    from docx.shared import Inches, Pt, RGBColor
+    from docx.shared import Pt, RGBColor
 
-    table = document.add_table(rows=5, cols=4)
-    table.style = "Table Grid"
-    merged = table.rows[0].cells[0].merge(table.rows[0].cells[-1])
-    merged.text = title
-    for row_index in range(1, 5):
-        for col_index in range(4):
-            cell = table.rows[row_index].cells[col_index]
-            cell.text = ["功能入口", "业务数据", "状态信息", "操作按钮"][col_index]
+    note_p = document.add_paragraph(f"{title}用于{caption}")
+    note_p.paragraph_format.space_after = Pt(4)
+    for note_run in note_p.runs:
+        note_run.font.color.rgb = RGBColor(80, 80, 80)
+        note_run.font.size = Pt(9)
     caption_p = document.add_paragraph(f"图：{title}，{caption}")
     caption_p.paragraph_format.space_after = Pt(6)
     for run in caption_p.runs:
@@ -471,10 +473,8 @@ def _add_ui_figure(document, ui_screenshots: dict | None, key: str, title: str, 
 
     item = ui_screenshots.get(key) if isinstance(ui_screenshots, dict) else None
     image_path = getattr(item, "image_path", None) if item else None
-    display_title = getattr(item, "title", None) if item else None
-    display_caption = getattr(item, "caption", None) if item else None
-    display_title = display_title or title
-    display_caption = display_caption or caption
+    display_title = title
+    display_caption = caption
     if image_path and Path(image_path).exists():
         paragraph = document.add_paragraph()
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -504,6 +504,116 @@ def _expand_paragraphs(paragraphs: list[str], min_count: int) -> list[str]:
         result.append(templates[index % len(templates)])
         index += 1
     return result
+
+
+def _add_module_operation_sections(document, module, module_index: int, ui_screenshots: dict | None, design_brief: dict | None = None) -> None:
+    _add_heading(document, f"4.{module_index}.1 {module.title}主界面", level=3)
+    _add_ui_figure(
+        document,
+        ui_screenshots,
+        _module_figure_key(module.key),
+        f"{module.title}主界面",
+        f"{module.title}页面展示查询条件、数据列表、状态摘要和常用操作入口。",
+    )
+    fields = _join_items(module.data_fields[:5]) or "名称、状态、责任角色、更新时间和处理备注"
+    document.add_paragraph(
+        f"{module.title}主界面用于集中展示{fields}等核心信息，用户可在该界面完成查询、筛选和记录定位。"
+    )
+    document.add_paragraph(
+        f"界面操作区提供{_join_items(module.operations[:5]) or '新增、编辑、查询、导出和状态维护'}等入口，"
+        "用户根据业务状态选择对应操作后进入后续处理流程。"
+    )
+    operations = _module_operation_items(module, design_brief)
+    for operation_index, operation in enumerate(operations[:4], start=2):
+        _add_heading(document, f"4.{module_index}.{operation_index} {operation}", level=3)
+        action = _operation_action(operation)
+        document.add_paragraph(
+            f"用户在{module.title}页面选择【{action}】入口后，系统打开对应的{action}窗口或详情区域。"
+            f"页面展示{fields}等信息，用户可根据业务需要完成查看、填写、修改或确认。"
+        )
+        _add_ui_figure(
+            document,
+            ui_screenshots,
+            _module_operation_figure_key(module.key, action, operation_index),
+            f"{module.title}{action}界面",
+            f"{module.title}{action}界面用于展示二级窗口、业务字段和处理按钮，用户在该界面完成当前操作。",
+        )
+        document.add_paragraph(
+            f"提交前系统会校验{_join_items(module.rules[:2]) or '必填项、业务状态和权限范围'}，"
+            f"校验通过后保存{module.title}处理结果，并同步记录操作人员、处理时间和状态变化。"
+        )
+        document.add_paragraph(
+            f"完成{action}后，列表区刷新当前记录状态，相关数据进入查询、统计和审计流程，便于后续跟踪。"
+        )
+
+
+def _operation_action(operation: str) -> str:
+    for suffix in [
+        "登记",
+        "查询",
+        "编辑",
+        "审核",
+        "发布",
+        "归档",
+        "导入",
+        "导出",
+        "预警",
+        "复核",
+        "统计",
+        "追踪",
+        "新增",
+        "删除",
+        "详情",
+        "配置",
+        "定位",
+        "调度",
+        "训练",
+        "道具",
+        "结算",
+        "活动",
+        "确认",
+        "处置",
+    ]:
+        if suffix in operation:
+            return suffix
+    return str(operation).strip() or "处理"
+
+
+def _module_operation_items(module, design_brief: dict | None = None) -> list[str]:
+    operations = [str(item).strip() for item in module.operations if str(item).strip()]
+    if not operations:
+        operations = [
+            f"{module.title}列表查看",
+            f"{module.title}详情维护",
+            f"{module.title}数据保存",
+            f"{module.title}结果导出",
+        ]
+    secondary_mix = [str(item).strip() for item in (design_brief or {}).get("secondary_mix", []) if str(item).strip()]
+    if not secondary_mix:
+        return operations
+    selected: list[str] = []
+    used: set[int] = set()
+    for preferred_action in secondary_mix:
+        for index, operation in enumerate(operations):
+            if index in used:
+                continue
+            if _operation_action(operation) == preferred_action or preferred_action in operation:
+                selected.append(operation)
+                used.add(index)
+                break
+    for index, operation in enumerate(operations):
+        if index not in used:
+            selected.append(operation)
+    return selected
+
+
+def _navigation_description(design_brief: dict | None) -> str:
+    nav_model = str((design_brief or {}).get("nav_model") or "")
+    if nav_model == "top_tabs":
+        return "顶部页签导航和主体工作区布局"
+    if nav_model == "rail":
+        return "窄侧栏导航和右侧工作区布局"
+    return "左侧菜单和右侧工作区布局"
 
 
 def _content_paragraphs(
@@ -557,3 +667,9 @@ def _module_figure_key(module_key: str) -> str:
     if module_key in {"login", "dashboard", "statistics"}:
         return f"module_{module_key}"
     return module_key
+
+
+def _module_operation_figure_key(module_key: str, action: str, operation_index: int) -> str:
+    token = re.sub(r"[^a-zA-Z0-9]+", "_", action).strip("_").lower()
+    token = token or f"operation_{operation_index}"
+    return f"{_module_figure_key(module_key)}_{token}_{operation_index}"

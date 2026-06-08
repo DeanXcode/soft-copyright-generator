@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from .blueprint import ProductBlueprint
+from .industry_subtypes import build_ui_design_brief
 from .llm.provider import LLMProvider, LocalTemplateProvider
 from .llm.trace import trace_event
 from .models import GenerationTask
@@ -43,6 +44,7 @@ class UiBlueprint:
     screens: list[UiScreenBlueprint]
     source: str = "local-template"
     warnings: list[str] = field(default_factory=list)
+    design_brief: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +52,7 @@ class UiBlueprint:
             "visual_style": self.visual_style,
             "source": self.source,
             "warnings": self.warnings,
+            "design_brief": self.design_brief,
             "screens": [screen.to_dict() for screen in self.screens],
         }
 
@@ -192,11 +195,14 @@ def _build_ui_style_prompt(task: GenerationTask, blueprint: ProductBlueprint, ex
 
 软件名称：{task.software_name}
 软件类型：{task.product_type}
+本次行业子类型：{getattr(blueprint, "industry_subtype", "") or "未提供"}
 业务补充：{task.feature_hint or "无"}
 行业领域：{blueprint.industry}
 具体场景：{blueprint.scenario or "未提供"}
 产品定位：{blueprint.positioning or "未提供"}
 模块标题：{"、".join(module.title for module in blueprint.modules[:8])}
+本次界面设计 brief：
+{json.dumps(build_ui_design_brief(task, blueprint), ensure_ascii=False, indent=2)}
 
 强制要求：
 - renderer 必须为 "{expected_renderer}"
@@ -223,6 +229,9 @@ def _build_ui_screen_batch_prompt(
 
 软件上下文：
 {_compact_ui_context(task, blueprint)}
+
+本次界面设计 brief：
+{json.dumps(build_ui_design_brief(task, blueprint), ensure_ascii=False, indent=2)}
 
 本批截图固定结构：
 {json.dumps(_screen_batch_payload(screens, blueprint), ensure_ascii=False, indent=2)}
@@ -508,7 +517,12 @@ def _ui_blueprint_from_data(data: dict[str, Any], fallback: UiBlueprint, expecte
         )
 
     visual_style = _clean_text(str(data.get("visual_style") or fallback.visual_style), fallback.visual_style, 40)
-    return UiBlueprint(renderer=expected_renderer, visual_style=visual_style, screens=screens)
+    return UiBlueprint(
+        renderer=expected_renderer,
+        visual_style=visual_style,
+        screens=screens,
+        design_brief=dict(getattr(fallback, "design_brief", {}) or {}),
+    )
 
 
 def _safe_screen_key(value: str) -> str:
@@ -610,6 +624,7 @@ def ui_matches_software_type(task: GenerationTask, blueprint: ProductBlueprint, 
 
 
 def _game_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> UiBlueprint:
+    design_brief = build_ui_design_brief(task, blueprint)
     screens = [
         UiScreenBlueprint(
             key="login",
@@ -651,10 +666,12 @@ def _game_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> UiB
             sample_data={"score": "18,640", "stars": "★★★", "combo": "7"},
         )
     )
-    return UiBlueprint(renderer="game", visual_style="bright-casual-game", screens=screens)
+    visual_style = str(design_brief.get("visual_mood") or "bright-casual-game")
+    return UiBlueprint(renderer="game", visual_style=visual_style, screens=screens, design_brief=design_brief)
 
 
 def _admin_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> UiBlueprint:
+    design_brief = build_ui_design_brief(task, blueprint)
     screens = [
         UiScreenBlueprint(
             key="login",
@@ -692,7 +709,8 @@ def _admin_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> Ui
             components=["指标卡片", "模块统计", "导出报表"],
         )
     )
-    return UiBlueprint(renderer="admin", visual_style="desktop-admin", screens=screens)
+    visual_style = str(design_brief.get("visual_mood") or "desktop-admin")
+    return UiBlueprint(renderer="admin", visual_style=visual_style, screens=screens, design_brief=design_brief)
 
 
 def _game_module_screen(module) -> tuple[str, str, str, list[str]]:

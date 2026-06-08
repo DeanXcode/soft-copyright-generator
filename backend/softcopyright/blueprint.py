@@ -4,6 +4,7 @@ import hashlib
 import random
 from dataclasses import dataclass, field
 
+from .industry_subtypes import select_industry_subtype, subtype_module_specs
 from .models import GenerationTask
 
 
@@ -46,6 +47,8 @@ class ProductBlueprint:
     uniqueness_notes: list[str] = field(default_factory=list)
     generation_fingerprint: str = ""
     quality_score: int = 0
+    industry_subtype_key: str = ""
+    industry_subtype: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -74,6 +77,8 @@ class ProductBlueprint:
             "uniqueness_notes": self.uniqueness_notes,
             "generation_fingerprint": self.generation_fingerprint,
             "quality_score": self.quality_score,
+            "industry_subtype_key": self.industry_subtype_key,
+            "industry_subtype": self.industry_subtype,
         }
 
 
@@ -290,8 +295,9 @@ def generate_blueprint(task: GenerationTask) -> ProductBlueprint:
     seed_input = f"{task.software_name}|{task.version}|{task.language}|{task.product_type}|{task.feature_hint}|{task.seed}"
     seed_value = int(hashlib.sha256(seed_input.encode("utf-8")).hexdigest()[:12], 16)
     rng = random.Random(seed_value)
+    subtype = select_industry_subtype(task)
 
-    module_specs = list(preset["modules"])
+    module_specs = subtype_module_specs(subtype, list(preset["modules"]))
     rng.shuffle(module_specs)
     selected_count = min(len(module_specs), 6 + (1 if task.randomness == "高差异" else 0))
     selected = module_specs[:selected_count]
@@ -301,8 +307,8 @@ def generate_blueprint(task: GenerationTask) -> ProductBlueprint:
             0,
             (
                 "custom",
-                "特色业务管理",
-                f"围绕{task.feature_hint}提供参数配置、业务处理、数据追踪和统计分析。",
+                f"{subtype.title}专项业务",
+                f"围绕{task.feature_hint}在{subtype.title}场景中提供参数配置、业务处理、数据追踪和统计分析。",
                 ["CustomBusiness", "CustomRecord"],
             ),
         )
@@ -313,7 +319,7 @@ def generate_blueprint(task: GenerationTask) -> ProductBlueprint:
             title=title,
             description=description,
             entities=entities,
-            operations=_module_operations(title, rng),
+            operations=_module_operations(title, rng, subtype.secondary_mix),
             data_fields=_module_data_fields(title, entities),
             pages=[f"{title}列表页", f"{title}详情页", f"{title}处理页"],
             rules=_module_rules(title),
@@ -321,13 +327,13 @@ def generate_blueprint(task: GenerationTask) -> ProductBlueprint:
         for key, title, description, entities in selected
     ]
     pages = ["登录页", "系统首页"] + [module.title for module in modules] + ["统计报表页", "系统设置页"]
-    industry = preset["industry"]
-    scenario = _scenario_for_task(task, industry, modules)
-    purpose = f"用于{industry}场景下的业务数据管理、流程协同、运行监控和统计分析。"
+    industry = subtype.industry or preset["industry"]
+    scenario = _scenario_for_task(task, industry, modules, subtype.scenario)
+    purpose = f"用于{industry}中的{subtype.scenario}，支撑{subtype.title}相关数据、流程、监控和统计分析。"
     summary = (
-        f"{task.software_name}是一套面向{industry}的{task.product_type}，"
+        f"{task.software_name}是一套面向{industry}的{subtype.title}，"
         f"围绕{', '.join(module.title for module in modules[:4])}等模块，"
-        "提供数据维护、业务处理、权限控制、日志审计和报表分析能力。"
+        "提供真实业务对象维护、流程处理、权限控制、日志审计和报表分析能力。"
     )
 
     dev_environment = _environment_for_language(task.language)
@@ -342,38 +348,45 @@ def generate_blueprint(task: GenerationTask) -> ProductBlueprint:
         purpose=purpose,
         summary=summary,
         modules=modules,
-        roles=list(preset["roles"]),
+        roles=list(subtype.roles or tuple(preset["roles"])),
         pages=pages,
         dev_environment=dev_environment,
         runtime_environment=runtime_environment,
         scenario=scenario,
-        positioning=f"面向{industry}的{task.product_type}，用于支撑{scenario}中的日常业务处理和数据留痕。",
-        target_users=list(preset["roles"]),
-        business_objects=_business_objects_from_modules(modules),
+        positioning=f"{subtype.positioning}，用于支撑{scenario}中的日常业务处理和数据留痕。",
+        target_users=list(subtype.roles or tuple(preset["roles"])),
+        business_objects=_merge_unique(list(subtype.domain_terms), _business_objects_from_modules(modules)),
         workflows=_workflow_cards(modules),
-        report_metrics=_report_metrics(modules),
+        report_metrics=_merge_unique(list(subtype.metrics), _report_metrics(modules)),
         technical_features=_technical_features(task),
         quality_rules=_quality_rules(modules),
         data_relations=_data_relations(modules),
         deployment_topology=_deployment_topology(task),
-        uniqueness_notes=_uniqueness_notes(task, modules),
+        uniqueness_notes=_uniqueness_notes(task, modules, subtype.title),
         generation_fingerprint=hashlib.sha256(seed_input.encode("utf-8")).hexdigest()[:16],
         quality_score=68,
+        industry_subtype_key=subtype.key,
+        industry_subtype=subtype.title,
     )
 
 
-def _scenario_for_task(task: GenerationTask, industry: str, modules: list[FeatureModule]) -> str:
+def _scenario_for_task(task: GenerationTask, industry: str, modules: list[FeatureModule], subtype_scenario: str = "") -> str:
     if task.feature_hint:
-        return f"{industry}下的{task.feature_hint}协同场景"
+        return f"{industry}下的{subtype_scenario or task.feature_hint}协同场景"
+    if subtype_scenario:
+        return subtype_scenario
     if modules:
         return f"{industry}下的{modules[0].title}和{modules[min(1, len(modules) - 1)].title}协同场景"
     return f"{industry}下的业务协同场景"
 
 
-def _module_operations(title: str, rng: random.Random) -> list[str]:
+def _module_operations(title: str, rng: random.Random, preferred_actions: tuple[str, ...] | None = None) -> list[str]:
     pool = ["登记", "查询", "编辑", "审核", "发布", "归档", "导入", "导出", "预警", "复核", "统计", "追踪"]
-    rng.shuffle(pool)
-    return [f"{title}{operation}" for operation in pool[:5]]
+    preferred = [str(item).strip() for item in (preferred_actions or ()) if str(item).strip()]
+    extras = [operation for operation in pool if operation not in preferred]
+    rng.shuffle(extras)
+    ordered = _merge_unique(preferred, extras)
+    return [f"{title}{operation}" for operation in ordered[:5]]
 
 
 def _module_data_fields(title: str, entities: list[str]) -> list[str]:
@@ -456,13 +469,22 @@ def _deployment_topology(task: GenerationTask) -> str:
     return "应用服务、数据存储和文件导出组件部署在同一业务网络环境中。"
 
 
-def _uniqueness_notes(task: GenerationTask, modules: list[FeatureModule]) -> list[str]:
+def _uniqueness_notes(task: GenerationTask, modules: list[FeatureModule], subtype_title: str = "") -> list[str]:
     module_names = "、".join(module.title for module in modules[:3])
     return [
-        f"围绕{task.software_name}的名称和业务补充组织{module_names}等核心模块。",
+        f"围绕{task.software_name}的名称、{subtype_title or task.product_type}和业务补充组织{module_names}等核心模块。",
         "每个模块均包含独立的业务字段、操作流程、状态规则和审计记录。",
         "说明书、源码工程和界面截图共享同一套产品蓝图，避免内容互相脱节。",
     ]
+
+
+def _merge_unique(primary: list[str], secondary: list[str]) -> list[str]:
+    result: list[str] = []
+    for item in primary + secondary:
+        value = str(item).strip()
+        if value and value not in result:
+            result.append(value)
+    return result
 
 
 def _environment_for_language(language: str) -> dict[str, str]:
