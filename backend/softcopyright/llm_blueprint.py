@@ -1,68 +1,678 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
+import os
 import re
+import time
 from typing import Any
 
 from .blueprint import FeatureModule, ProductBlueprint, _environment_for_language, _runtime_for_language
 from .llm.provider import LLMProvider, LocalTemplateProvider
+from .llm.trace import trace_event
 from .models import GenerationTask
 
 
-def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | None) -> ProductBlueprint | None:
+def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | None, emit=None) -> ProductBlueprint | None:
     if provider is None or isinstance(provider, LocalTemplateProvider):
         return None
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "你是中文软件著作权材料生成专家。请根据用户输入生成真实、具体、可落到源码工程的产品蓝图。"
-                "只返回 JSON，不要返回 Markdown，不要编造公司主体信息，不要承诺包过。"
-            ),
-        },
-        {
-            "role": "user",
-            "content": _build_prompt(task),
-        },
-    ]
-    content = provider.chat(
-        messages,
-        temperature=_temperature(task.randomness),
-        max_tokens=3500,
-        response_format={"type": "json_object"},
+    rejection_reasons: list[str] = []
+    last_error: Exception | None = None
+    best_blueprint: ProductBlueprint | None = None
+    best_score = 0
+    for _attempt in range(2):
+        started_at = time.perf_counter()
+        trace_event(
+            "blueprint_attempt_begin",
+            attempt=_attempt + 1,
+            software_name=task.software_name,
+            product_type=task.product_type,
+        )
+        try:
+            core_plan = _generate_core_plan(task, provider, rejection_reasons, emit=emit)
+            module_plan = _generate_modules(task, provider, core_plan, rejection_reasons, emit=emit)
+            data = _merge_plan(core_plan, module_plan)
+            blueprint = _blueprint_from_data(task, data)
+            score, reasons = _quality_review(task, blueprint)
+            blueprint.quality_score = score
+
+            if score < 78:
+                try:
+                    _emit(emit, 21, "修复产品方案质量")
+                    repaired_data = _repair_plan(task, provider, data, score, reasons)
+                    repaired_blueprint = _blueprint_from_data(task, repaired_data)
+                    repaired_score, repaired_reasons = _quality_review(task, repaired_blueprint)
+                    repaired_blueprint.quality_score = repaired_score
+                    if repaired_score >= score:
+                        data = repaired_data
+                        blueprint = repaired_blueprint
+                        score = repaired_score
+                        reasons = repaired_reasons
+                except Exception as repair_exc:
+                    reasons = reasons + [f"质量修复请求失败：{str(repair_exc)[:120]}"]
+
+            if score > best_score:
+                best_blueprint = blueprint
+                best_score = score
+            if score >= 78:
+                trace_event(
+                    "blueprint_attempt_success",
+                    attempt=_attempt + 1,
+                    elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                    quality_score=score,
+                    module_count=len(blueprint.modules),
+                )
+                return blueprint
+            rejection_reasons = reasons
+            last_error = ValueError(f"LLM 产品方案质量分 {score}，未达 78：{'；'.join(reasons[:4])}")
+            trace_event(
+                "blueprint_attempt_rejected",
+                attempt=_attempt + 1,
+                elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                quality_score=score,
+                reasons=reasons[:6],
+            )
+        except Exception as exc:
+            last_error = exc
+            rejection_reasons = [str(exc)[:180]]
+            trace_event(
+                "blueprint_attempt_error",
+                attempt=_attempt + 1,
+                elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+            )
+    if best_blueprint and best_score >= 72:
+        return best_blueprint
+    if last_error:
+        raise last_error
+    return None
+
+
+def _emit(emit, progress: int, message: str, **extra) -> None:
+    if emit:
+        emit(progress, message, **extra)
+
+
+def _system_prompt() -> str:
+    return (
+        "你是中文软件产品经理、软件架构师和软件著作权材料生成专家。"
+        "请先把软件当成真实项目设计，再生成可被说明书、源码工程和界面截图共同使用的产品方案。"
+        "只返回 JSON，不要返回 Markdown，不要编造公司主体信息，不要承诺包过。"
     )
-    data = _parse_json(content)
-    return _blueprint_from_data(task, data)
 
 
-def _build_prompt(task: GenerationTask) -> str:
+def _generate_core_plan(
+    task: GenerationTask,
+    provider: LLMProvider,
+    rejection_reasons: list[str] | None = None,
+    emit=None,
+) -> dict[str, Any]:
+    _emit(emit, 16, "生成产品身份定位")
+    identity_plan = _generate_identity_plan(task, provider, rejection_reasons)
+    _emit(emit, 17, "生成业务对象、流程和指标")
+    business_detail = _generate_business_details(task, provider, identity_plan, rejection_reasons)
+    data = dict(identity_plan)
+    data.update(business_detail)
+    if not isinstance(data.get("module_outline"), list) or len(data.get("module_outline", [])) < 6:
+        data["module_outline"] = _module_outline_from_core(data)
+    if not isinstance(data.get("pages"), list) or len(data.get("pages", [])) < 8:
+        data["pages"] = _pages_from_outline(data.get("module_outline"))
+    if not isinstance(data.get("business_objects"), list) or len(data.get("business_objects", [])) < 6:
+        raise ValueError("LLM 核心产品方案业务对象不足")
+    if not isinstance(data.get("workflows"), list) or len(data.get("workflows", [])) < 3:
+        raise ValueError("LLM 核心产品方案业务流程不足")
+    return data
+
+
+def _generate_identity_plan(
+    task: GenerationTask,
+    provider: LLMProvider,
+    rejection_reasons: list[str] | None = None,
+) -> dict[str, Any]:
+    data = _chat_json(
+        provider,
+        [
+            {"role": "system", "content": _system_prompt()},
+            {"role": "user", "content": _build_core_prompt(task, rejection_reasons)},
+        ],
+        temperature=_temperature(task.randomness),
+        max_tokens=1500,
+        label="产品身份定位",
+    )
+    if not data.get("scenario") or not data.get("positioning"):
+        raise ValueError("LLM 产品身份定位不完整")
+    return data
+
+
+def _generate_business_details(
+    task: GenerationTask,
+    provider: LLMProvider,
+    identity_plan: dict[str, Any],
+    rejection_reasons: list[str] | None = None,
+) -> dict[str, Any]:
+    return _chat_json(
+        provider,
+        [
+            {"role": "system", "content": _system_prompt()},
+            {"role": "user", "content": _build_business_detail_prompt(task, identity_plan, rejection_reasons)},
+        ],
+        temperature=_temperature(task.randomness),
+        max_tokens=2100,
+        label="业务细节方案",
+    )
+
+
+def _generate_modules(
+    task: GenerationTask,
+    provider: LLMProvider,
+    core_plan: dict[str, Any],
+    rejection_reasons: list[str] | None = None,
+    emit=None,
+) -> dict[str, Any]:
+    modules = _generate_module_batches(task, provider, core_plan, rejection_reasons, "", emit=emit)
+    return {"modules": modules}
+
+
+def _generate_module_batches(
+    task: GenerationTask,
+    provider: LLMProvider,
+    core_plan: dict[str, Any],
+    rejection_reasons: list[str] | None,
+    first_error: str,
+    emit=None,
+) -> list[dict[str, Any]]:
+    outline = core_plan.get("module_outline")
+    if not isinstance(outline, list) or len(outline) < 6:
+        outline = _module_outline_from_core(core_plan)
+    if len(outline) < 6:
+        detail = f"：{first_error[:160]}" if first_error else ""
+        raise ValueError(f"LLM 模块轮廓不足，无法分批生成模块{detail}")
+
+    modules: list[dict[str, Any]] = []
+    batch_count = (min(len(outline), 8) + 1) // 2
+    batches: list[tuple[int, list[Any]]] = []
+    for start in range(0, min(len(outline), 8), 2):
+        batch = outline[start : start + 2]
+        batch_index = start // 2 + 1
+        batches.append((batch_index, batch))
+
+    def run_batch(batch_index: int, batch: list[Any]) -> list[dict[str, Any]]:
+        _emit(emit, 17 + batch_index, f"生成模块明细 {batch_index}/{batch_count}")
+        data = _chat_json(
+            provider,
+            [
+                {"role": "system", "content": _system_prompt()},
+                {"role": "user", "content": _build_module_batch_prompt(task, core_plan, batch, rejection_reasons, first_error)},
+            ],
+            temperature=_temperature(task.randomness),
+            max_tokens=1500,
+            label=f"模块明细批次{batch_index}",
+        )
+        batch_modules = data.get("modules")
+        if not isinstance(batch_modules, list):
+            raise ValueError("LLM 分批模块方案不是 modules 数组")
+        return [item for item in batch_modules if isinstance(item, dict)]
+
+    batch_results: dict[int, list[dict[str, Any]]] = {}
+    workers = _llm_batch_workers()
+    if workers <= 1 or len(batches) <= 1:
+        for batch_index, batch in batches:
+            batch_results[batch_index] = run_batch(batch_index, batch)
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(batches))) as executor:
+            futures = {executor.submit(run_batch, batch_index, batch): batch_index for batch_index, batch in batches}
+            for future in as_completed(futures):
+                batch_index = futures[future]
+                batch_results[batch_index] = future.result()
+
+    for batch_index in sorted(batch_results):
+        modules.extend(batch_results[batch_index])
+    if len(modules) < 6:
+        raise ValueError(f"LLM 分批模块方案数量不足：{len(modules)}")
+    return modules[:8]
+
+
+def _llm_batch_workers() -> int:
+    try:
+        value = int(os.getenv("SOFT_LLM_BATCH_WORKERS", "1"))
+    except ValueError:
+        value = 1
+    return max(1, min(3, value))
+
+
+def _repair_plan(
+    task: GenerationTask,
+    provider: LLMProvider,
+    data: dict[str, Any],
+    score: int,
+    reasons: list[str],
+) -> dict[str, Any]:
+    patch_data = _chat_json(
+        provider,
+        [
+            {"role": "system", "content": _system_prompt()},
+            {"role": "user", "content": _build_repair_prompt(task, data, score, reasons)},
+        ],
+        temperature=min(_temperature(task.randomness) + 0.05, 0.9),
+        max_tokens=2200,
+        label="产品方案质量修复",
+    )
+    repaired = dict(data)
+    for key, value in patch_data.items():
+        if value not in (None, "", []):
+            repaired[key] = value
+    return repaired
+
+
+def _merge_plan(core_plan: dict[str, Any], module_plan: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(core_plan)
+    modules = module_plan.get("modules")
+    if not isinstance(modules, list) or len(modules) < 4:
+        raise ValueError("LLM 模块方案缺少 modules 数组")
+    merged["modules"] = modules
+    if not isinstance(merged.get("pages"), list) or len(merged.get("pages", [])) < 8:
+        pages = ["登录页", "系统首页"]
+        for module in modules[:8]:
+            if isinstance(module, dict) and module.get("title"):
+                pages.append(f"{module['title']}页")
+        pages.extend(["统计报表页", "系统设置页"])
+        merged["pages"] = pages[:12]
+    return merged
+
+
+def _build_core_prompt(task: GenerationTask, rejection_reasons: list[str] | None = None) -> str:
+    retry_note = ""
+    if rejection_reasons:
+        retry_note = "\n上一版产品方案被拒绝，原因如下，请逐项修正：\n" + "\n".join(f"- {item}" for item in rejection_reasons[:6])
+    variation_strategy = _variation_strategy(task)
     return f"""
-请为以下软件生成软著材料用产品蓝图：
+请为以下软件生成软著申请材料用“核心产品方案”。这份 JSON 将驱动说明书正文、源码工程、界面截图和后续模块明细，因此必须像真实可开发的软件项目，而不是通用模板。
 
 软件全称：{task.software_name}
 版本号：{task.version}
 编程语言：{task.language}
 软件技术特点/产品类型：{task.product_type}
 业务补充：{task.feature_hint or "无"}
+随机差异要求：{task.randomness}
+{retry_note}
+
+本次生成的差异化产品策略：
+{variation_strategy}
 
 返回 JSON 字段必须包含：
 - industry: 面向领域/行业，中文短语
-- purpose: 开发目的，一句话
-- summary: 软件主要功能概述，150-300字
+- scenario: 具体使用场景，必须能看出这套软件服务谁、在什么业务环境使用
+- positioning: 产品定位，1-2句话，必须区别于同类型通用后台
+- purpose: 开发目的，1-2句话
+- summary: 软件主要功能概述，160-240字
 - roles: 4-6个用户角色，字符串数组
-- modules: 6-8个功能模块，每个对象包含 key/title/description/entities
+- target_users: 4-6个目标用户或岗位，字符串数组
+- deployment_topology: 部署拓扑说明，1句话
+- module_outline: 6-8个候选模块轮廓，每个对象只包含 key/title/focus，用于下一步生成模块明细
 - pages: 8-12个页面名称，字符串数组
 
-modules 规则：
+module_outline 规则：
 - key 使用小写英文或英文下划线，适合作为源码目录/类名前缀
 - title 使用中文模块名
-- description 要具体写出业务动作，不能空泛
-- entities 是2-4个英文实体名
-- 模块必须与软件名称和业务补充高度相关
+- focus 用一句话说明该模块负责的具体业务对象、动作和输出
+
+质量要求：
+- 禁止只写“数据维护、业务处理、统计分析、权限管理”等通用表达
+- 禁止所有流程、指标和模块轮廓都使用相同句式
+- 至少 70% 模块轮廓和页面必须体现软件名称或业务补充中的具体领域
+- 必须按“本次生成的差异化产品策略”组织产品角度、流程重心、模块边界和页面命名
+- 同类软件再次生成时也不能复用固定的“首页+数据管理+统计+权限”套壳结构
+- 说明书读者应能看出这是一个可申请软著的具体软件，不是泛型后台管理系统
 
 只返回 JSON。
 """.strip()
+
+
+def _build_business_detail_prompt(
+    task: GenerationTask,
+    identity_plan: dict[str, Any],
+    rejection_reasons: list[str] | None = None,
+) -> str:
+    retry_note = ""
+    if rejection_reasons:
+        retry_note = "\n上一版产品方案被拒绝，原因如下，请逐项修正：\n" + "\n".join(f"- {item}" for item in rejection_reasons[:5])
+    variation_strategy = _variation_strategy(task)
+    return f"""
+请基于下面的软件身份定位，补齐软著材料需要的业务细节。只返回 JSON，不要返回 Markdown。
+
+软件全称：{task.software_name}
+编程语言：{task.language}
+软件技术特点/产品类型：{task.product_type}
+业务补充：{task.feature_hint or "无"}
+{retry_note}
+
+本次生成的差异化产品策略：
+{variation_strategy}
+
+软件身份定位：
+{_compact_identity_plan(identity_plan)}
+
+返回 JSON 字段必须包含：
+- business_objects: 8-12个核心业务对象，中文字符串数组
+- workflows: 3-5个业务流程对象，每个包含 name/trigger/steps/output；steps 为4-6个中文步骤
+- report_metrics: 8-12个统计指标，中文字符串数组
+- technical_features: 5-8个技术实现特点，中文字符串数组
+- quality_rules: 6-10个业务校验、权限、审计、状态流转规则，中文字符串数组
+- data_relations: 4-8条数据关系，中文字符串数组
+- uniqueness_notes: 5-8条差异化说明，必须解释为什么这不是同类通用模板
+
+质量要求：
+- 每一项都要围绕软件名称、使用场景和业务补充，不要写泛型后台词
+- workflows 的 steps 必须出现具体动作，如发布、提交、审核、批改、同步、归档、预警、推送等
+- report_metrics 必须像真实软件首页或报表页会展示的指标
+- business_objects、workflows、report_metrics 和 uniqueness_notes 必须呼应差异化产品策略，避免同类软件每次生成同一组对象和指标
+
+只返回 JSON。
+""".strip()
+
+
+def _build_module_prompt(
+    task: GenerationTask,
+    core_plan: dict[str, Any],
+    rejection_reasons: list[str] | None = None,
+) -> str:
+    retry_note = ""
+    if rejection_reasons:
+        retry_note = "\n上一版被拒绝原因：\n" + "\n".join(f"- {item}" for item in rejection_reasons[:6])
+    return f"""
+请基于“核心产品方案”为软件生成功能模块明细。只返回 JSON，顶层只需要 modules 字段。
+
+软件全称：{task.software_name}
+版本号：{task.version}
+编程语言：{task.language}
+软件技术特点/产品类型：{task.product_type}
+业务补充：{task.feature_hint or "无"}
+{retry_note}
+
+核心产品方案摘要：
+{_compact_core_plan(core_plan)}
+
+modules 必须包含 6-8 个功能模块，每个对象包含：
+- key: 小写英文或英文下划线，适合作为源码目录/类名前缀
+- title: 中文模块名，必须贴合软件名称、业务补充和核心场景
+- description: 90-180字，具体写出业务对象、业务动作、状态流转、权限/校验点和输出结果
+- entities: 2-4个英文实体名，必须能用于源码类名
+- operations: 4-7个中文操作名称，如“提交排班”“复核处方”“发布地图服务”
+- data_fields: 6-10个中文业务字段，如“课程编号”“风险等级”“处方状态”
+- pages: 2-4个当前模块相关页面名
+- rules: 3-5条当前模块业务规则，包含校验、权限、状态流转或审计要求
+
+质量要求：
+- 禁止模块标题只叫“数据管理、业务管理、统计分析、系统设置”
+- 禁止各模块 description 使用同一句式
+- 每个模块都要能映射到说明书章节、源码包名和至少一张软件截图
+- 模块必须体现真实业务，不要输出泛型后台管理系统
+
+只返回 JSON。
+""".strip()
+
+
+def _build_module_batch_prompt(
+    task: GenerationTask,
+    core_plan: dict[str, Any],
+    outline_batch: list[Any],
+    rejection_reasons: list[str] | None,
+    first_error: str,
+) -> str:
+    retry_note = ""
+    if rejection_reasons:
+        retry_note = "\n上一版被拒绝原因：\n" + "\n".join(f"- {item}" for item in rejection_reasons[:4])
+    first_error_note = f"上一轮完整模块请求失败：{first_error[:180]}\n" if first_error else ""
+    variation_strategy = _variation_strategy(task)
+    return f"""
+{first_error_note}请只为下面 2 个模块轮廓补齐模块明细，返回 JSON，顶层只需要 modules。
+
+软件全称：{task.software_name}
+产品类型：{task.product_type}
+业务补充：{task.feature_hint or "无"}
+{retry_note}
+
+核心产品方案摘要：
+{_compact_core_plan(core_plan)}
+
+本次生成的差异化产品策略：
+{variation_strategy}
+
+本批模块轮廓：
+{json.dumps(outline_batch, ensure_ascii=False)}
+
+每个模块必须包含 key/title/description/entities/operations/data_fields/pages/rules。
+description 90-180字；operations 4-7个；data_fields 6-10个；rules 3-5条。
+- 模块边界、操作名、字段名和规则必须符合差异化产品策略，不要复用“新增、编辑、删除、导出”四件套作为主要内容。
+只返回 JSON。
+""".strip()
+
+
+def _build_repair_prompt(task: GenerationTask, data: dict[str, Any], score: int, reasons: list[str]) -> str:
+    variation_strategy = _variation_strategy(task)
+    return f"""
+请修复下面的软件产品方案，使质量分达到 78 分以上。只返回需要替换或补充的 JSON 字段；如果模块问题较多，可以返回完整 modules 数组。
+
+软件全称：{task.software_name}
+产品类型：{task.product_type}
+业务补充：{task.feature_hint or "无"}
+当前质量分：{score}
+扣分原因：
+{chr(10).join(f"- {item}" for item in reasons[:8])}
+
+本次生成的差异化产品策略：
+{variation_strategy}
+
+当前方案压缩快照：
+{_compact_full_plan(data)}
+
+修复要求：
+- 保持同一个产品方向，不要改成另一个软件
+- 补齐 business_objects、workflows、report_metrics、quality_rules、uniqueness_notes 等不足字段
+- 如果模块描述空泛，返回完整 modules，并让每个模块包含具体操作、字段、页面和规则
+- 如果方案像泛型后台模板，必须按差异化产品策略重写模块边界、业务对象、流程和指标
+- 不要返回 Markdown
+""".strip()
+
+
+def _compact_core_plan(data: dict[str, Any]) -> str:
+    keys = [
+        "industry",
+        "scenario",
+        "positioning",
+        "purpose",
+        "summary",
+        "roles",
+        "target_users",
+        "business_objects",
+        "workflows",
+        "report_metrics",
+        "technical_features",
+        "quality_rules",
+        "data_relations",
+        "deployment_topology",
+        "uniqueness_notes",
+        "module_outline",
+        "pages",
+    ]
+    compact = {key: data.get(key) for key in keys if data.get(key)}
+    return json.dumps(compact, ensure_ascii=False, indent=2)[:4200]
+
+
+def _compact_identity_plan(data: dict[str, Any]) -> str:
+    keys = [
+        "industry",
+        "scenario",
+        "positioning",
+        "purpose",
+        "summary",
+        "roles",
+        "target_users",
+        "deployment_topology",
+        "module_outline",
+        "pages",
+    ]
+    compact = {key: data.get(key) for key in keys if data.get(key)}
+    return json.dumps(compact, ensure_ascii=False, indent=2)[:3200]
+
+
+def _compact_full_plan(data: dict[str, Any]) -> str:
+    compact = {
+        "scenario": data.get("scenario"),
+        "positioning": data.get("positioning"),
+        "summary": data.get("summary"),
+        "business_objects": data.get("business_objects"),
+        "workflows": data.get("workflows"),
+        "report_metrics": data.get("report_metrics"),
+        "quality_rules": data.get("quality_rules"),
+        "uniqueness_notes": data.get("uniqueness_notes"),
+        "deployment_topology": data.get("deployment_topology"),
+        "modules": _compact_modules(data.get("modules")),
+    }
+    return json.dumps({key: value for key, value in compact.items() if value}, ensure_ascii=False, indent=2)[:5200]
+
+
+def _compact_modules(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    modules: list[dict[str, Any]] = []
+    for item in value[:8]:
+        if not isinstance(item, dict):
+            continue
+        modules.append(
+            {
+                "key": item.get("key"),
+                "title": item.get("title"),
+                "description": item.get("description"),
+                "operations": item.get("operations"),
+                "data_fields": item.get("data_fields"),
+                "pages": item.get("pages"),
+                "rules": item.get("rules"),
+            }
+        )
+    return modules
+
+
+def _module_outline_from_core(core_plan: dict[str, Any]) -> list[dict[str, str]]:
+    outline: list[dict[str, str]] = []
+    pages = core_plan.get("pages")
+    if isinstance(pages, list):
+        for index, page in enumerate(pages[:8], start=1):
+            title = str(page).replace("页面", "").replace("页", "").strip()
+            if title and title not in {"登录", "系统首页", "首页", "统计报表", "系统设置"}:
+                outline.append(
+                    {
+                        "key": f"module_{index}",
+                        "title": title if title.endswith("管理") or title.endswith("分析") else f"{title}管理",
+                        "focus": f"围绕{title}处理核心业务记录、状态流转和统计输出",
+                    }
+                )
+            if len(outline) >= 8:
+                break
+
+    objects = core_plan.get("business_objects")
+    if isinstance(objects, list):
+        for index, item in enumerate(objects, start=len(outline) + 1):
+            if len(outline) >= 8:
+                break
+            label = str(item).strip()
+            if not label:
+                continue
+            title = label if label.endswith("管理") or label.endswith("分析") else f"{label}管理"
+            if title in {entry["title"] for entry in outline}:
+                continue
+            outline.append(
+                {
+                    "key": f"module_{index}",
+                    "title": title,
+                    "focus": f"围绕{label}建立业务台账、处理流程和结果留痕",
+                }
+            )
+    return outline[:8]
+
+
+def _pages_from_outline(value: Any) -> list[str]:
+    pages = ["登录页", "系统首页"]
+    if isinstance(value, list):
+        for item in value[:8]:
+            if isinstance(item, dict):
+                title = str(item.get("title") or "").strip()
+            else:
+                title = str(item).strip()
+            if title:
+                pages.append(f"{title}页")
+    pages.extend(["统计报表页", "系统设置页"])
+    return pages[:12]
+
+
+def _chat_json(
+    provider: LLMProvider,
+    messages: list[dict[str, str]],
+    *,
+    temperature: float,
+    max_tokens: int,
+    label: str,
+    attempts: int = 3,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    current_messages = messages
+    provider_retries = int(getattr(getattr(provider, "config", None), "retry_count", 0) or 0)
+    total_attempts = 1 if provider_retries > 0 else max(1, attempts)
+    for attempt in range(total_attempts):
+        started_at = time.perf_counter()
+        trace_event(
+            "chat_json_begin",
+            layer="blueprint",
+            label=label,
+            attempt=attempt + 1,
+            total_attempts=total_attempts,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            message_count=len(current_messages),
+        )
+        try:
+            content = provider.chat(
+                current_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+                trace_label=f"blueprint:{label}",
+            )
+            data = _parse_json(content)
+            trace_event(
+                "chat_json_success",
+                layer="blueprint",
+                label=label,
+                attempt=attempt + 1,
+                elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                content_chars=len(content or ""),
+            )
+            return data
+        except Exception as exc:
+            last_error = exc
+            trace_event(
+                "chat_json_error",
+                layer="blueprint",
+                label=label,
+                attempt=attempt + 1,
+                elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+            )
+            if attempt < total_attempts - 1:
+                current_messages = messages + [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"上一次{label}请求没有得到可解析 JSON，错误摘要：{str(exc)[:120]}。"
+                            "请重新输出严格 JSON 对象，不要 Markdown，不要解释文字。"
+                        ),
+                    }
+                ]
+    raise RuntimeError(f"{label}请求失败：{last_error}")
 
 
 def _parse_json(content: str) -> dict[str, Any]:
@@ -91,14 +701,28 @@ def _blueprint_from_data(task: GenerationTask, data: dict[str, Any]) -> ProductB
             continue
         key = _safe_key(str(item.get("key") or f"module_{index}"))
         title = _clean_text(str(item.get("title") or f"业务模块{index}"), 24)
-        description = _clean_text(str(item.get("description") or f"{title}用于业务数据维护和流程处理。"), 160)
+        description = _clean_text(str(item.get("description") or f"{title}用于业务数据维护和流程处理。"), 220)
         entities = item.get("entities")
         if not isinstance(entities, list):
             entities = [f"Module{index}Record", f"Module{index}Query"]
-        safe_entities = [_safe_entity(str(entity)) for entity in entities[:4] if str(entity).strip()]
-        if len(safe_entities) < 2:
-            safe_entities = [f"Module{index}Record", f"Module{index}Query"]
-        modules.append(FeatureModule(key=key, title=title, description=description, entities=safe_entities))
+        safe_entities = [
+            _safe_entity(_entity_name_from_item(entity))
+            for entity in entities[:4]
+            if _entity_name_from_item(entity)
+        ]
+        safe_entities = _normalize_entities(safe_entities, key, index)
+        modules.append(
+            FeatureModule(
+                key=key,
+                title=title,
+                description=description,
+                entities=safe_entities,
+                operations=_clean_list(item.get("operations"), 7, 28),
+                data_fields=_clean_list(item.get("data_fields"), 10, 24),
+                pages=_clean_list(item.get("pages"), 4, 28),
+                rules=_clean_list(item.get("rules"), 5, 80),
+            )
+        )
 
     if len(modules) < 4:
         raise ValueError("LLM 蓝图有效模块数量不足")
@@ -114,10 +738,22 @@ def _blueprint_from_data(task: GenerationTask, data: dict[str, Any]) -> ProductB
     pages = [_clean_text(str(page), 26) for page in pages[:12]]
 
     industry = _clean_text(str(data.get("industry") or task.product_type), 40)
-    purpose = _clean_text(str(data.get("purpose") or f"用于{industry}场景下的业务管理和数据分析。"), 120)
-    summary = _clean_text(str(data.get("summary") or _fallback_summary(task, industry, modules)), 360)
+    scenario = _clean_text(str(data.get("scenario") or f"{industry}业务协同场景"), 120)
+    positioning = _clean_text(str(data.get("positioning") or f"面向{scenario}的业务处理软件。"), 180)
+    purpose = _clean_text(str(data.get("purpose") or f"用于{industry}场景下的业务管理和数据分析。"), 180)
+    summary = _clean_text(str(data.get("summary") or _fallback_summary(task, industry, modules)), 480)
+    target_users = _clean_list(data.get("target_users"), 6, 24) or roles
+    business_objects = _clean_list(data.get("business_objects"), 12, 28)
+    workflows = _clean_workflows(data.get("workflows"))
+    report_metrics = _clean_list(data.get("report_metrics"), 12, 32)
+    technical_features = _clean_list(data.get("technical_features"), 8, 60)
+    quality_rules = _clean_list(data.get("quality_rules"), 10, 90)
+    data_relations = _clean_list(data.get("data_relations"), 8, 80)
+    deployment_topology = _clean_text(str(data.get("deployment_topology") or ""), 160)
+    uniqueness_notes = _clean_list(data.get("uniqueness_notes"), 8, 90)
 
-    return ProductBlueprint(
+    fingerprint_source = json.dumps(data, ensure_ascii=False, sort_keys=True) + task.seed
+    blueprint = ProductBlueprint(
         software_name=task.software_name,
         version=task.version,
         language=task.language,
@@ -130,7 +766,20 @@ def _blueprint_from_data(task: GenerationTask, data: dict[str, Any]) -> ProductB
         pages=pages,
         dev_environment=_environment_for_language(task.language),
         runtime_environment=_runtime_for_language(task.language),
+        scenario=scenario,
+        positioning=positioning,
+        target_users=target_users,
+        business_objects=business_objects,
+        workflows=workflows,
+        report_metrics=report_metrics,
+        technical_features=technical_features,
+        quality_rules=quality_rules,
+        data_relations=data_relations,
+        deployment_topology=deployment_topology,
+        uniqueness_notes=uniqueness_notes,
+        generation_fingerprint=hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:16],
     )
+    return blueprint
 
 
 def _temperature(randomness: str) -> float:
@@ -139,6 +788,84 @@ def _temperature(randomness: str) -> float:
     if randomness == "高差异":
         return 0.9
     return 0.65
+
+
+def _variation_strategy(task: GenerationTask) -> str:
+    seed_text = "|".join(
+        [
+            task.software_name,
+            task.product_type,
+            task.feature_hint,
+            task.randomness,
+            task.seed,
+        ]
+    )
+    digest = hashlib.sha256(seed_text.encode("utf-8")).digest()
+    product_angles = [
+        "以一线操作员的高频办理流程为中心，模块按日常任务闭环拆分",
+        "以管理者的监管、复核和异常处置为中心，模块按状态流转拆分",
+        "以数据采集、校验、归档和追溯为中心，模块按数据生命周期拆分",
+        "以多角色协同和跨部门交接为中心，模块按角色责任边界拆分",
+        "以移动/现场/边缘场景的快速处理为中心，模块按场景入口拆分",
+        "以风险预警、质量控制和复盘分析为中心，模块按风控闭环拆分",
+    ]
+    workflow_focuses = [
+        "重点体现提交、校验、审核、归档和回访/复盘链路",
+        "重点体现采集、清洗、匹配、预警和处置闭环",
+        "重点体现预约/申请、分派、执行、确认和结算/评价链路",
+        "重点体现配置、发布、监控、异常处理和审计追踪链路",
+        "重点体现导入、解析、比对、复核和批量输出链路",
+        "重点体现计划、执行、反馈、统计和持续改进链路",
+    ]
+    module_styles = [
+        "模块标题优先使用业务名词加动作，例如“课程排课调度”“作业批改追踪”，少用“管理”后缀",
+        "模块标题优先使用对象台账加流程结果，例如“风险工单核验”“资源发布留痕”，避免纯名词堆叠",
+        "模块边界按页面和角色动作拆开，不把所有对象塞进一个综合管理模块",
+        "模块边界按核心对象、异常对象、统计对象分层，避免每个模块都长得一样",
+        "模块标题可以使用“看板、调度、复核、归档、追踪、预警、核验、发布”等业务动词",
+        "模块之间要形成上下游关系，每个模块至少有一个独有字段、状态或规则",
+    ]
+    data_depths = [
+        "字段要包含编号、状态、责任人、时间、来源、校验结果和处理结论",
+        "字段要体现业务对象的生命周期，不只写名称、备注、创建时间",
+        "指标要同时包含数量、完成率、异常率、时效和趋势类指标",
+        "规则要体现权限范围、状态流转、重复校验、阈值预警和审计留痕",
+        "对象要拆成主业务对象、过程记录、异常记录、统计结果和配置规则",
+        "示例对象和指标要能直接进入截图表格、说明书段落和源码实体类",
+    ]
+    naming_styles = [
+        "英文 key 使用具体领域词，避免 module_1、business、data、manage",
+        "英文实体名使用 Record、Task、Rule、Trace、Summary、Snapshot 等后缀区分职责",
+        "页面名称使用业务入口名，例如“课程编排台”“异常复核页”，避免全部叫列表页",
+        "操作名使用领域动作，例如核验、派发、批改、发布、归档、回溯、同步、结算",
+        "状态名要贴近业务，如待复核、已派发、处理中、待归档、异常退回、已闭环",
+        "统计指标名称要像产品首页真实指标，不使用“数据量、业务量、完成量”空泛词",
+    ]
+    avoidances = [
+        "不要把模块固定成登录、首页、数据管理、统计分析、权限管理",
+        "不要让所有模块操作都是新增、编辑、删除、查询、导出",
+        "不要让所有字段都是名称、编号、状态、备注、创建时间",
+        "不要让流程只停留在提交、审核、完成三步",
+        "不要在不同模块重复同一套规则句式",
+        "不要把软件写成任何行业都能套用的通用后台",
+    ]
+
+    def pick(items: list[str], offset: int) -> str:
+        return items[digest[offset] % len(items)]
+
+    lines = [
+        f"- 产品角度：{pick(product_angles, 0)}",
+        f"- 流程重心：{pick(workflow_focuses, 1)}",
+        f"- 模块组织：{pick(module_styles, 2)}",
+        f"- 数据深度：{pick(data_depths, 3)}",
+        f"- 命名风格：{pick(naming_styles, 4)}",
+        f"- 避免套路：{pick(avoidances, 5)}",
+    ]
+    if task.randomness == "高差异":
+        lines.append("- 高差异要求：允许采用更细的模块边界和更有行业特征的页面名称，但不能偏离软件名称和业务补充。")
+    elif task.randomness == "保守":
+        lines.append("- 保守要求：保持常规业务系统结构，但模块标题、字段、流程和指标仍必须体现具体行业差异。")
+    return "\n".join(lines)
 
 
 def _safe_key(value: str) -> str:
@@ -153,6 +880,83 @@ def _safe_entity(value: str) -> str:
     return entity or "BusinessRecord"
 
 
+def _entity_name_from_item(item: Any) -> str:
+    if isinstance(item, dict):
+        for key in ("entity", "className", "class_name", "name", "title", "value", "text"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return ""
+    return str(item).strip()
+
+
+def _normalize_entities(entities: list[str], key: str, index: int) -> list[str]:
+    base = _entity_base_from_key(key) or f"Module{index}"
+    cleaned: list[str] = []
+    for entity in entities:
+        if not entity or entity == "BusinessRecord" or entity in cleaned:
+            continue
+        cleaned.append(entity)
+    while len(cleaned) < 2:
+        suffix = "Record" if len(cleaned) == 0 else "Query"
+        candidate = f"{base}{suffix}"
+        if candidate not in cleaned:
+            cleaned.append(candidate)
+        else:
+            cleaned.append(f"{base}Detail")
+    return cleaned[:4]
+
+
+def _entity_base_from_key(key: str) -> str:
+    parts = [part for part in re.split(r"[_\W]+", key) if part]
+    return "".join(part[:1].upper() + part[1:] for part in parts)
+
+
+def _clean_list(value: Any, max_count: int, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value[:max_count]:
+        text = _clean_text(_string_from_list_item(item), limit)
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _string_from_list_item(item: Any) -> str:
+    if isinstance(item, dict):
+        for key in ("name", "title", "operation", "field", "rule", "label", "value", "text"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        for value in item.values():
+            if isinstance(value, str) and value.strip():
+                return value
+        return ""
+    return str(item)
+
+
+def _clean_workflows(value: Any) -> list[dict[str, list[str] | str]]:
+    if not isinstance(value, list):
+        return []
+    workflows: list[dict[str, list[str] | str]] = []
+    for index, item in enumerate(value[:5], start=1):
+        if not isinstance(item, dict):
+            continue
+        steps = _clean_list(item.get("steps"), 7, 32)
+        if len(steps) < 3:
+            steps = ["创建记录", "字段校验", "提交处理", "生成结果"]
+        workflows.append(
+            {
+                "name": _clean_text(str(item.get("name") or f"业务流程{index}"), 36),
+                "trigger": _clean_text(str(item.get("trigger") or "用户提交业务记录"), 80),
+                "steps": steps,
+                "output": _clean_text(str(item.get("output") or "形成处理结果和操作日志"), 90),
+            }
+        )
+    return workflows
+
+
 def _clean_text(value: str, limit: int) -> str:
     value = re.sub(r"\s+", " ", value).strip()
     return value[:limit]
@@ -161,3 +965,113 @@ def _clean_text(value: str, limit: int) -> str:
 def _fallback_summary(task: GenerationTask, industry: str, modules: list[FeatureModule]) -> str:
     titles = "、".join(module.title for module in modules[:4])
     return f"{task.software_name}是一套面向{industry}的{task.product_type}，围绕{titles}等模块提供业务管理、流程协同、统计分析和权限审计能力。"
+
+
+def _quality_review(task: GenerationTask, blueprint: ProductBlueprint) -> tuple[int, list[str]]:
+    score = 100
+    reasons: list[str] = []
+    generic_words = ["业务管理", "数据维护", "流程处理", "统计分析", "系统配置", "通用", "管理列表", "基础档案", "数据管理", "信息管理"]
+    generic_keys = {"module", "module_1", "module_2", "business", "data", "manage", "management", "system", "common"}
+    generic_operations = {"新增", "编辑", "删除", "查询", "导出", "新增记录", "编辑记录", "删除记录", "查询记录", "导出数据"}
+    generic_fields = {"名称", "编号", "状态", "备注", "创建时间", "更新时间", "创建人", "修改人"}
+    action_words = [
+        "审核",
+        "复核",
+        "发布",
+        "归档",
+        "预警",
+        "调度",
+        "派单",
+        "核验",
+        "结算",
+        "采集",
+        "训练",
+        "诊疗",
+        "排班",
+        "核销",
+        "同步",
+        "推送",
+        "批改",
+        "闭环",
+        "回溯",
+        "确认",
+        "配置",
+    ]
+
+    if len(blueprint.summary) < 180:
+        score -= 12
+        reasons.append("summary 过短，无法支撑真实说明书")
+    if len(blueprint.business_objects) < 6:
+        score -= 12
+        reasons.append("business_objects 少于 6 个，业务对象不足")
+    if len(blueprint.workflows) < 3:
+        score -= 10
+        reasons.append("workflows 少于 3 个，业务流程不足")
+    if len(blueprint.report_metrics) < 6:
+        score -= 8
+        reasons.append("report_metrics 少于 6 个，统计指标不足")
+    if len(blueprint.quality_rules) < 5:
+        score -= 8
+        reasons.append("quality_rules 少于 5 条，校验/权限/审计规则不足")
+    if len(blueprint.uniqueness_notes) < 4:
+        score -= 8
+        reasons.append("uniqueness_notes 少于 4 条，差异化说明不足")
+
+    module_titles = [module.title for module in blueprint.modules]
+    if len(set(module_titles)) != len(module_titles):
+        score -= 10
+        reasons.append("模块标题存在重复")
+    generic_module_count = sum(1 for module in blueprint.modules if any(word == module.title or word in module.title for word in generic_words))
+    if generic_module_count >= 2:
+        score -= 12
+        reasons.append("模块标题过于通用")
+    generic_key_count = sum(1 for module in blueprint.modules if module.key in generic_keys or re.fullmatch(r"module_\d+", module.key or ""))
+    if generic_key_count >= 2:
+        score -= 8
+        reasons.append("多个模块 key 仍是泛型命名")
+    weak_description_count = sum(
+        1
+        for module in blueprint.modules
+        if len(module.description) < 45 or not any(word in module.description for word in action_words)
+    )
+    if weak_description_count >= 2:
+        score -= 12
+        reasons.append("多个模块描述缺少具体业务动作")
+    generic_operation_modules = sum(
+        1
+        for module in blueprint.modules
+        if len(set(module.operations) - generic_operations) < 3
+    )
+    if generic_operation_modules >= 2:
+        score -= 10
+        reasons.append("多个模块操作仍停留在新增/编辑/删除/查询/导出")
+    generic_field_modules = sum(
+        1
+        for module in blueprint.modules
+        if len(set(module.data_fields) - generic_fields) < 4
+    )
+    if generic_field_modules >= 2:
+        score -= 8
+        reasons.append("多个模块字段过于通用，缺少行业字段")
+
+    feature_terms = [term for term in re.split(r"[，,、\s]+", task.feature_hint) if len(term) >= 2]
+    if feature_terms:
+        joined = json.dumps(blueprint.to_dict(), ensure_ascii=False)
+        hit_count = sum(1 for term in feature_terms if term in joined)
+        if hit_count < max(1, min(3, len(feature_terms))):
+            score -= 10
+            reasons.append("产品方案与业务补充关键词关联不足")
+
+    joined_plan = json.dumps(blueprint.to_dict(), ensure_ascii=False)
+    if sum(1 for word in generic_words if word in joined_plan) >= 8:
+        score -= 6
+        reasons.append("方案中泛型后台表达偏多")
+
+    if not blueprint.scenario or len(blueprint.scenario) < 12:
+        score -= 8
+        reasons.append("scenario 不够具体")
+    if not blueprint.deployment_topology:
+        score -= 5
+        reasons.append("缺少部署拓扑说明")
+
+    return max(score, 0), reasons

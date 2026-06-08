@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -14,6 +15,8 @@ def generate_source_project(task: GenerationTask, blueprint: ProductBlueprint, o
 
     if task.language == "Java":
         files = _generate_java_project(task, blueprint, source_dir)
+    elif task.language == "C#":
+        files = _generate_csharp_project(task, blueprint, source_dir)
     elif task.language == "Python":
         files = _generate_python_project(task, blueprint, source_dir)
     elif task.language == "JavaScript":
@@ -21,10 +24,15 @@ def generate_source_project(task: GenerationTask, blueprint: ProductBlueprint, o
     else:
         files = _generate_generic_project(task, blueprint, source_dir)
 
+    blueprint_path = _write(source_dir / "product-blueprint.json", json.dumps(blueprint.to_dict(), ensure_ascii=False, indent=2))
+    files.append(blueprint_path)
     total_lines = sum(_count_lines(path) for path in files)
     return {
         "source_dir": str(source_dir),
         "files": [str(path) for path in files],
+        "blueprint_path": str(blueprint_path),
+        "module_keys": [module.key for module in blueprint.modules],
+        "module_titles": [module.title for module in blueprint.modules],
         "total_lines": total_lines,
     }
 
@@ -55,6 +63,8 @@ def read_source_lines(source_dir: Path) -> list[str]:
         if not path.is_file() or path.suffix.lower() not in allowed:
             continue
         relative = path.relative_to(source_dir).as_posix()
+        if _is_duplicate_served_prototype(relative):
+            continue
         lines.append(f"// ===== {relative} =====")
         try:
             content = path.read_text(encoding="utf-8")
@@ -64,6 +74,27 @@ def read_source_lines(source_dir: Path) -> list[str]:
             lines.append(line.rstrip())
         lines.append("")
     return lines
+
+
+def source_project_stats(source_dir: Path) -> dict:
+    lines = read_source_lines(source_dir)
+    files = [
+        str(path)
+        for path in sorted(source_dir.rglob("*"))
+        if path.is_file() and not _is_duplicate_served_prototype(path.relative_to(source_dir).as_posix())
+    ]
+    return {
+        "files": files,
+        "total_lines": len(lines),
+    }
+
+
+def _is_duplicate_served_prototype(relative: str) -> bool:
+    normalized = relative.replace("\\", "/")
+    return (
+        normalized.startswith("src/main/resources/static/ui-prototype/")
+        or normalized.startswith("wwwroot/ui-prototype/")
+    )
 
 
 def _generate_java_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path) -> list[Path]:
@@ -81,6 +112,7 @@ def _generate_java_project(task: GenerationTask, blueprint: ProductBlueprint, so
         java_root / "dto",
         java_root / "config",
         java_root / "common",
+        resources / "static",
         mapper_dir,
     ]:
         folder.mkdir(parents=True, exist_ok=True)
@@ -132,6 +164,12 @@ software:
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.5</version>
+        <relativePath/>
+    </parent>
     <groupId>com.copyright</groupId>
     <artifactId>{_ascii_token(task.software_name)}</artifactId>
     <version>1.0.0</version>
@@ -139,6 +177,20 @@ software:
     <properties>
         <java.version>17</java.version>
     </properties>
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+    </dependencies>
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
 </project>
 """,
         )
@@ -220,6 +272,9 @@ public class SoftwareProfile {{
     private final String version = "{task.version}";
     private final String productType = "{task.product_type}";
     private final String industry = "{blueprint.industry}";
+    private final String scenario = "{_java_literal(blueprint.scenario)}";
+    private final String positioning = "{_java_literal(blueprint.positioning)}";
+    private final String fingerprint = "{blueprint.generation_fingerprint}";
 
     public String getSoftwareName() {{
         return softwareName;
@@ -235,6 +290,18 @@ public class SoftwareProfile {{
 
     public String getIndustry() {{
         return industry;
+    }}
+
+    public String getScenario() {{
+        return scenario;
+    }}
+
+    public String getPositioning() {{
+        return positioning;
+    }}
+
+    public String getFingerprint() {{
+        return fingerprint;
     }}
 }}
 """,
@@ -800,13 +867,21 @@ def _generate_python_project(task: GenerationTask, blueprint: ProductBlueprint, 
         _write(
             app_dir / "main.py",
             f'''from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="{task.software_name}", version="{task.version}")
+app.mount("/ui-prototype", StaticFiles(directory="ui-prototype", html=True), name="ui_prototype")
 
 
 @app.get("/health")
 def health_check():
     return {{"status": "ok", "software": "{task.software_name}", "version": "{task.version}"}}
+
+
+@app.get("/")
+def prototype_entry():
+    return RedirectResponse(url="/ui-prototype/index.html")
 ''',
         ),
     ]
@@ -927,11 +1002,17 @@ def _generate_javascript_project(task: GenerationTask, blueprint: ProductBluepri
         _write(
             src / "server.js",
             f'''const express = require("express");
+const path = require("path");
 const app = express();
 app.use(express.json());
+app.use("/ui-prototype", express.static(path.join(__dirname, "..", "ui-prototype")));
 
 app.get("/health", (req, res) => {{
   res.json({{ status: "ok", software: "{task.software_name}", version: "{task.version}" }});
+}});
+
+app.get("/", (req, res) => {{
+  res.redirect("/ui-prototype/index.html");
 }});
 
 app.listen(8080, () => {{
@@ -1044,6 +1125,665 @@ def _generate_generic_project(task: GenerationTask, blueprint: ProductBlueprint,
     return files
 
 
+def _generate_csharp_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path) -> list[Path]:
+    root_namespace = _pascal(_ascii_token(task.software_name))
+    src = source_dir / "src"
+    for folder in [
+        src / "Controllers",
+        src / "Services",
+        src / "Repositories",
+        src / "Models",
+        src / "Queries",
+        src / "Common",
+        src / "Configuration",
+    ]:
+        folder.mkdir(parents=True, exist_ok=True)
+
+    files = [
+        _write(source_dir / "README.md", _readme(task, blueprint)),
+        _write(
+            source_dir / f"{root_namespace}.csproj",
+            f"""<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>{root_namespace}</AssemblyName>
+    <RootNamespace>{root_namespace}</RootNamespace>
+  </PropertyGroup>
+</Project>
+""",
+        ),
+        _write(
+            src / "Program.cs",
+            f"""using {root_namespace}.Configuration;
+
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddControllers();
+builder.Services.AddSingleton(new SoftwareProfile(
+    "{task.software_name}",
+    "{task.version}",
+    "{task.product_type}",
+    "{blueprint.industry}"
+));
+var app = builder.Build();
+app.UseStaticFiles();
+app.MapControllers();
+app.MapGet("/health", () => Results.Ok(new {{
+    Status = "ok",
+    Software = "{task.software_name}",
+    Version = "{task.version}"
+}}));
+app.MapGet("/", () => Results.Redirect("/ui-prototype/index.html"));
+app.Run();
+""",
+        ),
+    ]
+    files.extend(_csharp_common_files(src, root_namespace, task, blueprint))
+    for module in blueprint.modules:
+        files.extend(_csharp_module_files(src, root_namespace, module))
+    files.append(_write(src / "Services" / "OperationTraceService.cs", _csharp_operation_trace_service(root_namespace, task, blueprint)))
+    files = _ensure_generic_line_target(files, src / "Services", task, blueprint, target_lines=3200, extension=".cs")
+    return files
+
+
+def _csharp_common_files(src: Path, namespace: str, task: GenerationTask, blueprint: ProductBlueprint) -> list[Path]:
+    return [
+        _write(
+            src / "Common" / "ApiResult.cs",
+            f"""namespace {namespace}.Common;
+
+public class ApiResult<T>
+{{
+    public bool Success {{ get; set; }}
+    public string Message {{ get; set; }} = string.Empty;
+    public T? Data {{ get; set; }}
+
+    public static ApiResult<T> Ok(T data)
+    {{
+        return new ApiResult<T> {{ Success = true, Message = "操作成功", Data = data }};
+    }}
+
+    public static ApiResult<T> Fail(string message)
+    {{
+        return new ApiResult<T> {{ Success = false, Message = message }};
+    }}
+}}
+""",
+        ),
+        _write(
+            src / "Common" / "PagedResult.cs",
+            f"""namespace {namespace}.Common;
+
+public class PagedResult<T>
+{{
+    public IReadOnlyList<T> Items {{ get; set; }} = Array.Empty<T>();
+    public int PageNo {{ get; set; }}
+    public int PageSize {{ get; set; }}
+    public int TotalCount {{ get; set; }}
+
+    public int TotalPages => PageSize <= 0 ? 0 : (int)Math.Ceiling(TotalCount / (double)PageSize);
+
+    public static PagedResult<T> Create(IEnumerable<T> source, int pageNo, int pageSize)
+    {{
+        var safePageNo = Math.Max(1, pageNo);
+        var safePageSize = Math.Max(1, pageSize);
+        var list = source.ToList();
+        return new PagedResult<T>
+        {{
+            Items = list.Skip((safePageNo - 1) * safePageSize).Take(safePageSize).ToList(),
+            PageNo = safePageNo,
+            PageSize = safePageSize,
+            TotalCount = list.Count
+        }};
+    }}
+}}
+""",
+        ),
+        _write(
+            src / "Configuration" / "SoftwareProfile.cs",
+            f"""namespace {namespace}.Configuration;
+
+public record SoftwareProfile(
+    string SoftwareName,
+    string Version,
+    string ProductType,
+    string Industry
+)
+{{
+    public string Summary => $"{task.software_name} {task.version} / {task.product_type} / {blueprint.industry}";
+}}
+""",
+        ),
+    ]
+
+
+def _csharp_module_files(src: Path, namespace: str, module: FeatureModule) -> list[Path]:
+    class_name = _pascal(module.key)
+    record_name = f"{class_name}Record"
+    query_name = f"{class_name}Query"
+    title = module.title
+    description = module.description
+    return [
+        _write(src / "Models" / f"{record_name}.cs", _csharp_record(namespace, record_name, title, description)),
+        _write(src / "Queries" / f"{query_name}.cs", _csharp_query(namespace, query_name, title)),
+        _write(src / "Repositories" / f"I{class_name}Repository.cs", _csharp_repository_interface(namespace, class_name, record_name, query_name)),
+        _write(src / "Repositories" / f"InMemory{class_name}Repository.cs", _csharp_repository(namespace, class_name, record_name, query_name)),
+        _write(src / "Services" / f"{class_name}Validator.cs", _csharp_validator(namespace, class_name, record_name, title)),
+        _write(src / "Services" / f"{class_name}Service.cs", _csharp_service(namespace, class_name, record_name, query_name, title)),
+        _write(src / "Services" / f"{class_name}StatisticsService.cs", _csharp_statistics(namespace, class_name, record_name, title)),
+        _write(src / "Services" / f"{class_name}AuditService.cs", _csharp_audit(namespace, class_name, record_name, title)),
+        _write(src / "Services" / f"{class_name}ExportService.cs", _csharp_export(namespace, class_name, record_name, title)),
+        _write(src / "Controllers" / f"{class_name}Controller.cs", _csharp_controller(namespace, class_name, record_name, query_name, title)),
+    ]
+
+
+def _csharp_record(namespace: str, record_name: str, title: str, description: str) -> str:
+    return f"""namespace {namespace}.Models;
+
+public class {record_name}
+{{
+    public long Id {{ get; set; }}
+    public string Code {{ get; set; }} = string.Empty;
+    public string Name {{ get; set; }} = string.Empty;
+    public string Status {{ get; set; }} = "Enabled";
+    public string OwnerRole {{ get; set; }} = string.Empty;
+    public string Description {{ get; set; }} = string.Empty;
+    public int SortNo {{ get; set; }}
+    public decimal Score {{ get; set; }}
+    public bool Enabled {{ get; set; }} = true;
+    public DateTime CreatedAt {{ get; set; }} = DateTime.Now;
+    public DateTime UpdatedAt {{ get; set; }} = DateTime.Now;
+
+    public string ModuleTitle => "{title}";
+    public string ModuleDescription => "{description}";
+
+    public void MarkUpdated(string operatorName)
+    {{
+        UpdatedAt = DateTime.Now;
+        Description = string.IsNullOrWhiteSpace(Description)
+            ? $"最后操作人：{{operatorName}}"
+            : Description + $"；最后操作人：{{operatorName}}";
+    }}
+
+    public string BuildDisplayName()
+    {{
+        return $"{{Code}} - {{Name}} - {{Status}}";
+    }}
+}}
+"""
+
+
+def _csharp_query(namespace: str, query_name: str, title: str) -> str:
+    return f"""namespace {namespace}.Queries;
+
+public class {query_name}
+{{
+    public string? Keyword {{ get; set; }}
+    public string? Status {{ get; set; }}
+    public string? OwnerRole {{ get; set; }}
+    public DateTime? StartTime {{ get; set; }}
+    public DateTime? EndTime {{ get; set; }}
+    public int PageNo {{ get; set; }} = 1;
+    public int PageSize {{ get; set; }} = 20;
+
+    public void Normalize()
+    {{
+        Keyword = Keyword?.Trim();
+        Status = Status?.Trim();
+        OwnerRole = OwnerRole?.Trim();
+        PageNo = PageNo <= 0 ? 1 : PageNo;
+        PageSize = PageSize <= 0 ? 20 : Math.Min(PageSize, 200);
+        if (StartTime.HasValue && EndTime.HasValue && StartTime.Value > EndTime.Value)
+        {{
+            (StartTime, EndTime) = (EndTime, StartTime);
+        }}
+    }}
+
+    public string BuildSummary()
+    {{
+        return $"{title} 查询条件：关键字={{Keyword ?? "全部"}}，状态={{Status ?? "全部"}}，页码={{PageNo}}";
+    }}
+}}
+"""
+
+
+def _csharp_repository_interface(namespace: str, class_name: str, record_name: str, query_name: str) -> str:
+    return f"""using {namespace}.Models;
+using {namespace}.Queries;
+
+namespace {namespace}.Repositories;
+
+public interface I{class_name}Repository
+{{
+    IReadOnlyList<{record_name}> Query({query_name} query);
+    {record_name}? FindById(long id);
+    {record_name} Save({record_name} record);
+    bool Delete(long id);
+    bool ExistsByCode(string code, long? excludeId = null);
+}}
+"""
+
+
+def _csharp_repository(namespace: str, class_name: str, record_name: str, query_name: str) -> str:
+    return f"""using {namespace}.Models;
+using {namespace}.Queries;
+
+namespace {namespace}.Repositories;
+
+public class InMemory{class_name}Repository : I{class_name}Repository
+{{
+    private readonly List<{record_name}> _records = new();
+    private long _nextId = 1;
+
+    public IReadOnlyList<{record_name}> Query({query_name} query)
+    {{
+        query.Normalize();
+        IEnumerable<{record_name}> result = _records;
+        if (!string.IsNullOrWhiteSpace(query.Keyword))
+        {{
+            result = result.Where(item => item.Name.Contains(query.Keyword) || item.Code.Contains(query.Keyword));
+        }}
+        if (!string.IsNullOrWhiteSpace(query.Status))
+        {{
+            result = result.Where(item => item.Status.Equals(query.Status, StringComparison.OrdinalIgnoreCase));
+        }}
+        if (!string.IsNullOrWhiteSpace(query.OwnerRole))
+        {{
+            result = result.Where(item => item.OwnerRole.Equals(query.OwnerRole, StringComparison.OrdinalIgnoreCase));
+        }}
+        if (query.StartTime.HasValue)
+        {{
+            result = result.Where(item => item.UpdatedAt >= query.StartTime.Value);
+        }}
+        if (query.EndTime.HasValue)
+        {{
+            result = result.Where(item => item.UpdatedAt <= query.EndTime.Value);
+        }}
+        return result.OrderByDescending(item => item.UpdatedAt).ToList();
+    }}
+
+    public {record_name}? FindById(long id)
+    {{
+        return _records.FirstOrDefault(item => item.Id == id);
+    }}
+
+    public {record_name} Save({record_name} record)
+    {{
+        if (record.Id <= 0)
+        {{
+            record.Id = _nextId++;
+            record.CreatedAt = DateTime.Now;
+        }}
+        _records.RemoveAll(item => item.Id == record.Id);
+        record.UpdatedAt = DateTime.Now;
+        _records.Add(record);
+        return record;
+    }}
+
+    public bool Delete(long id)
+    {{
+        return _records.RemoveAll(item => item.Id == id) > 0;
+    }}
+
+    public bool ExistsByCode(string code, long? excludeId = null)
+    {{
+        return _records.Any(item => item.Code == code && (!excludeId.HasValue || item.Id != excludeId.Value));
+    }}
+}}
+"""
+
+
+def _csharp_validator(namespace: str, class_name: str, record_name: str, title: str) -> str:
+    return f"""using {namespace}.Models;
+using {namespace}.Repositories;
+
+namespace {namespace}.Services;
+
+public class {class_name}Validator
+{{
+    private readonly I{class_name}Repository _repository;
+
+    public {class_name}Validator(I{class_name}Repository repository)
+    {{
+        _repository = repository;
+    }}
+
+    public IReadOnlyList<string> ValidateForCreate({record_name} record)
+    {{
+        var errors = ValidateBasicFields(record).ToList();
+        if (_repository.ExistsByCode(record.Code))
+        {{
+            errors.Add("{title}编码已经存在");
+        }}
+        return errors;
+    }}
+
+    public IReadOnlyList<string> ValidateForUpdate(long id, {record_name} record)
+    {{
+        var errors = ValidateBasicFields(record).ToList();
+        if (id <= 0)
+        {{
+            errors.Add("记录编号不合法");
+        }}
+        if (_repository.ExistsByCode(record.Code, id))
+        {{
+            errors.Add("{title}编码与其他记录重复");
+        }}
+        return errors;
+    }}
+
+    private IEnumerable<string> ValidateBasicFields({record_name} record)
+    {{
+        if (string.IsNullOrWhiteSpace(record.Code))
+        {{
+            yield return "业务编码不能为空";
+        }}
+        if (string.IsNullOrWhiteSpace(record.Name))
+        {{
+            yield return "业务名称不能为空";
+        }}
+        if (string.IsNullOrWhiteSpace(record.OwnerRole))
+        {{
+            yield return "负责角色不能为空";
+        }}
+        if (!IsSupportedStatus(record.Status))
+        {{
+            yield return "状态值不在允许范围内";
+        }}
+        if (record.Description.Length > 500)
+        {{
+            yield return "描述信息不能超过500个字符";
+        }}
+    }}
+
+    public bool IsSupportedStatus(string status)
+    {{
+        var allowed = new[] {{ "Enabled", "Disabled", "Pending", "Archived", "Locked" }};
+        return allowed.Contains(status, StringComparer.OrdinalIgnoreCase);
+    }}
+}}
+"""
+
+
+def _csharp_service(namespace: str, class_name: str, record_name: str, query_name: str, title: str) -> str:
+    return f"""using {namespace}.Common;
+using {namespace}.Models;
+using {namespace}.Queries;
+using {namespace}.Repositories;
+
+namespace {namespace}.Services;
+
+public class {class_name}Service
+{{
+    private readonly I{class_name}Repository _repository;
+    private readonly {class_name}Validator _validator;
+    private readonly {class_name}AuditService _auditService = new();
+
+    public {class_name}Service(I{class_name}Repository repository, {class_name}Validator validator)
+    {{
+        _repository = repository;
+        _validator = validator;
+    }}
+
+    public PagedResult<{record_name}> Query({query_name} query)
+    {{
+        var records = _repository.Query(query);
+        return PagedResult<{record_name}>.Create(records, query.PageNo, query.PageSize);
+    }}
+
+    public ApiResult<{record_name}> Create({record_name} record, string operatorName)
+    {{
+        var errors = _validator.ValidateForCreate(record);
+        if (errors.Count > 0)
+        {{
+            return ApiResult<{record_name}>.Fail(string.Join("；", errors));
+        }}
+        record.MarkUpdated(operatorName);
+        var saved = _repository.Save(record);
+        _auditService.RecordCreate(operatorName, saved);
+        return ApiResult<{record_name}>.Ok(saved);
+    }}
+
+    public ApiResult<{record_name}> Update(long id, {record_name} request, string operatorName)
+    {{
+        var existing = _repository.FindById(id);
+        if (existing == null)
+        {{
+            return ApiResult<{record_name}>.Fail("{title}记录不存在");
+        }}
+        var errors = _validator.ValidateForUpdate(id, request);
+        if (errors.Count > 0)
+        {{
+            return ApiResult<{record_name}>.Fail(string.Join("；", errors));
+        }}
+        existing.Code = request.Code;
+        existing.Name = request.Name;
+        existing.Status = request.Status;
+        existing.OwnerRole = request.OwnerRole;
+        existing.Description = request.Description;
+        existing.SortNo = request.SortNo;
+        existing.Score = request.Score;
+        existing.Enabled = request.Enabled;
+        existing.MarkUpdated(operatorName);
+        var saved = _repository.Save(existing);
+        _auditService.RecordUpdate(operatorName, saved);
+        return ApiResult<{record_name}>.Ok(saved);
+    }}
+
+    public ApiResult<bool> Delete(long id, string operatorName)
+    {{
+        var existing = _repository.FindById(id);
+        if (existing == null)
+        {{
+            return ApiResult<bool>.Fail("{title}记录不存在");
+        }}
+        var deleted = _repository.Delete(id);
+        _auditService.RecordDelete(operatorName, existing);
+        return ApiResult<bool>.Ok(deleted);
+    }}
+}}
+"""
+
+
+def _csharp_statistics(namespace: str, class_name: str, record_name: str, title: str) -> str:
+    return f"""using {namespace}.Models;
+
+namespace {namespace}.Services;
+
+public class {class_name}StatisticsService
+{{
+    public Dictionary<string, int> CountByStatus(IEnumerable<{record_name}> records)
+    {{
+        return records
+            .GroupBy(item => string.IsNullOrWhiteSpace(item.Status) ? "Unknown" : item.Status)
+            .ToDictionary(group => group.Key, group => group.Count());
+    }}
+
+    public Dictionary<string, object> BuildSummary(IEnumerable<{record_name}> records, DateTime date)
+    {{
+        var list = records.ToList();
+        var status = CountByStatus(list);
+        return new Dictionary<string, object>
+        {{
+            ["Module"] = "{title}",
+            ["Date"] = date.ToString("yyyy-MM-dd"),
+            ["TotalCount"] = list.Count,
+            ["EnabledCount"] = status.GetValueOrDefault("Enabled"),
+            ["PendingCount"] = status.GetValueOrDefault("Pending"),
+            ["ArchivedCount"] = status.GetValueOrDefault("Archived"),
+            ["AverageScore"] = list.Count == 0 ? 0 : list.Average(item => item.Score),
+            ["RiskLevel"] = EvaluateRiskLevel(list)
+        }};
+    }}
+
+    public string EvaluateRiskLevel(IEnumerable<{record_name}> records)
+    {{
+        var list = records.ToList();
+        var disabled = list.Count(item => !item.Enabled || item.Status == "Disabled");
+        var pending = list.Count(item => item.Status == "Pending");
+        if (disabled > 10 || pending > 20)
+        {{
+            return "High";
+        }}
+        if (disabled > 3 || pending > 5)
+        {{
+            return "Medium";
+        }}
+        return "Low";
+    }}
+}}
+"""
+
+
+def _csharp_audit(namespace: str, class_name: str, record_name: str, title: str) -> str:
+    return f"""using {namespace}.Models;
+
+namespace {namespace}.Services;
+
+public class {class_name}AuditService
+{{
+    private readonly List<string> _auditLines = new();
+
+    public void RecordCreate(string operatorName, {record_name} record)
+    {{
+        Append(operatorName, "Create", record, "新增{title}记录");
+    }}
+
+    public void RecordUpdate(string operatorName, {record_name} record)
+    {{
+        Append(operatorName, "Update", record, "修改{title}记录");
+    }}
+
+    public void RecordDelete(string operatorName, {record_name} record)
+    {{
+        Append(operatorName, "Delete", record, "删除{title}记录");
+    }}
+
+    public void RecordExport(string operatorName, int count)
+    {{
+        _auditLines.Add($"{{DateTime.Now:yyyy-MM-dd HH:mm:ss}} | {{Normalize(operatorName)}} | Export | {title} | count={{count}}");
+    }}
+
+    public IReadOnlyList<string> ListRecent(int limit)
+    {{
+        var safeLimit = Math.Max(1, limit);
+        return _auditLines.Skip(Math.Max(0, _auditLines.Count - safeLimit)).ToList();
+    }}
+
+    private void Append(string operatorName, string action, {record_name} record, string message)
+    {{
+        _auditLines.Add($"{{DateTime.Now:yyyy-MM-dd HH:mm:ss}} | {{Normalize(operatorName)}} | {{action}} | {{record.Code}} | {{message}}");
+    }}
+
+    private string Normalize(string value)
+    {{
+        return string.IsNullOrWhiteSpace(value) ? "system" : value.Trim();
+    }}
+}}
+"""
+
+
+def _csharp_export(namespace: str, class_name: str, record_name: str, title: str) -> str:
+    return f"""using {namespace}.Models;
+
+namespace {namespace}.Services;
+
+public class {class_name}ExportService
+{{
+    public IReadOnlyList<string> ExportCsv(IEnumerable<{record_name}> records)
+    {{
+        var lines = new List<string>
+        {{
+            "Id,Code,Name,Status,OwnerRole,Score,UpdatedAt"
+        }};
+        foreach (var record in records)
+        {{
+            lines.Add(string.Join(",",
+                record.Id,
+                Escape(record.Code),
+                Escape(record.Name),
+                Escape(record.Status),
+                Escape(record.OwnerRole),
+                record.Score,
+                record.UpdatedAt.ToString("yyyy-MM-dd HH:mm:ss")));
+        }}
+        return lines;
+    }}
+
+    public string BuildFileName(string operatorName)
+    {{
+        var safeOperator = string.IsNullOrWhiteSpace(operatorName) ? "system" : operatorName.Trim();
+        return "{class_name.lower()}_" + safeOperator + "_" + DateTime.Now.ToString("yyyyMMddHHmmss") + ".csv";
+    }}
+
+    public string BuildExportRemark(int count)
+    {{
+        return "{title}导出完成，共 " + count + " 条记录。";
+    }}
+
+    private string Escape(string value)
+    {{
+        return string.IsNullOrWhiteSpace(value) ? string.Empty : value.Replace(",", "，").Replace("\\n", " ");
+    }}
+}}
+"""
+
+
+def _csharp_controller(namespace: str, class_name: str, record_name: str, query_name: str, title: str) -> str:
+    route = _snake(class_name).replace("_", "-")
+    return f"""using Microsoft.AspNetCore.Mvc;
+using {namespace}.Common;
+using {namespace}.Models;
+using {namespace}.Queries;
+using {namespace}.Services;
+
+namespace {namespace}.Controllers;
+
+[ApiController]
+[Route("api/{route}")]
+public class {class_name}Controller : ControllerBase
+{{
+    private readonly {class_name}Service _service;
+
+    public {class_name}Controller({class_name}Service service)
+    {{
+        _service = service;
+    }}
+
+    [HttpGet]
+    public ActionResult<PagedResult<{record_name}>> Query([FromQuery] {query_name} query)
+    {{
+        return _service.Query(query);
+    }}
+
+    [HttpPost]
+    public ActionResult<ApiResult<{record_name}>> Create([FromBody] {record_name} record)
+    {{
+        return _service.Create(record, User.Identity?.Name ?? "system");
+    }}
+
+    [HttpPut("{{id:long}}")]
+    public ActionResult<ApiResult<{record_name}>> Update(long id, [FromBody] {record_name} record)
+    {{
+        return _service.Update(id, record, User.Identity?.Name ?? "system");
+    }}
+
+    [HttpDelete("{{id:long}}")]
+    public ActionResult<ApiResult<bool>> Delete(long id)
+    {{
+        return _service.Delete(id, User.Identity?.Name ?? "system");
+    }}
+
+    [HttpGet("module-title")]
+    public ActionResult<string> ModuleTitle()
+    {{
+        return "{title}";
+    }}
+}}
+"""
+
+
 def _generic_source_content(task: GenerationTask, module: FeatureModule, extension: str) -> str:
     title = module.title
     if extension == ".html":
@@ -1120,6 +1860,180 @@ def _ensure_line_target(
         return files
     files.append(_write(java_root / "service" / "OperationTraceService.java", _operation_trace_service(task, blueprint)))
     return files
+
+
+def _ensure_generic_line_target(
+    files: list[Path],
+    target_dir: Path,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    target_lines: int,
+    extension: str,
+) -> list[Path]:
+    total_lines = sum(_count_lines(path) for path in files)
+    if total_lines >= target_lines:
+        return files
+    if extension == ".cs":
+        files.append(_write(target_dir / "ScenarioCatalogService.cs", _csharp_scenario_catalog(task, blueprint, target_lines - total_lines)))
+    return files
+
+
+def _csharp_operation_trace_service(namespace: str, task: GenerationTask, blueprint: ProductBlueprint) -> str:
+    module_titles = ", ".join(module.title for module in blueprint.modules)
+    return f"""namespace {namespace}.Services;
+
+public class OperationTraceService
+{{
+    private readonly List<Dictionary<string, object>> _traces = new();
+
+    public Dictionary<string, object> BeginTrace(string module, string action, string operatorName)
+    {{
+        var trace = new Dictionary<string, object>
+        {{
+            ["SoftwareName"] = "{task.software_name}",
+            ["Version"] = "{task.version}",
+            ["AvailableModules"] = "{module_titles}",
+            ["Module"] = Normalize(module),
+            ["Action"] = Normalize(action),
+            ["Operator"] = Normalize(operatorName),
+            ["Status"] = "Started",
+            ["CreatedAt"] = DateTime.Now,
+            ["UpdatedAt"] = DateTime.Now
+        }};
+        _traces.Add(trace);
+        return trace;
+    }}
+
+    public void AppendBusinessMessage(Dictionary<string, object> trace, string message)
+    {{
+        if (!trace.TryGetValue("Messages", out var value) || value is not List<string> messages)
+        {{
+            messages = new List<string>();
+            trace["Messages"] = messages;
+        }}
+        messages.Add($"{{DateTime.Now:yyyy-MM-dd HH:mm:ss}} | {{Normalize(message)}}");
+        trace["UpdatedAt"] = DateTime.Now;
+    }}
+
+    public void MarkSuccess(Dictionary<string, object> trace, string message)
+    {{
+        Mark(trace, "Success", message);
+    }}
+
+    public void MarkFailure(Dictionary<string, object> trace, string message)
+    {{
+        Mark(trace, "Failure", message);
+    }}
+
+    public IReadOnlyList<Dictionary<string, object>> ListByModule(string module)
+    {{
+        var safeModule = Normalize(module);
+        return _traces
+            .Where(item => item.TryGetValue("Module", out var value) && Equals(value, safeModule))
+            .Select(item => new Dictionary<string, object>(item))
+            .ToList();
+    }}
+
+    public IReadOnlyList<string> ExportTraceLines()
+    {{
+        var lines = new List<string> {{ "Software,Module,Action,Operator,Status,CreatedAt,UpdatedAt" }};
+        foreach (var trace in _traces)
+        {{
+            lines.Add(string.Join(",",
+                Escape(trace.GetValueOrDefault("SoftwareName")),
+                Escape(trace.GetValueOrDefault("Module")),
+                Escape(trace.GetValueOrDefault("Action")),
+                Escape(trace.GetValueOrDefault("Operator")),
+                Escape(trace.GetValueOrDefault("Status")),
+                Escape(trace.GetValueOrDefault("CreatedAt")),
+                Escape(trace.GetValueOrDefault("UpdatedAt"))));
+        }}
+        return lines;
+    }}
+
+    private void Mark(Dictionary<string, object> trace, string status, string message)
+    {{
+        trace["Status"] = status;
+        trace["ResultMessage"] = Normalize(message);
+        trace["UpdatedAt"] = DateTime.Now;
+        AppendBusinessMessage(trace, message);
+    }}
+
+    private string Normalize(string? value)
+    {{
+        return string.IsNullOrWhiteSpace(value) ? "-" : value.Trim().Replace(",", "，");
+    }}
+
+    private string Escape(object? value)
+    {{
+        return value == null ? string.Empty : Convert.ToString(value)?.Replace(",", "，").Replace("\\n", " ") ?? string.Empty;
+    }}
+}}
+"""
+
+
+def _csharp_scenario_catalog(task: GenerationTask, blueprint: ProductBlueprint, missing_lines: int) -> str:
+    rows: list[str] = [
+        "using System.Collections.ObjectModel;",
+        "",
+        f"namespace {_pascal(_ascii_token(task.software_name))}.Services;",
+        "",
+        "public class ScenarioCatalogService",
+        "{",
+        "    private readonly List<ScenarioDefinition> _scenarios = new();",
+        "",
+        "    public ScenarioCatalogService()",
+        "    {",
+    ]
+    scenario_count = max(24, missing_lines // 7 + 8)
+    modules = blueprint.modules or []
+    for index in range(1, scenario_count + 1):
+        module = modules[(index - 1) % len(modules)] if modules else FeatureModule("business", "业务模块", "业务处理", ["BusinessRecord"])
+        rows.extend(
+            [
+                "        _scenarios.Add(new ScenarioDefinition",
+                "        {",
+                f"            Code = \"SCN-{index:04d}\",",
+                f"            ModuleName = \"{module.title}\",",
+                f"            Title = \"{module.title}场景{index:04d}\",",
+                f"            Description = \"{module.description}，用于覆盖查询、配置、处理、审核、统计和追踪等业务过程。\",",
+                f"            ExpectedResult = \"系统完成{module.title}场景{index:04d}处理并记录审计日志。\"",
+                "        });",
+            ]
+        )
+    rows.extend(
+        [
+            "    }",
+            "",
+            "    public IReadOnlyList<ScenarioDefinition> ListAll()",
+            "    {",
+            "        return new ReadOnlyCollection<ScenarioDefinition>(_scenarios);",
+            "    }",
+            "",
+            "    public IReadOnlyList<ScenarioDefinition> ListByModule(string moduleName)",
+            "    {",
+            "        return _scenarios",
+            "            .Where(item => item.ModuleName.Equals(moduleName, StringComparison.OrdinalIgnoreCase))",
+            "            .ToList();",
+            "    }",
+            "",
+            "    public ScenarioDefinition? FindByCode(string code)",
+            "    {",
+            "        return _scenarios.FirstOrDefault(item => item.Code.Equals(code, StringComparison.OrdinalIgnoreCase));",
+            "    }",
+            "}",
+            "",
+            "public class ScenarioDefinition",
+            "{",
+            "    public string Code { get; set; } = string.Empty;",
+            "    public string ModuleName { get; set; } = string.Empty;",
+            "    public string Title { get; set; } = string.Empty;",
+            "    public string Description { get; set; } = string.Empty;",
+            "    public string ExpectedResult { get; set; } = string.Empty;",
+            "}",
+        ]
+    )
+    return "\n".join(rows)
 
 
 def _operation_trace_service(task: GenerationTask, blueprint: ProductBlueprint) -> str:
@@ -1265,6 +2179,11 @@ public class OperationTraceService {{
 
 def _readme(task: GenerationTask, blueprint: ProductBlueprint) -> str:
     module_lines = "\n".join(f"- {module.title}：{module.description}" for module in blueprint.modules)
+    workflow_lines = "\n".join(
+        f"- {item.get('name', '业务流程')}：{' -> '.join(item.get('steps', []))}，输出：{item.get('output', '')}"
+        for item in blueprint.workflows[:5]
+        if isinstance(item, dict)
+    )
     return f"""# {task.software_name}
 
 版本：{task.version}
@@ -1276,6 +2195,23 @@ def _readme(task: GenerationTask, blueprint: ProductBlueprint) -> str:
 ## 软件概述
 
 {blueprint.summary}
+
+## 产品方案
+
+- 具体场景：{blueprint.scenario or "-"}
+- 产品定位：{blueprint.positioning or "-"}
+- 目标用户：{"、".join(blueprint.target_users or blueprint.roles)}
+- 核心业务对象：{"、".join(blueprint.business_objects)}
+- 统计指标：{"、".join(blueprint.report_metrics)}
+- 技术特点：{"、".join(blueprint.technical_features)}
+- 质量规则：{"；".join(blueprint.quality_rules)}
+- 数据关系：{"；".join(blueprint.data_relations)}
+- 部署拓扑：{blueprint.deployment_topology or "-"}
+- 方案指纹：{blueprint.generation_fingerprint or "-"}
+
+## 业务流程
+
+{workflow_lines or "-"}
 
 ## 功能模块
 
@@ -1290,6 +2226,10 @@ def _readme(task: GenerationTask, blueprint: ProductBlueprint) -> str:
 def _package_token(value: str) -> str:
     token = _ascii_token(value).replace("-", "")
     return token or "software"
+
+
+def _java_literal(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _ascii_token(value: str) -> str:

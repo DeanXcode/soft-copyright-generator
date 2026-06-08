@@ -5,13 +5,22 @@ const https = require("https");
 const path = require("path");
 const { spawn } = require("child_process");
 
-const rootDir = path.resolve(__dirname, "..", "..");
+const sourceRoot = path.resolve(__dirname, "..", "..");
+const appRoot = app.isPackaged ? app.getAppPath() : sourceRoot;
+const resourceRoot = app.isPackaged ? process.resourcesPath : sourceRoot;
+const rootDir = resourceRoot;
 loadDesktopConfig();
 
 const isDev = process.env.VITE_DEV_SERVER_URL || process.env.NODE_ENV === "development";
 let mainWindow;
 
 const modelPlans = {
+  template: {
+    provider: "local-template",
+    modelName: "template-v1",
+    apiBaseUrl: "",
+    apiKey: ""
+  },
   gpt: {
     provider: "custom",
     modelName: process.env.SOFT_MODEL_GPT_NAME || process.env.SOFT_MODEL_GATEWAY_MODEL || "gpt-4o-mini",
@@ -35,13 +44,113 @@ function accountBalanceUrl() {
   }
   if ((process.env.SOFT_ACCOUNT_PROVIDER || "").toLowerCase() === "newapi") {
     const gatewayRoot = rootUrlFromGateway(modelPlans.gpt.apiBaseUrl);
-    return gatewayRoot ? `${gatewayRoot}/api/usage/token` : "";
+    return gatewayRoot ? `${gatewayRoot}/api/usage/token/` : "";
   }
   const baseUrl = accountApiBaseUrl().replace(/\/+$/, "");
   return baseUrl ? `${baseUrl}/api/v1/account/balance` : "";
 }
 
-function fetchJson(url, token) {
+function defaultConfigPath() {
+  const externalConfigDir = process.env.SOFT_DESKTOP_CONFIG_DIR || "";
+  if (externalConfigDir) {
+    return path.join(externalConfigDir, "production.json");
+  }
+  if (app.isPackaged) {
+    return path.join(app.getPath("userData"), "config", "production.json");
+  }
+  return path.join(rootDir, "config", "production.json");
+}
+
+function packagedPlaywrightBrowsersPath() {
+  const candidates = [
+    path.join(process.resourcesPath || "", "ms-playwright"),
+    path.join(path.dirname(process.execPath), "ms-playwright"),
+    path.join(rootDir, "ms-playwright")
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || "";
+}
+
+function bundledPythonExecutable() {
+  const candidates = [
+    path.join(process.resourcesPath || "", "python-runtime", "python.exe"),
+    path.join(path.dirname(process.execPath), "python-runtime", "python.exe"),
+    path.join(rootDir, "python-runtime", "python.exe")
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || "python";
+}
+
+function packagedLibreOfficePath() {
+  const candidates = [
+    path.join(process.resourcesPath || "", "libreoffice", "program", "soffice.exe"),
+    path.join(path.dirname(process.execPath), "libreoffice", "program", "soffice.exe"),
+    path.join(rootDir, "libreoffice", "program", "soffice.exe")
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || "";
+}
+
+function generationOutputRoot() {
+  if (app.isPackaged) {
+    return path.join(app.getPath("documents"), "SoftCopyrightGenerator", "output");
+  }
+  return path.join(rootDir, "output");
+}
+
+function currentModelMode() {
+  if ((process.env.SOFT_MODEL_MODE || "").toLowerCase() === "template") {
+    return "template";
+  }
+  if (!modelPlans.gpt.apiKey) {
+    return "template";
+  }
+  return "gpt";
+}
+
+function envFlagEnabled(value) {
+  return ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
+}
+
+function applyModelConfig(config) {
+  if (typeof config.SOFT_MODEL_MODE === "string") {
+    process.env.SOFT_MODEL_MODE = config.SOFT_MODEL_MODE;
+  }
+  if (typeof config.SOFT_MODEL_GPT_API_KEY === "string") {
+    process.env.SOFT_MODEL_GPT_API_KEY = config.SOFT_MODEL_GPT_API_KEY;
+    modelPlans.gpt.apiKey = config.SOFT_MODEL_GPT_API_KEY;
+  }
+  if (typeof config.SOFT_MODEL_GPT_NAME === "string" && config.SOFT_MODEL_GPT_NAME) {
+    process.env.SOFT_MODEL_GPT_NAME = config.SOFT_MODEL_GPT_NAME;
+    modelPlans.gpt.modelName = config.SOFT_MODEL_GPT_NAME;
+  }
+  if (typeof config.SOFT_MODEL_GPT_BASE_URL === "string") {
+    process.env.SOFT_MODEL_GPT_BASE_URL = config.SOFT_MODEL_GPT_BASE_URL;
+    modelPlans.gpt.apiBaseUrl = config.SOFT_MODEL_GPT_BASE_URL;
+  }
+  if (typeof config.SOFT_ACCOUNT_PROVIDER === "string") {
+    process.env.SOFT_ACCOUNT_PROVIDER = config.SOFT_ACCOUNT_PROVIDER;
+  }
+  if (typeof config.SOFT_MODEL_CONFIG_LOCKED === "string" || typeof config.SOFT_MODEL_CONFIG_LOCKED === "boolean") {
+    process.env.SOFT_MODEL_CONFIG_LOCKED = String(config.SOFT_MODEL_CONFIG_LOCKED);
+  }
+  if (typeof config.SOFT_CUSTOMER_PRESET_CONFIG === "string" || typeof config.SOFT_CUSTOMER_PRESET_CONFIG === "boolean") {
+    process.env.SOFT_CUSTOMER_PRESET_CONFIG = String(config.SOFT_CUSTOMER_PRESET_CONFIG);
+  }
+}
+
+function readJsonConfig(configPath) {
+  if (!fs.existsSync(configPath)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(configPath, "utf8"));
+  } catch (_error) {
+    return {};
+  }
+}
+
+function writeJsonConfig(configPath, config) {
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
+function fetchJson(url, token, redirectCount = 0) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith("https:") ? https : http;
     const request = client.request(
@@ -57,6 +166,20 @@ function fetchJson(url, token) {
       (response) => {
         let body = "";
         response.setEncoding("utf8");
+        if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
+          response.resume();
+          if (redirectCount >= 4) {
+            reject(new Error(`HTTP ${response.statusCode}: 余额接口重定向次数过多`));
+            return;
+          }
+          try {
+            const nextUrl = new URL(response.headers.location, url).toString();
+            resolve(fetchJson(nextUrl, token, redirectCount + 1));
+          } catch (error) {
+            reject(error);
+          }
+          return;
+        }
         response.on("data", (chunk) => {
           body += chunk;
         });
@@ -122,9 +245,32 @@ function rootUrlFromGateway(baseUrl) {
 }
 
 function loadDesktopConfig() {
+  const exeConfigDir = path.join(path.dirname(process.execPath), "config");
+  const externalConfigDir = process.env.SOFT_DESKTOP_CONFIG_DIR || "";
+  const userConfigDir = (() => {
+    try {
+      return app.isPackaged ? path.join(app.getPath("userData"), "config") : "";
+    } catch (_error) {
+      return "";
+    }
+  })();
   const configPaths = [
+    ...(externalConfigDir
+      ? [
+          path.join(externalConfigDir, "production.json"),
+          path.join(externalConfigDir, "desktop.local.json")
+        ]
+      : []),
     path.join(rootDir, "config", "production.json"),
-    path.join(rootDir, "config", "desktop.local.json")
+    path.join(rootDir, "config", "desktop.local.json"),
+    ...(userConfigDir
+      ? [
+          path.join(userConfigDir, "production.json"),
+          path.join(userConfigDir, "desktop.local.json")
+        ]
+      : []),
+    path.join(exeConfigDir, "production.json"),
+    path.join(exeConfigDir, "desktop.local.json")
   ];
   for (const configPath of configPaths) {
     if (!fs.existsSync(configPath)) continue;
@@ -162,7 +308,7 @@ function createWindow() {
   if (isDev) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL || "http://127.0.0.1:5173");
   } else {
-    mainWindow.loadFile(path.join(rootDir, "dist", "index.html"));
+    mainWindow.loadFile(path.join(appRoot, "dist", "index.html"));
   }
 }
 
@@ -199,7 +345,9 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
     "--model-name",
     modelPlan.modelName || payload.modelName || "template-v1",
     "--randomness",
-    payload.randomness || "standard"
+    payload.randomness || "standard",
+    "--output-root",
+    payload.outputRoot || generationOutputRoot()
   ];
 
   if (modelPlan.apiBaseUrl) {
@@ -214,11 +362,13 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
 
   return new Promise((resolve) => {
     const sender = _event.sender;
-    const child = spawn("python", args, {
-      cwd: rootDir,
+    const child = spawn(bundledPythonExecutable(), args, {
+      cwd: app.isPackaged ? process.resourcesPath : rootDir,
       windowsHide: true,
       env: {
         ...process.env,
+        ...(packagedPlaywrightBrowsersPath() ? { PLAYWRIGHT_BROWSERS_PATH: packagedPlaywrightBrowsersPath() } : {}),
+        ...(packagedLibreOfficePath() ? { SOFT_LIBREOFFICE_PATH: packagedLibreOfficePath() } : {}),
         PYTHONIOENCODING: "utf-8"
       }
     });
@@ -287,6 +437,54 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
   });
 });
 
+ipcMain.handle("get-model-config", async () => {
+  return {
+    mode: currentModelMode(),
+    modelName: modelPlans.gpt.modelName || "gpt-4o-mini",
+    apiBaseUrl: modelPlans.gpt.apiBaseUrl || "",
+    apiKey: modelPlans.gpt.apiKey || "",
+    apiKeyConfigured: Boolean(modelPlans.gpt.apiKey),
+    provider: process.env.SOFT_ACCOUNT_PROVIDER || "newapi",
+    preset: envFlagEnabled(process.env.SOFT_CUSTOMER_PRESET_CONFIG)
+  };
+});
+
+ipcMain.handle("save-model-config", async (_event, payload) => {
+  const mode = payload?.mode === "template" ? "template" : "gpt";
+  const modelName = String(payload?.modelName || modelPlans.gpt.modelName || "gpt-4o-mini").trim();
+  const apiBaseUrl = String(payload?.apiBaseUrl || modelPlans.gpt.apiBaseUrl || "").trim();
+  const apiKey = String(payload?.apiKey || "").trim();
+  if (mode === "gpt" && !apiBaseUrl) {
+    return { ok: false, message: "GPT 模式需要填写请求地址" };
+  }
+  if (mode === "gpt" && !apiKey) {
+    return { ok: false, message: "GPT 模式需要填写 API Key" };
+  }
+
+  const configPath = defaultConfigPath();
+  const config = {
+    ...readJsonConfig(configPath),
+    SOFT_ACCOUNT_PROVIDER: "newapi",
+    SOFT_MODEL_MODE: mode,
+    SOFT_MODEL_GPT_BASE_URL: apiBaseUrl,
+    SOFT_MODEL_GPT_NAME: modelName || "gpt-4o-mini",
+    SOFT_MODEL_CONFIG_LOCKED: "false"
+  };
+  if (mode === "gpt") {
+    config.SOFT_MODEL_GPT_API_KEY = apiKey;
+  }
+  writeJsonConfig(configPath, config);
+  applyModelConfig(config);
+  return {
+    ok: true,
+    mode,
+    modelName: config.SOFT_MODEL_GPT_NAME,
+    apiBaseUrl: config.SOFT_MODEL_GPT_BASE_URL,
+    apiKey: config.SOFT_MODEL_GPT_API_KEY,
+    apiKeyConfigured: Boolean(config.SOFT_MODEL_GPT_API_KEY)
+  };
+});
+
 ipcMain.handle("open-path", async (_event, targetPath) => {
   if (!targetPath) {
     return { ok: false, message: "路径为空" };
@@ -296,6 +494,14 @@ ipcMain.handle("open-path", async (_event, targetPath) => {
 });
 
 ipcMain.handle("get-model-account", async () => {
+  if (currentModelMode() === "template") {
+    return {
+      status: "local",
+      accountName: "默认模板",
+      balanceLabel: "不消耗 token",
+      updatedAt: ""
+    };
+  }
   const url = accountBalanceUrl();
   if (url) {
     try {

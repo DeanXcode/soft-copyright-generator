@@ -75,26 +75,51 @@ start-desktop.bat
 
 ## 模型配置
 
-桌面端客户界面只显示 GPT 套餐和余额，API 中转站由服务端或交付环境配置。NewAPI 这类 OpenAI-compatible 中转站可直接作为 GPT 网关使用：
+桌面端客户界面支持两种生成模式：
 
-推荐使用隐藏配置文件，不要让客户在界面里填写 API。复制模板：
+- `默认模板`：使用本地模板生成，不调用模型接口，不消耗 token。
+- `GPT`：通过服务端中转生成产品蓝图和说明书正文，会按实际调用消耗 token。
+
+客户交付版安装包会预置 GPT 配置，客户安装后可在高级设置里直接看到并修改请求地址、模型名称和 API Key；默认模板模式仍保留为不消耗 token 的兜底入口。
+
+生成客户交付版安装包：
 
 ```powershell
-Copy-Item config\production.example.json config\production.json
+npm run pack:win:customer
 ```
 
-然后编辑 `config\production.json`：
+该命令会从本机忽略文件 `config\production.json` 读取真实配置，临时写入 `build\customer-config\production.json`，并将其打入安装包的 `resources\config\production.json`。临时目录 `build/` 已加入 `.gitignore`，不要提交真实 token。
+
+本机真实配置示例：
 
 ```json
 {
   "SOFT_ACCOUNT_PROVIDER": "newapi",
   "SOFT_MODEL_GPT_BASE_URL": "https://smoke2.learn-flow.cn/v1",
   "SOFT_MODEL_GPT_API_KEY": "sk-你的NewAPI调用Token",
-  "SOFT_MODEL_GPT_NAME": "gpt-5.4"
+  "SOFT_MODEL_GPT_NAME": "gpt-5.5",
+  "SOFT_MODEL_MODE": "gpt"
 }
 ```
 
 `config\production.json` 已加入 `.gitignore`，不要提交真实 token。
+
+如果不是客户预制安装包，也可以由实施人员把真实配置放在安装目录或 exe 同级目录下的 `config\production.json`：
+
+```text
+软件安装目录/
+  soft-copyright-generator.exe
+  config/
+    production.json
+```
+
+也可以通过环境变量指定外部配置目录：
+
+```powershell
+$env:SOFT_DESKTOP_CONFIG_DIR="D:\SoftCopyrightConfig"
+```
+
+程序会优先读取 `SOFT_DESKTOP_CONFIG_DIR` 指向目录中的 `production.json` / `desktop.local.json`，其次读取安装包资源目录内的预置配置，再读取用户配置和 exe 同级 `config` 目录。不要把真实 key 写入 `production.example.json`，它只作为模板提交到仓库。
 
 也可以临时使用环境变量：
 
@@ -142,7 +167,7 @@ Authorization: Bearer sk-你的NewAPI调用Token
 }
 ```
 
-桌面端会优先读取业务后台余额接口：
+桌面端会优先读取业务后台余额接口。选择 `默认模板` 时界面显示“不消耗 token”，不会请求余额接口：
 
 ```powershell
 $env:SOFT_ACCOUNT_API_BASE_URL="https://your-domain.com"
@@ -199,26 +224,193 @@ npm run electron
 
 - 生成真实源码工程目录。
 - Java 默认生成 Controller、Service、Repository、DTO、Domain、XML Mapper、审计、统计、导入导出、校验和 SQL 脚本。
+- C# 默认生成 ASP.NET Core 风格工程，包含 Controller、Service、Repository、Model、Query、统计、审计、导出和操作追踪等源码文件，可满足 3000+ 行源码鉴别材料目标。
 - 自动提取源码生成源码鉴别材料。
 - 超过 60 页时采用前 30 页 + 后 30 页。
-- 生成软件说明书、源码文档、信息表、材料清单和生成报告。
+- 生成软件说明书、源码文档、申请信息表和最终 zip 材料包。
+- 自动生成登录页、系统首页、功能模块页和统计页界面截图，并插入软件说明书。
+- GPT 模式下优先由模型生成 `ui_blueprint.json`，本地再强校验截图渲染器和视图类型，保证游戏软件生成手机 9:16 竖屏的关卡、棋盘、道具、结算等游戏截图，非游戏软件不混入游戏界面。
+- 非游戏软件截图已按 APP、教育、金融、医疗、GIS、云计算、信息安全、大数据、人工智能、VR、5G、小程序、物联网、智慧城市等类型配置行业指标、业务对象、状态和流程面板。
+- 截图 HTML 已并入生成源码项目的 `generated_source/ui-prototype/`，并自动生成 `index.html`、`README.md` 和 `prototype-manifest.json`，便于直接浏览和验收每张界面原型。
+- 生成源码项目已补齐第一版可启动前端入口：Java/Spring Boot 会同步到 `src/main/resources/static/ui-prototype/`，C#/ASP.NET Core 会同步到 `wwwroot/ui-prototype/`，JavaScript/Python 项目会通过本地静态路由暴露 `/ui-prototype/index.html`。
 - 桌面端仅展示 GPT 套餐；底层可通过 NewAPI / OpenAI-compatible 中转站接入真实模型。
 - 已支持 LibreOffice 高保真 PDF 转换；未检测到 LibreOffice 时会自动生成简版 PDF 占位文件。
 
-## LibreOffice
+## 界面截图
 
-Windows 可通过 winget 安装：
+程序会为说明书生成业务相关界面图：
+
+- 登录界面
+- 系统首页
+- 功能模块页面
+- 统计报表界面
+
+优先使用 GPT 生成或修正 `ui_blueprint.json`，再由 Playwright/Chromium 对 HTML 页面截图；游戏软件输出 720×1280 的 9:16 手机竖屏截图，桌面管理类软件输出 1280×820 横向截图，并按产品类型套用行业画像。如果浏览器运行时不可用，会自动使用本地图像渲染生成 PNG，仍会插入说明书，不中断材料生成。截图 PNG 会保存在输出目录的 `ui_screenshots/` 中；对应 HTML、原型入口、蓝图和清单会保存在源码工程的 `generated_source/ui-prototype/` 中，作为内部生成过程文件保留；最终 zip 只包含客户交付所需的 5 个文件，不包含截图源文件、源码工程、生成报告或材料清单。
+
+快速验收截图链路可以只生成源码项目、UI 原型和 PNG，不生成 Word/PDF，也不打包：
 
 ```powershell
-winget install --id TheDocumentFoundation.LibreOffice -e --accept-package-agreements --accept-source-agreements
+.\python-runtime\python.exe scripts\run_screenshot_chain_review.py --output-root output-screenshot-chain-local-review
 ```
 
-程序会自动探测 `soffice` 或常见安装路径：
+含中文任务时建议使用 UTF-8 JSON 文件传参，避免 PowerShell 把中文参数转成 `????`：
+
+```json
+{
+  "software_name": "星糖岛消除冒险",
+  "version": "V1.0",
+  "language": "C#",
+  "product_type": "游戏软件",
+  "feature_hint": "三消关卡、糖果棋盘、步数目标、道具背包、星级结算",
+  "model_provider": "local-template",
+  "output_root": "output-screenshot-chain-local-review"
+}
+```
+
+```powershell
+.\python-runtime\python.exe scripts\run_screenshot_chain_review.py --task-file .\your-task.json
+```
+
+脚本会输出 `screenshot_chain_report.json`，重点检查 `ui_screenshot_count`、`ui_software_type_match`、`ui_mobile_portrait_match` / `ui_admin_desktop_match`、`prototype_index_exists`、`ui_project_entry_exists`、`ui_project_served_index_exists` 和 `material_consistency_ready`。
+
+生成后的源码工程会包含 `UI_PROTOTYPE_ENTRY.md`。Java 项目可通过 `mvn spring-boot:run` 访问：
 
 ```text
-C:\Program Files\LibreOffice\program\soffice.exe
+http://127.0.0.1:8080/ui-prototype/index.html
 ```
+
+C# 项目可通过以下命令访问：
+
+```powershell
+dotnet run --urls http://127.0.0.1:5000
+```
+
+```text
+http://127.0.0.1:5000/ui-prototype/index.html
+```
+
+内部验收 C# 项目真实服务截图时，可让脚本启动生成项目后从 HTTP URL 截图：
+
+```powershell
+.\python-runtime\python.exe scripts\run_screenshot_chain_review.py --task-file .\your-csharp-task.json --project-server
+```
+
+报告中 `ui_screenshot_render_mode` 为 `project-server` 时，表示截图来自生成项目服务 URL；启动失败时会回退本地文件截图并写入 warning。
+
+最终 zip 只包含：
+
+- `软件名称.docx`
+- `软件名称.pdf`
+- `软件名称.txt`
+- `软件名称_代码-(语言).docx`
+- `软件名称_代码-(语言).pdf`
+
+安装包交付会内置 Playwright Chromium Headless Shell，避免客户机器首次运行时下载浏览器：
+
+```powershell
+python -m pip install -r requirements.txt
+npm install
+npm run prepare:runtime
+```
+
+该命令会把浏览器运行时下载到项目根目录的 `ms-playwright/`，并准备内置 Python 运行时 `python-runtime/`。这两个目录不提交到 Git，但打包 Windows 安装包时会作为额外资源复制到安装包资源目录：
+
+```text
+软件安装目录/
+  soft-copyright-generator.exe
+  resources/
+    ms-playwright/
+      chromium_headless_shell-*/
+    python-runtime/
+      python.exe
+```
+
+桌面端启动生成任务时会优先使用内置 `python-runtime/python.exe`，并自动设置 `PLAYWRIGHT_BROWSERS_PATH` 指向内置 `ms-playwright/`，客户机器无需单独安装 Python 或 Chromium。
+
+## LibreOffice
+
+客户预制安装器会内置 LibreOffice 运行时，客户机器不需要单独安装 LibreOffice。构建客户包前可用以下命令把本机 LibreOffice 复制到项目根目录的 `libreoffice/`：
+
+```powershell
+npm run prepare:libreoffice
+```
+
+客户版安装包会把该目录复制到：
+
+```text
+resources/libreoffice/program/soffice.exe
+```
+
+PDF 转换探测优先级：
+
+```text
+1. SOFT_LIBREOFFICE_PATH
+2. 安装包内置 resources/libreoffice/program/soffice.exe
+3. 系统安装路径 C:\Program Files\LibreOffice\program\soffice.exe
+4. PATH 中的 soffice/libreoffice
+5. 简版 PDF 兜底
+```
+
+## Windows 便携交付包
+
+当前提供便携 zip 打包脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package-windows-portable.ps1 -Version 0.1.0
+```
+
+输出：
+
+```text
+release/soft-copyright-generator-0.1.0-portable.zip
+```
+
+包内包含：
+
+- 前端构建产物 `dist/`
+- Electron 主进程和界面源码 `desktop/`
+- Python 后端 `backend/`
+- 配置模板 `config/production.example.json`
+- Playwright Chromium Headless Shell 运行时 `ms-playwright/`
+- Python embeddable runtime `python-runtime/`
+
+便携包默认不会包含本机真实配置 `config/production.json` 或 `config/desktop.local.json`，主要用于开发验收和备用交付。当前客户正式交付优先使用下方客户预制 NSIS 安装器。
+
+## Windows 安装器
+
+当前已接入 `electron-builder`，普通安装器可用：
+
+```powershell
+npm run prepare:runtime
+npm run pack:win
+```
+
+输出：
+
+```text
+release/installer/Soft Copyright Generator Setup 0.1.0.exe
+release/installer/win-unpacked/
+```
+
+安装器包含 Electron 应用、Python 后端文件、配置模板、`ms-playwright/` 和 `python-runtime/`。安装器不会包含真实本机配置，客户机器无需单独安装 Python、pip、项目 Python 包或 Chromium。
+
+客户预制安装器使用：
+
+```powershell
+npm run pack:win:customer
+```
+
+输出：
+
+```text
+release/customer-installer/Soft Copyright Generator Setup 0.1.0.exe
+release/customer-installer/win-unpacked/
+```
+
+客户预制安装器会把本机 `config/production.json` 注入到安装包资源目录，并写入 `SOFT_MODEL_MODE=gpt` 和 `SOFT_CUSTOMER_PRESET_CONFIG=true`。同时会内置 LibreOffice 运行时。客户安装后可在界面高级设置里看到并修改请求地址、模型名称和 API Key，并可直接生成高保真 PDF。
+
+注意：当前预制配置属于客户端随包配置，客户界面可见可改；如果后续要改回不暴露 API Key 和网关地址，应使用服务端授权代理，由桌面端只持有客户授权码。
 
 ## 后续开发
 
-下一阶段建议接入真实 LLM Provider，并启动 Electron 首页，让用户在首页选择语言、产品类型、模型和随机度后一键生成。
+下一阶段建议做干净 Windows 环境端到端验收，并补齐服务端授权代理或激活码绑定流程，让客户包不再内置模型 API Key。

@@ -7,6 +7,13 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
+    "pack:dir": "npm run prepare:runtime && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --dir",
+    "pack:win": "npm run prepare:runtime && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --win nsis",
+    "pack:win:customer": "powershell -ExecutionPolicy Bypass -File scripts\\package-customer-nsis.ps1",
+    "prepare:playwright": "cross-env PLAYWRIGHT_BROWSERS_PATH=ms-playwright python -m playwright install chromium",
+    "prepare:python": "powershell -ExecutionPolicy Bypass -File scripts\\prepare-python-runtime.ps1",
+    "prepare:libreoffice": "powershell -ExecutionPolicy Bypass -File scripts\\prepare-libreoffice-runtime.ps1",
+    "prepare:runtime": "npm run prepare:playwright && npm run prepare:python",
     "mock:account": "node mock-account-server.cjs",
     "mock:gateway": "node mock-account-server.cjs",
     "preview": "vite preview --host 127.0.0.1",
@@ -14,11 +21,61 @@
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",
-    "electron": "^39.2.7",
+    "cross-env": "^10.1.0",
     "lucide-react": "^0.556.0",
     "vite": "^7.2.7",
     "react": "^19.2.3",
     "react-dom": "^19.2.3"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "electron": "39.8.10",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.softcopyright.generator",
+    "productName": "Soft Copyright Generator",
+    "directories": {
+      "output": "release/installer"
+    },
+    "files": [
+      "dist/**/*",
+      "desktop/electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "backend",
+        "to": "backend"
+      },
+      {
+        "from": "config/production.example.json",
+        "to": "config/production.example.json"
+      },
+      {
+        "from": "ms-playwright",
+        "to": "ms-playwright"
+      },
+      {
+        "from": "python-runtime",
+        "to": "python-runtime"
+      },
+      {
+        "from": "requirements.txt",
+        "to": "requirements.txt"
+      }
+    ],
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
 }

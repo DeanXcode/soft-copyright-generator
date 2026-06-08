@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ def generate_manual_docx(
     blueprint: ProductBlueprint,
     output_dir: Path,
     manual_content: dict | None = None,
+    ui_screenshots: dict | None = None,
 ) -> Path:
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -58,8 +60,11 @@ def generate_manual_docx(
         "overview",
         [
             blueprint.summary,
-            f"本软件面向{blueprint.industry}场景，重点解决业务数据分散、处理流程不统一、运行状态缺少跟踪、统计分析依赖人工汇总等问题。",
-            f"系统采用{task.language}进行主要功能开发，通过模块化设计完成用户操作、业务处理、数据查询、统计分析和权限审计等能力。",
+            blueprint.positioning or f"本软件面向{blueprint.industry}场景，重点解决业务数据分散、处理流程不统一、运行状态缺少跟踪、统计分析依赖人工汇总等问题。",
+            f"系统具体服务于{blueprint.scenario or blueprint.industry}，围绕{_join_items(blueprint.business_objects[:8]) or '核心业务对象'}完成登记、校验、处理、统计和归档。",
+            f"系统采用{task.language}进行主要功能开发，通过模块化设计完成{_join_items(blueprint.technical_features[:4]) or '用户操作、业务处理、数据查询、统计分析和权限审计'}等能力。",
+            f"产品方案内置{_workflow_summary(blueprint)}，确保说明书、源码工程和界面截图围绕同一业务闭环生成。",
+            f"系统关注{_join_items(blueprint.report_metrics[:6]) or '新增记录数、待办数量、完成率和异常预警数'}等统计指标，便于管理人员掌握运行结果。",
         ],
         min_count=6,
     )
@@ -80,6 +85,7 @@ def generate_manual_docx(
         ("运行支撑环境", blueprint.runtime_environment["support"]),
         ("编程语言", task.language),
         ("软件技术特点", task.product_type),
+        ("业务部署拓扑", blueprint.deployment_topology or "客户端访问业务服务，服务端完成数据处理、权限控制和文件导出。"),
     ]
     for key, value in rows:
         cells = table.add_row().cells
@@ -87,14 +93,16 @@ def generate_manual_docx(
         cells[1].text = value
 
     _add_heading(document, "三、登录与主界面")
-    _add_ui_placeholder(document, "登录界面", "用户输入账号、密码和验证码后进入系统。")
+    _add_ui_figure(document, ui_screenshots, "login", "登录界面", "用户输入账号、密码和验证码后进入系统。")
+    _add_ui_figure(document, ui_screenshots, "dashboard", "系统首页", "首页集中展示核心指标、待办事项、异常提醒和快捷入口。")
     login_paragraphs = _content_paragraphs(
         manual_content,
         "login_main",
         [
             "用户打开系统后首先进入登录界面，系统对账号、密码、验证码和账号状态进行校验。",
-            "登录成功后进入系统首页，首页集中展示核心指标、待办事项、异常提醒和快捷入口。",
-            "主界面采用左侧菜单和右侧工作区布局，不同角色登录后展示对应权限范围内的功能模块。",
+            f"登录成功后进入系统首页，首页集中展示{_join_items(blueprint.report_metrics[:4]) or '核心指标、待办事项、异常提醒和快捷入口'}。",
+            f"主界面采用左侧菜单和右侧工作区布局，{_join_items(blueprint.target_users or blueprint.roles)}登录后展示对应权限范围内的功能模块。",
+            f"首页围绕{_join_items(blueprint.business_objects[:5]) or '业务记录'}展示待处理状态、最近操作和统计摘要。",
         ],
         min_count=8,
     )
@@ -104,27 +112,28 @@ def generate_manual_docx(
     _add_heading(document, "四、功能模块说明")
     for index, module in enumerate(blueprint.modules, start=1):
         _add_heading(document, f"4.{index} {module.title}", level=2)
-        _add_ui_placeholder(document, module.title, module.description)
+        _add_ui_figure(document, ui_screenshots, _module_figure_key(module.key), module.title, module.description)
         module_paragraphs = _module_content_paragraphs(manual_content, module.key) or [
             module.description,
-            f"进入{module.title}页面后，用户可以按关键字、状态、时间范围和业务分类进行查询。",
-            f"系统支持{module.title}数据的新增、编辑、删除、查看详情和状态维护操作。",
-            f"{module.title}与权限审计、日志记录、统计报表等公共能力保持联动，确保业务操作可以追溯。",
-            f"在数据保存时，系统会校验必填字段、业务编码、状态流转和重复记录，避免无效数据进入业务流程。",
-            f"对于需要审核的记录，系统会记录提交人、审核人、审核时间和审核意见，便于后续查询和归档。",
+            f"进入{module.title}页面后，用户可围绕{_join_items(module.data_fields[:6]) or '业务字段'}进行条件筛选和详情查看。",
+            f"系统支持{_join_items(module.operations[:6]) or f'{module.title}新增、编辑、审核、导出'}等操作，并根据当前状态控制可用按钮。",
+            f"{module.title}与{_join_items(blueprint.report_metrics[:4]) or '统计指标'}保持联动，处理结果可进入报表分析和操作追踪。",
+            f"在数据保存时，系统会执行{_join_items(module.rules[:3]) or '必填字段、业务编码、状态流转和重复记录校验'}，避免无效数据进入业务流程。",
+            f"该模块产生的数据会与{_join_items(blueprint.data_relations[:3]) or '操作日志、统计报表和权限范围'}关联，便于后续查询和归档。",
         ]
         for text in _expand_paragraphs(module_paragraphs, min_count=10):
             document.add_paragraph(text)
 
     _add_heading(document, "五、统计分析")
-    _add_ui_placeholder(document, "统计报表界面", "系统按日期、模块、状态和角色维度生成统计结果。")
+    _add_ui_figure(document, ui_screenshots, "statistics", "统计报表界面", "系统按日期、模块、状态和角色维度生成统计结果。")
     statistics_paragraphs = _content_paragraphs(
         manual_content,
         "statistics",
         [
-            "统计分析功能用于汇总系统运行过程中的业务数据，帮助管理人员掌握整体运行情况。",
-            "用户可以选择统计周期、业务模块、组织范围和状态条件，系统自动生成列表和图表数据。",
+            f"统计分析功能围绕{_join_items(blueprint.report_metrics[:8]) or '系统运行过程中的业务数据'}进行汇总，帮助管理人员掌握整体运行情况。",
+            f"用户可以选择统计周期、业务模块、组织范围和状态条件，系统按{_join_items(blueprint.business_objects[:6]) or '业务对象'}自动生成列表和图表数据。",
             "报表结果支持导出、打印和归档，便于形成日常运营分析材料。",
+            f"统计页会结合{_workflow_summary(blueprint)}展示各流程节点的处理数量、完成率和异常情况。",
         ],
         min_count=8,
     )
@@ -138,7 +147,9 @@ def generate_manual_docx(
         [
             "系统通过用户、角色、菜单和数据范围进行权限控制，避免越权访问。",
             "用户登录、数据新增、数据修改、状态变更、导出下载等关键操作均记录审计日志。",
-            "管理员可根据岗位职责配置角色权限，并定期查看异常登录和高风险操作记录。",
+            f"管理员可根据{_join_items(blueprint.target_users or blueprint.roles)}等岗位职责配置角色权限，并定期查看异常登录和高风险操作记录。",
+            f"系统按照{_join_items(blueprint.quality_rules[:6]) or '字段校验、状态流转、导出审计和权限范围'}执行安全控制。",
+            f"关键数据关系包括{_join_items(blueprint.data_relations[:5]) or '业务记录与操作日志关联'}，用于支撑追溯和审计。",
         ],
         min_count=8,
     )
@@ -273,8 +284,8 @@ def generate_info_txt(task: GenerationTask, blueprint: ProductBlueprint, source_
             f"【源程序量】{source_lines}行",
             f"【开发目的】{blueprint.purpose}",
             f"【面向领域/行业】{blueprint.industry}",
-            f"【软件的主要功能】{blueprint.summary}{_module_summary(blueprint)}",
-            f"【软件的技术特点】{task.product_type}。系统采用模块化结构，界面、业务逻辑、数据模型和日志审计相互配合，具有良好的可维护性和扩展性。",
+            f"【软件的主要功能】{blueprint.summary}{_module_summary(blueprint)}软件具体场景为{blueprint.scenario or blueprint.industry}，核心业务对象包括{_join_items(blueprint.business_objects[:8])}。",
+            f"【软件的技术特点】{task.product_type}。{_join_items(blueprint.technical_features[:6]) or '系统采用模块化结构，界面、业务逻辑、数据模型和日志审计相互配合，具有良好的可维护性和扩展性。'}",
             "",
         ]
     )
@@ -298,14 +309,16 @@ def convert_to_pdf(docx_path: Path, output_dir: Path) -> tuple[Path | None, str 
                 "--headless",
                 "--nologo",
                 "--nodefault",
+                "--norestore",
+                "--nolockcheck",
                 "--nofirststartwizard",
                 "--convert-to",
                 "pdf",
                 "--outdir",
-                str(output_dir),
-                str(docx_path),
+                str(output_dir.resolve()),
+                str(docx_path.resolve()),
             ]
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=_office_timeout_seconds(), check=False)
     except Exception as exc:
         return None, f"PDF 转换失败：{exc}"
     pdf_path = output_dir / f"{docx_path.stem}.pdf"
@@ -315,17 +328,45 @@ def convert_to_pdf(docx_path: Path, output_dir: Path) -> tuple[Path | None, str 
 
 
 def _find_office_binary() -> str | None:
-    office = shutil.which("soffice") or shutil.which("libreoffice")
-    if office:
-        return office
+    env_candidates = [
+        os.getenv("SOFT_LIBREOFFICE_PATH", ""),
+        os.getenv("SOFFICE_PATH", ""),
+        os.getenv("LIBREOFFICE_PATH", ""),
+    ]
+    for value in env_candidates:
+        if not value:
+            continue
+        candidate = Path(value)
+        if candidate.is_dir():
+            candidate = candidate / "program" / "soffice.exe"
+        if candidate.exists():
+            return str(candidate)
+
+    resource_root = Path(__file__).resolve().parents[2]
     candidates = [
+        resource_root / "libreoffice" / "program" / "soffice.exe",
+        resource_root.parent / "libreoffice" / "program" / "soffice.exe",
+        Path.cwd() / "libreoffice" / "program" / "soffice.exe",
         Path("C:/Program Files/LibreOffice/program/soffice.exe"),
         Path("C:/Program Files (x86)/LibreOffice/program/soffice.exe"),
     ]
     for candidate in candidates:
         if candidate.exists():
             return str(candidate)
+    office = shutil.which("soffice") or shutil.which("libreoffice")
+    if office:
+        return office
     return None
+
+
+def _office_timeout_seconds() -> int:
+    raw_value = os.getenv("SOFT_LIBREOFFICE_TIMEOUT_SECONDS", "").strip()
+    if raw_value:
+        try:
+            return max(60, int(raw_value))
+        except ValueError:
+            pass
+    return 360
 
 
 def _write_fallback_pdf(docx_path: Path, output_dir: Path) -> tuple[Path | None, str | None]:
@@ -424,6 +465,31 @@ def _add_ui_placeholder(document, title: str, caption: str) -> None:
         run.font.color.rgb = RGBColor(80, 80, 80)
 
 
+def _add_ui_figure(document, ui_screenshots: dict | None, key: str, title: str, caption: str) -> None:
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Inches, Pt, RGBColor
+
+    item = ui_screenshots.get(key) if isinstance(ui_screenshots, dict) else None
+    image_path = getattr(item, "image_path", None) if item else None
+    display_title = getattr(item, "title", None) if item else None
+    display_caption = getattr(item, "caption", None) if item else None
+    display_title = display_title or title
+    display_caption = display_caption or caption
+    if image_path and Path(image_path).exists():
+        paragraph = document.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = paragraph.add_run()
+        run.add_picture(image_path, width=Inches(5.9))
+        caption_p = document.add_paragraph(f"图：{display_title}，{display_caption}")
+        caption_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        caption_p.paragraph_format.space_after = Pt(6)
+        for caption_run in caption_p.runs:
+            caption_run.font.color.rgb = RGBColor(80, 80, 80)
+            caption_run.font.size = Pt(9)
+        return
+    _add_ui_placeholder(document, display_title, display_caption)
+
+
 def _expand_paragraphs(paragraphs: list[str], min_count: int) -> list[str]:
     result = list(paragraphs)
     templates = [
@@ -473,3 +539,21 @@ def _module_summary(blueprint: ProductBlueprint) -> str:
     for module in blueprint.modules:
         details.append(f"{module.title}用于{module.description}")
     return "系统主要包括" + "、".join(details) + "等功能。"
+
+
+def _join_items(items: list[str]) -> str:
+    return "、".join(str(item) for item in items if str(item).strip())
+
+
+def _workflow_summary(blueprint: ProductBlueprint) -> str:
+    if not blueprint.workflows:
+        return "业务提交、字段校验、状态流转和结果归档流程"
+    names = [str(item.get("name") or "") for item in blueprint.workflows[:3] if isinstance(item, dict)]
+    names = [name for name in names if name]
+    return "、".join(names) or "业务提交、字段校验、状态流转和结果归档流程"
+
+
+def _module_figure_key(module_key: str) -> str:
+    if module_key in {"login", "dashboard", "statistics"}:
+        return f"module_{module_key}"
+    return module_key

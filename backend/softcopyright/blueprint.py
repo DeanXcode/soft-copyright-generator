@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .models import GenerationTask
 
@@ -13,6 +13,10 @@ class FeatureModule:
     title: str
     description: str
     entities: list[str]
+    operations: list[str] = field(default_factory=list)
+    data_fields: list[str] = field(default_factory=list)
+    pages: list[str] = field(default_factory=list)
+    rules: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -29,6 +33,19 @@ class ProductBlueprint:
     pages: list[str]
     dev_environment: dict[str, str]
     runtime_environment: dict[str, str]
+    scenario: str = ""
+    positioning: str = ""
+    target_users: list[str] = field(default_factory=list)
+    business_objects: list[str] = field(default_factory=list)
+    workflows: list[dict[str, list[str] | str]] = field(default_factory=list)
+    report_metrics: list[str] = field(default_factory=list)
+    technical_features: list[str] = field(default_factory=list)
+    quality_rules: list[str] = field(default_factory=list)
+    data_relations: list[str] = field(default_factory=list)
+    deployment_topology: str = ""
+    uniqueness_notes: list[str] = field(default_factory=list)
+    generation_fingerprint: str = ""
+    quality_score: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -44,6 +61,19 @@ class ProductBlueprint:
             "pages": self.pages,
             "dev_environment": self.dev_environment,
             "runtime_environment": self.runtime_environment,
+            "scenario": self.scenario,
+            "positioning": self.positioning,
+            "target_users": self.target_users,
+            "business_objects": self.business_objects,
+            "workflows": self.workflows,
+            "report_metrics": self.report_metrics,
+            "technical_features": self.technical_features,
+            "quality_rules": self.quality_rules,
+            "data_relations": self.data_relations,
+            "deployment_topology": self.deployment_topology,
+            "uniqueness_notes": self.uniqueness_notes,
+            "generation_fingerprint": self.generation_fingerprint,
+            "quality_score": self.quality_score,
         }
 
 
@@ -278,11 +308,21 @@ def generate_blueprint(task: GenerationTask) -> ProductBlueprint:
         )
 
     modules = [
-        FeatureModule(key=key, title=title, description=description, entities=entities)
+        FeatureModule(
+            key=key,
+            title=title,
+            description=description,
+            entities=entities,
+            operations=_module_operations(title, rng),
+            data_fields=_module_data_fields(title, entities),
+            pages=[f"{title}列表页", f"{title}详情页", f"{title}处理页"],
+            rules=_module_rules(title),
+        )
         for key, title, description, entities in selected
     ]
     pages = ["登录页", "系统首页"] + [module.title for module in modules] + ["统计报表页", "系统设置页"]
     industry = preset["industry"]
+    scenario = _scenario_for_task(task, industry, modules)
     purpose = f"用于{industry}场景下的业务数据管理、流程协同、运行监控和统计分析。"
     summary = (
         f"{task.software_name}是一套面向{industry}的{task.product_type}，"
@@ -306,7 +346,123 @@ def generate_blueprint(task: GenerationTask) -> ProductBlueprint:
         pages=pages,
         dev_environment=dev_environment,
         runtime_environment=runtime_environment,
+        scenario=scenario,
+        positioning=f"面向{industry}的{task.product_type}，用于支撑{scenario}中的日常业务处理和数据留痕。",
+        target_users=list(preset["roles"]),
+        business_objects=_business_objects_from_modules(modules),
+        workflows=_workflow_cards(modules),
+        report_metrics=_report_metrics(modules),
+        technical_features=_technical_features(task),
+        quality_rules=_quality_rules(modules),
+        data_relations=_data_relations(modules),
+        deployment_topology=_deployment_topology(task),
+        uniqueness_notes=_uniqueness_notes(task, modules),
+        generation_fingerprint=hashlib.sha256(seed_input.encode("utf-8")).hexdigest()[:16],
+        quality_score=68,
     )
+
+
+def _scenario_for_task(task: GenerationTask, industry: str, modules: list[FeatureModule]) -> str:
+    if task.feature_hint:
+        return f"{industry}下的{task.feature_hint}协同场景"
+    if modules:
+        return f"{industry}下的{modules[0].title}和{modules[min(1, len(modules) - 1)].title}协同场景"
+    return f"{industry}下的业务协同场景"
+
+
+def _module_operations(title: str, rng: random.Random) -> list[str]:
+    pool = ["登记", "查询", "编辑", "审核", "发布", "归档", "导入", "导出", "预警", "复核", "统计", "追踪"]
+    rng.shuffle(pool)
+    return [f"{title}{operation}" for operation in pool[:5]]
+
+
+def _module_data_fields(title: str, entities: list[str]) -> list[str]:
+    return [
+        f"{title}编号",
+        f"{title}名称",
+        "业务状态",
+        "责任角色",
+        "更新时间",
+        "处理备注",
+    ] + [f"{entity}标识" for entity in entities[:2]]
+
+
+def _module_rules(title: str) -> list[str]:
+    return [
+        f"{title}保存前必须校验必填字段和业务编码唯一性。",
+        f"{title}状态变更必须记录操作人、操作时间和变更原因。",
+        f"{title}导出和删除操作必须受角色权限控制。",
+    ]
+
+
+def _business_objects_from_modules(modules: list[FeatureModule]) -> list[str]:
+    objects: list[str] = []
+    for module in modules[:8]:
+        label = module.title.replace("管理", "").replace("分析", "").replace("统计", "")
+        if label and label not in objects:
+            objects.append(label)
+    return objects or ["业务记录", "流程任务", "统计指标", "审计日志"]
+
+
+def _workflow_cards(modules: list[FeatureModule]) -> list[dict[str, list[str] | str]]:
+    result: list[dict[str, list[str] | str]] = []
+    for module in modules[:3]:
+        result.append(
+            {
+                "name": f"{module.title}闭环流程",
+                "trigger": f"用户在{module.title}页面提交业务记录",
+                "steps": ["创建记录", "字段校验", "状态流转", "责任人处理", "结果归档"],
+                "output": f"形成{module.title}处理结果、操作日志和统计数据",
+            }
+        )
+    return result
+
+
+def _report_metrics(modules: list[FeatureModule]) -> list[str]:
+    metrics = ["新增记录数", "待处理数量", "处理完成率", "异常预警数", "导出次数", "平均处理时长"]
+    return [f"{module.title}{metrics[index % len(metrics)]}" for index, module in enumerate(modules[:6])]
+
+
+def _technical_features(task: GenerationTask) -> list[str]:
+    return [
+        f"采用{task.language}实现分层业务模块",
+        "支持角色权限、操作日志和数据范围控制",
+        "支持条件查询、分页列表、状态流转和报表导出",
+        "支持运行环境参数化配置和模块化扩展",
+    ]
+
+
+def _quality_rules(modules: list[FeatureModule]) -> list[str]:
+    rules = ["登录用户必须拥有对应菜单权限", "关键业务操作必须写入审计日志", "统计报表必须按当前数据权限过滤"]
+    for module in modules[:3]:
+        rules.append(f"{module.title}必须校验状态流转顺序和重复提交。")
+    return rules
+
+
+def _data_relations(modules: list[FeatureModule]) -> list[str]:
+    if not modules:
+        return ["业务记录与操作日志按记录编号关联"]
+    return [
+        f"{modules[index].title}与{modules[(index + 1) % len(modules)].title}通过业务编号和状态字段关联"
+        for index in range(min(4, len(modules)))
+    ]
+
+
+def _deployment_topology(task: GenerationTask) -> str:
+    if task.language in {"Java", "C#"}:
+        return "客户端浏览器访问业务服务，服务端连接关系型数据库并输出 Word/PDF 材料。"
+    if task.language == "JavaScript":
+        return "前端页面调用 Node.js 服务接口，服务端负责数据处理、权限校验和报表导出。"
+    return "应用服务、数据存储和文件导出组件部署在同一业务网络环境中。"
+
+
+def _uniqueness_notes(task: GenerationTask, modules: list[FeatureModule]) -> list[str]:
+    module_names = "、".join(module.title for module in modules[:3])
+    return [
+        f"围绕{task.software_name}的名称和业务补充组织{module_names}等核心模块。",
+        "每个模块均包含独立的业务字段、操作流程、状态规则和审计记录。",
+        "说明书、源码工程和界面截图共享同一套产品蓝图，避免内容互相脱节。",
+    ]
 
 
 def _environment_for_language(language: str) -> dict[str, str]:

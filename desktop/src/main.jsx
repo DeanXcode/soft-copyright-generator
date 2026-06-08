@@ -12,6 +12,7 @@ import {
   Loader2,
   PackageCheck,
   RefreshCw,
+  Save,
   Settings2,
   Sparkles,
   TerminalSquare
@@ -40,6 +41,14 @@ const productTypes = [
 
 const modelProviders = [
   {
+    value: "template",
+    label: "默认模板",
+    description: "使用本地模板生成，不调用模型接口。",
+    provider: "local-template",
+    modelName: "template-v1",
+    cost: "不消耗 token"
+  },
+  {
     value: "gpt",
     label: "GPT",
     description: "通过服务端中转生成产品蓝图和说明书正文。",
@@ -58,9 +67,18 @@ function App() {
     featureHint: "景区票务、闸机核验、团队订单、年卡管理",
     modelPlan: "gpt",
     modelProvider: "custom",
-    modelName: "gpt",
+    modelName: "gpt-4o-mini",
     randomness: "standard"
   });
+  const [modelConfig, setModelConfig] = useState({
+    mode: "template",
+    modelName: "gpt-4o-mini",
+    apiBaseUrl: "",
+    apiKey: "",
+    apiKeyConfigured: false,
+    preset: false
+  });
+  const [configStatus, setConfigStatus] = useState("");
   const [status, setStatus] = useState("idle");
   const [result, setResult] = useState(null);
   const [progress, setProgress] = useState(0);
@@ -115,18 +133,85 @@ function App() {
     };
   }, [bridgeAvailable]);
 
+  useEffect(() => {
+    if (!bridgeAvailable || !window.softCopyright.getModelConfig) return undefined;
+    let cancelled = false;
+    window.softCopyright.getModelConfig().then((config) => {
+      if (cancelled || !config) return;
+      setModelConfig({
+        mode: config.mode || "template",
+        modelName: config.modelName || "gpt-4o-mini",
+        apiBaseUrl: config.apiBaseUrl || "",
+        apiKey: config.apiKey || "",
+        apiKeyConfigured: Boolean(config.apiKeyConfigured || config.apiKey),
+        preset: Boolean(config.preset)
+      });
+      const plan = modelProviders.find((item) => item.value === (config.mode || "template")) || modelProviders[0];
+      setForm((current) => ({
+        ...current,
+        modelPlan: plan.value,
+        modelProvider: plan.provider,
+        modelName: config.modelName || plan.modelName
+      }));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [bridgeAvailable]);
+
   function updateField(key, value) {
     setForm((current) => ({ ...current, [key]: value }));
   }
 
   function updateModelPlan(planValue) {
     const plan = modelProviders.find((item) => item.value === planValue) || modelProviders[0];
+    setModelConfig((current) => ({ ...current, mode: plan.value }));
     setForm((current) => ({
       ...current,
       modelPlan: plan.value,
       modelProvider: plan.provider,
-      modelName: plan.modelName
+      modelName: plan.value === "gpt" ? modelConfig.modelName || plan.modelName : plan.modelName
     }));
+  }
+
+  function updateModelConfig(key, value) {
+    setConfigStatus("");
+    setModelConfig((current) => ({ ...current, [key]: value }));
+    if (key === "modelName") {
+      setForm((current) => ({ ...current, modelName: value }));
+    }
+  }
+
+  async function saveModelConfig() {
+    if (!bridgeAvailable || !window.softCopyright.saveModelConfig) return;
+    setConfigStatus("saving");
+    const response = await window.softCopyright.saveModelConfig({
+      mode: modelConfig.mode,
+      modelName: modelConfig.modelName,
+      apiBaseUrl: modelConfig.apiBaseUrl,
+      apiKey: modelConfig.apiKey
+    });
+    if (!response?.ok) {
+      setConfigStatus(response?.message || "保存失败");
+      return;
+    }
+    setConfigStatus("saved");
+    const plan = modelProviders.find((item) => item.value === response.mode) || modelProviders[0];
+    setForm((current) => ({
+      ...current,
+      modelPlan: plan.value,
+      modelProvider: plan.provider,
+      modelName: response.mode === "gpt" ? response.modelName : plan.modelName
+    }));
+    setModelConfig((current) => ({
+      ...current,
+      mode: response.mode || current.mode,
+      modelName: response.modelName || current.modelName,
+      apiBaseUrl: response.apiBaseUrl || current.apiBaseUrl,
+      apiKey: response.apiKey || current.apiKey,
+      apiKeyConfigured: Boolean(response.apiKeyConfigured || response.apiKey || current.apiKey)
+    }));
+    await refreshModelAccount();
   }
 
   async function fetchModelAccount() {
@@ -317,6 +402,58 @@ function App() {
                     <strong>{account.balanceLabel || "待配置"}</strong>
                     <small>{balanceHint(account)}</small>
                   </div>
+                </div>
+                <div className="model-config-form">
+                  <div className="field-grid config-field-grid">
+                    <label className="config-wide-field">
+                      <span>请求地址</span>
+                      <input
+                        value={modelConfig.apiBaseUrl}
+                        disabled={modelConfig.mode === "template"}
+                        onChange={(event) => updateModelConfig("apiBaseUrl", event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>模型名称</span>
+                      <input
+                        value={modelConfig.modelName}
+                        disabled={modelConfig.mode === "template"}
+                        onChange={(event) => updateModelConfig("modelName", event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>API Key</span>
+                      <input
+                        value={modelConfig.apiKey}
+                        disabled={modelConfig.mode === "template"}
+                        onChange={(event) => updateModelConfig("apiKey", event.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <button
+                    type="button"
+                    className="config-save-button"
+                    onClick={saveModelConfig}
+                    disabled={
+                      !bridgeAvailable ||
+                      configStatus === "saving" ||
+                      (modelConfig.mode === "gpt" && (!modelConfig.apiBaseUrl.trim() || !modelConfig.apiKey.trim()))
+                    }
+                  >
+                    {configStatus === "saving" ? <Loader2 size={16} /> : <Save size={16} />}
+                    <span>{configStatus === "saving" ? "保存中" : "保存模型配置"}</span>
+                  </button>
+                  <small className={configStatus && configStatus !== "saved" && configStatus !== "saving" ? "config-message error" : "config-message"}>
+                    {configStatus === "saved"
+                      ? "模型配置已保存"
+                      : configStatus === "saving"
+                        ? "正在写入本地配置"
+                        : modelConfig.mode === "template"
+                          ? "默认模板不会调用模型接口。"
+                          : modelConfig.preset
+                            ? "当前显示的是交付包预置配置，可按需修改并保存。"
+                            : "请确认请求地址、模型名称和 API Key 后保存。"}
+                  </small>
                 </div>
               </div>
             </details>
@@ -536,6 +673,8 @@ function buildQualityItems(result) {
   const sourcePages = Number(checks.source_total_pages || 0);
   const selectedPages = Number(checks.source_selected_pages || 0);
   const fullSelection = checks.selection_mode === "all";
+  const consistencyReady = checks.material_consistency_ready;
+  const consistencyDetail = materialConsistencyDetail(checks);
 
   return [
     {
@@ -575,12 +714,37 @@ function buildQualityItems(result) {
       state: checks.software_name_consistent && checks.version_consistent ? "pass" : "warn"
     },
     {
+      label: "产品方案一致性",
+      value: consistencyReady ? "说明书/截图/源码已匹配" : "需要复核材料同源性",
+      detail: consistencyDetail,
+      state: consistencyReady ? "pass" : "warn"
+    },
+    {
       label: "生成警告",
       value: warnings.length ? `${warnings.length} 条警告` : "无警告",
       detail: warnings[0] || "生成链路未返回异常提示",
       state: warnings.length ? "warn" : "pass"
     }
   ];
+}
+
+function materialConsistencyDetail(checks) {
+  if (!Object.prototype.hasOwnProperty.call(checks, "material_consistency_ready")) {
+    return "本次报告未返回材料一致性检查";
+  }
+  const moduleHits = Number(checks.material_module_title_hits || 0);
+  const objectHits = Number(checks.material_business_object_hits || 0);
+  const metricHits = Number(checks.material_metric_hits || 0);
+  const sourceHits = Number(checks.material_source_module_key_hits || 0);
+  const manualSource = checks.material_manual_text_source || "unknown";
+  const uiSource = checks.material_ui_text_source || "unknown";
+  return `模块 ${moduleHits}；对象 ${objectHits}；指标 ${metricHits}；源码 ${sourceHits}；说明书 ${materialSourceLabel(manualSource)}；截图 ${sourceLabel(uiSource)}`;
+}
+
+function materialSourceLabel(source) {
+  if (source === "llm-content") return "模型正文";
+  if (source === "local-template-derived") return "模板派生";
+  return sourceLabel(source);
 }
 
 function buildGeneratedFiles(result) {

@@ -299,6 +299,16 @@ select:focus {
   color: #a33a3a;
 }
 
+.balance-card.local {
+  border-color: #d8e7dd;
+  background: #f5fbf7;
+}
+
+.balance-card.local svg,
+.balance-card.local strong {
+  color: #12805c;
+}
+
 .balance-card.loading,
 .balance-card.refreshing {
   border-color: #cbd9f3;
@@ -342,6 +352,93 @@ select:focus {
 
 .secondary-body {
   padding: 0 0 14px;
+}
+
+.model-config-form {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #e6ebf2;
+}
+
+.model-config-form .field-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  margin-bottom: 0;
+}
+
+.config-wide-field {
+  grid-column: 1 / -1;
+}
+
+.config-save-button {
+  height: 38px;
+  border: 1px solid #d5dce7;
+  border-radius: 7px;
+  background: #fff;
+  color: #2d3b50;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  font-weight: 800;
+}
+
+.config-save-button:hover:not(:disabled) {
+  border-color: #7a9bd9;
+  color: #214f9f;
+}
+
+.config-save-button:has(.lucide-loader-2) svg {
+  animation: spin 900ms linear infinite;
+}
+
+.preset-config-card {
+  border: 1px solid #d8e2f1;
+  border-radius: 7px;
+  background: #f8fbff;
+  color: #2d3b50;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 12px;
+}
+
+.preset-config-card svg {
+  color: #2764b6;
+}
+
+.preset-config-card span,
+.preset-config-card strong,
+.preset-config-card small {
+  display: block;
+}
+
+.preset-config-card span {
+  color: #667387;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.preset-config-card strong {
+  margin-top: 2px;
+  color: #1f2d40;
+}
+
+.preset-config-card small {
+  margin-top: 3px;
+  color: #69778b;
+  line-height: 1.45;
+}
+
+.config-message {
+  color: #69778b;
+  line-height: 1.45;
+}
+
+.config-message.error {
+  color: #a33a3a;
 }
 
 .status-block {

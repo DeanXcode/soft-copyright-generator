@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import time
 from typing import Any
 
 import requests
+
+from .trace import trace_event
 
 
 @dataclass
@@ -27,6 +30,7 @@ class LLMProvider:
         temperature: float = 0.7,
         max_tokens: int = 4096,
         response_format: dict[str, Any] | None = None,
+        trace_label: str = "",
     ) -> str:
         raise NotImplementedError
 
@@ -38,6 +42,7 @@ class LocalTemplateProvider(LLMProvider):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         response_format: dict[str, Any] | None = None,
+        trace_label: str = "",
     ) -> str:
         return ""
 
@@ -49,6 +54,7 @@ class OpenAICompatibleProvider(LLMProvider):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         response_format: dict[str, Any] | None = None,
+        trace_label: str = "",
     ) -> str:
         base_url = self.config.base_url.rstrip("/")
         if not base_url:
@@ -73,14 +79,47 @@ class OpenAICompatibleProvider(LLMProvider):
             "Content-Type": "application/json",
         }
         last_error: Exception | None = None
-        for _ in range(max(1, self.config.retry_count + 1)):
+        total_attempts = max(1, self.config.retry_count + 1)
+        for attempt in range(1, total_attempts + 1):
+            started_at = time.perf_counter()
+            trace_event(
+                "provider_request_begin",
+                label=trace_label,
+                attempt=attempt,
+                total_attempts=total_attempts,
+                provider=self.config.provider,
+                model=self.config.model,
+                timeout=self.config.timeout,
+                max_tokens=max_tokens,
+                message_count=len(messages),
+                response_format=bool(response_format),
+            )
             try:
                 response = requests.post(url, json=payload, headers=headers, timeout=self.config.timeout)
                 response.raise_for_status()
                 data = response.json()
-                return data["choices"][0]["message"]["content"]
+                content = data["choices"][0]["message"]["content"]
+                trace_event(
+                    "provider_request_success",
+                    label=trace_label,
+                    attempt=attempt,
+                    elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                    status_code=response.status_code,
+                    content_chars=len(content or ""),
+                )
+                return content
             except Exception as exc:
                 last_error = exc
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                trace_event(
+                    "provider_request_error",
+                    label=trace_label,
+                    attempt=attempt,
+                    elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                    status_code=status_code,
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:500],
+                )
         raise RuntimeError(f"LLM 请求失败：{last_error}")
 
 
