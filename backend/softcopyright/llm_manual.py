@@ -25,9 +25,11 @@ def generate_manual_content_with_llm(
     result: dict[str, Any] = {"modules": {}}
     warnings: list[str] = []
 
-    section_batches = list(_chunks(_section_specs(), 2))
+    batch_size = 1 if _authenticity_first(task) else 2
+    section_batches = list(_chunks(_section_specs(), batch_size))
     section_results: dict[int, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=min(_llm_batch_workers(), len(section_batches) or 1)) as executor:
+    workers = 1 if _authenticity_first(task) else _llm_batch_workers()
+    with ThreadPoolExecutor(max_workers=min(workers, len(section_batches) or 1)) as executor:
         futures = {}
         for batch_index, specs in enumerate(section_batches, start=1):
             _emit(emit, 24 + batch_index, f"生成说明书公共章节 {batch_index}/{len(section_batches)}")
@@ -51,9 +53,9 @@ def generate_manual_content_with_llm(
             else:
                 warnings.append(f"{title}模型生成有效段落不足，已由本地模板补齐")
 
-    module_batches = list(_chunks(blueprint.modules, 2))
+    module_batches = list(_chunks(blueprint.modules, batch_size))
     module_results: dict[int, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=min(_llm_batch_workers(), len(module_batches) or 1)) as executor:
+    with ThreadPoolExecutor(max_workers=min(workers, len(module_batches) or 1)) as executor:
         futures = {}
         for batch_index, modules in enumerate(module_batches, start=1):
             _emit(emit, 27 + batch_index, f"生成说明书模块章节 {batch_index}/{len(module_batches)}")
@@ -96,7 +98,8 @@ def _generate_manual_content_with_llm_sequential(
     result: dict[str, Any] = {"modules": {}}
     warnings: list[str] = []
 
-    section_batches = list(_chunks(_section_specs(), 2))
+    batch_size = 1 if _authenticity_first(task) else 2
+    section_batches = list(_chunks(_section_specs(), batch_size))
     for batch_index, specs in enumerate(section_batches, start=1):
         _emit(emit, 24 + batch_index, f"生成说明书公共章节 {batch_index}/{len(section_batches)}")
         try:
@@ -117,7 +120,7 @@ def _generate_manual_content_with_llm_sequential(
             else:
                 warnings.append(f"{title}模型生成有效段落不足，已由本地模板补齐")
 
-    module_batches = list(_chunks(blueprint.modules, 2))
+    module_batches = list(_chunks(blueprint.modules, batch_size))
     for batch_index, modules in enumerate(module_batches, start=1):
         _emit(emit, 27 + batch_index, f"生成说明书模块章节 {batch_index}/{len(module_batches)}")
         try:
@@ -160,6 +163,17 @@ def _llm_batch_workers() -> int:
     except ValueError:
         value = 1
     return max(1, min(3, value))
+
+
+def _generation_quality_profile(task: GenerationTask) -> str:
+    value = os.getenv("SOFT_GENERATION_PROFILE", "").strip().lower()
+    if value in {"fast", "speed", "batch"}:
+        return "fast"
+    return "authenticity-first"
+
+
+def _authenticity_first(task: GenerationTask) -> bool:
+    return _generation_quality_profile(task) == "authenticity-first"
 
 
 def _section_specs() -> list[tuple[str, str, str, int, int, int]]:

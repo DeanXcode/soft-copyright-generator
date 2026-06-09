@@ -15,12 +15,6 @@ const isDev = process.env.VITE_DEV_SERVER_URL || process.env.NODE_ENV === "devel
 let mainWindow;
 
 const modelPlans = {
-  template: {
-    provider: "local-template",
-    modelName: "template-v1",
-    apiBaseUrl: "",
-    apiKey: ""
-  },
   gpt: {
     provider: "custom",
     modelName: process.env.SOFT_MODEL_GPT_NAME || process.env.SOFT_MODEL_GATEWAY_MODEL || "gpt-4o-mini",
@@ -96,13 +90,17 @@ function generationOutputRoot() {
 }
 
 function currentModelMode() {
-  if ((process.env.SOFT_MODEL_MODE || "").toLowerCase() === "template") {
-    return "template";
-  }
-  if (!modelPlans.gpt.apiKey) {
-    return "template";
-  }
   return "gpt";
+}
+
+function gptConfigError() {
+  if (!String(modelPlans.gpt.apiBaseUrl || "").trim()) {
+    return "GPT 模式需要填写请求地址";
+  }
+  if (!String(modelPlans.gpt.apiKey || "").trim()) {
+    return "GPT 模式需要填写 API Key";
+  }
+  return "";
 }
 
 function envFlagEnabled(value) {
@@ -327,7 +325,22 @@ app.on("activate", () => {
 });
 
 ipcMain.handle("generate-materials", async (_event, payload) => {
-  const modelPlan = modelPlans[payload.modelPlan] || modelPlans.gpt;
+  const configError = gptConfigError();
+  if (configError) {
+    return {
+      ok: false,
+      zipPath: "",
+      outputDir: "",
+      warnings: [],
+      checks: {},
+      stdout: "",
+      stderr: configError,
+      files: [],
+      blueprintSource: "gpt",
+      manualSource: "gpt"
+    };
+  }
+  const modelPlan = modelPlans.gpt;
   const args = [
     path.join(rootDir, "backend", "generate_materials.py"),
     "--name",
@@ -341,9 +354,9 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
     "--feature-hint",
     payload.featureHint || "",
     "--model-provider",
-    modelPlan.provider || payload.modelProvider || "local-template",
+    modelPlan.provider || "custom",
     "--model-name",
-    modelPlan.modelName || payload.modelName || "template-v1",
+    modelPlan.modelName || payload.modelName || "gpt-4o-mini",
     "--randomness",
     payload.randomness || "standard",
     "--output-root",
@@ -418,6 +431,13 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
       const files = Array.isArray(parsed.files)
         ? parsed.files.map((filePath) => path.resolve(rootDir, filePath))
         : [];
+      const validation = parsed.validation && typeof parsed.validation === "object" ? { ...parsed.validation } : {};
+      if (validation.path) {
+        validation.path = path.resolve(rootDir, validation.path);
+      }
+      if (validation.manifest_path) {
+        validation.manifest_path = path.resolve(rootDir, validation.manifest_path);
+      }
       resolve({
         ok: code === 0,
         code,
@@ -427,11 +447,85 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
         outputDir: outputDir || (zipPath ? path.dirname(zipPath) : ""),
         warnings: parsed.warnings || [],
         checks: parsed.checks || {},
+        validation,
         files,
-        blueprintSource: parsed.blueprint_source || "local-template",
-        manualSource: parsed.manual_source || "local-template",
+        blueprintSource: parsed.blueprint_source || "gpt",
+        manualSource: parsed.manual_source || "gpt",
+        featureHint: parsed.feature_hint || payload.featureHint || "",
+        featureHintMeta: parsed.feature_hint_meta || {},
         seed: parsed.seed || "",
         randomness: parsed.randomness || payload.randomness || "standard"
+      });
+    });
+  });
+});
+
+ipcMain.handle("infer-feature-hint", async (_event, payload) => {
+  const configError = gptConfigError();
+  if (configError) {
+    return {
+      ok: false,
+      code: -1,
+      stderr: configError,
+      message: configError,
+      featureHint: "",
+      meta: { requires_gpt_config: true }
+    };
+  }
+  const modelPlan = modelPlans.gpt;
+  const args = [
+    path.join(rootDir, "backend", "infer_feature_hint.py"),
+    "--name",
+    payload.name || "",
+    "--product-type",
+    payload.productType || "",
+    "--feature-hint",
+    payload.featureHint || "",
+    "--model-provider",
+    modelPlan.provider || "custom",
+    "--model-name",
+    modelPlan.modelName || payload.modelName || "gpt-4o-mini"
+  ];
+  if (modelPlan.apiBaseUrl) {
+    args.push("--api-base-url", modelPlan.apiBaseUrl);
+  }
+  if (modelPlan.apiKey) {
+    args.push("--api-key", modelPlan.apiKey);
+  }
+
+  return new Promise((resolve) => {
+    const child = spawn(bundledPythonExecutable(), args, {
+      cwd: app.isPackaged ? process.resourcesPath : rootDir,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: "utf-8"
+      }
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("close", (code) => {
+      const resultMatch = stdout.match(/RESULT_JSON:(\{.+\})/);
+      let parsed = {};
+      if (resultMatch) {
+        try {
+          parsed = JSON.parse(resultMatch[1]);
+        } catch (_error) {
+          parsed = {};
+        }
+      }
+      resolve({
+        ok: code === 0 && Boolean(parsed.feature_hint),
+        code,
+        stderr,
+        featureHint: parsed.feature_hint || "",
+        meta: parsed.meta || {}
       });
     });
   });
@@ -450,14 +544,14 @@ ipcMain.handle("get-model-config", async () => {
 });
 
 ipcMain.handle("save-model-config", async (_event, payload) => {
-  const mode = payload?.mode === "template" ? "template" : "gpt";
+  const mode = "gpt";
   const modelName = String(payload?.modelName || modelPlans.gpt.modelName || "gpt-4o-mini").trim();
   const apiBaseUrl = String(payload?.apiBaseUrl || modelPlans.gpt.apiBaseUrl || "").trim();
   const apiKey = String(payload?.apiKey || "").trim();
-  if (mode === "gpt" && !apiBaseUrl) {
+  if (!apiBaseUrl) {
     return { ok: false, message: "GPT 模式需要填写请求地址" };
   }
-  if (mode === "gpt" && !apiKey) {
+  if (!apiKey) {
     return { ok: false, message: "GPT 模式需要填写 API Key" };
   }
 
@@ -470,9 +564,7 @@ ipcMain.handle("save-model-config", async (_event, payload) => {
     SOFT_MODEL_GPT_NAME: modelName || "gpt-4o-mini",
     SOFT_MODEL_CONFIG_LOCKED: "false"
   };
-  if (mode === "gpt") {
-    config.SOFT_MODEL_GPT_API_KEY = apiKey;
-  }
+  config.SOFT_MODEL_GPT_API_KEY = apiKey;
   writeJsonConfig(configPath, config);
   applyModelConfig(config);
   return {
@@ -494,12 +586,14 @@ ipcMain.handle("open-path", async (_event, targetPath) => {
 });
 
 ipcMain.handle("get-model-account", async () => {
-  if (currentModelMode() === "template") {
+  const configError = gptConfigError();
+  if (configError) {
     return {
-      status: "local",
-      accountName: "默认模板",
-      balanceLabel: "不消耗 token",
-      updatedAt: ""
+      status: "unconfigured",
+      accountName: "GPT 未配置",
+      balanceLabel: "需要配置 API",
+      updatedAt: "",
+      message: configError
     };
   }
   const url = accountBalanceUrl();

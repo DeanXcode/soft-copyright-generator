@@ -78,7 +78,7 @@ start-desktop.bat
 桌面端客户界面支持两种生成模式：
 
 - `默认模板`：使用本地模板生成，不调用模型接口，不消耗 token。
-- `GPT`：通过服务端中转生成产品蓝图和说明书正文，会按实际调用消耗 token。
+- `GPT`：通过服务端中转生成产品蓝图和说明书正文，默认按质量优先策略分阶段生成。
 
 客户交付版安装包会预置 GPT 配置，客户安装后可在高级设置里直接看到并修改请求地址、模型名称和 API Key；默认模板模式仍保留为不消耗 token 的兜底入口。
 
@@ -304,6 +304,42 @@ http://127.0.0.1:5000/ui-prototype/index.html
 - `软件名称.txt`
 - `软件名称_代码-(语言).docx`
 - `软件名称_代码-(语言).pdf`
+
+## 真实性与规范性校验
+
+每次完整生成都会额外输出内部校验报告：
+
+```text
+输出目录/generation_report.json
+输出目录/validation_report.json
+输出目录/materials_manifest.json
+```
+
+`validation_report.json` 不进入最终客户 ZIP，只作为交付前验收和问题诊断材料。报告会记录源码文件清单、每个源码文件的 SHA-256、产品蓝图 hash、交付文件 hash、ZIP 文件条目、占位符/乱码扫描、第三方源码目录风险，以及说明书、源码、截图、信息表之间的业务命中情况。
+`materials_manifest.json` 同样是内部证据链文件，不进入最终客户 ZIP。它会记录软件名、版本、语言、产品类型、seed、生成模式、产品蓝图 hash、源码文件清单/行数/hash、源码鉴别材料每页对应的真实源码文件和行号范围、说明书引用映射、PDF 转换信息，以及不含 API Key 的 LLM trace 摘要。
+
+核心检查字段会同步写入 `generation_report.json` 的 `checks`：
+
+- `authenticity_score` / `authenticity_ready`
+- `normative_score` / `normative_ready`
+- `validation_ready_for_delivery`
+- `validation_finding_count`
+- `validation_source_hash`
+- `validation_zip_entries_match_deliverables`
+- `validation_placeholder_hit_count`
+
+其中规范性校验会把源码有效行数低于 3000、ZIP 内容偏离 5 文件白名单、材料中出现占位符或乱码标记视为交付前必须处理的问题。
+
+桌面端生成完成后，`结果明细` 会展示真实性评分、规范性评分和交付建议，并提供 `validation_report.json` 与 `materials_manifest.json` 的打开入口，便于实施人员查看完整校验证据链。
+
+GPT 生成默认采用“真实性优先”流水线，优先保证材料可申请性而不是速度：
+
+- 当业务补充为空，或业务补充与软件名称识别出的领域明显不匹配时，系统会先调用 GPT 根据软件名称生成业务说明、关键词和应避免方向；GPT 不可用时才回退本地规则。例如“阅读听书软件”会自动补充书城浏览、书架管理、有声听书、章节目录、听书播放、阅读进度、收藏订阅、会员权益等关键词。桌面端“按名称自动匹配”按钮也会优先调用 GPT，不再只依赖本地关键词表。
+- 产品蓝图默认质量目标为 `92` 分，最多尝试 5 轮；可通过 `SOFT_BLUEPRINT_QUALITY_FLOOR` 调整目标分。
+- 功能模块默认逐个生成、逐个校验，模块 key、标题、描述、操作、字段、规则过于泛化时会触发单模块修复。
+- 说明书正文默认逐章、逐模块生成，避免一次性上下文过大导致正文变成通用模板。
+- 截图蓝图默认逐页生成，进度会显示登录页、首页、各模块页和统计页设计图阶段。
+- `generation_report.json` 的 `checks.generation_quality_profile` 会记录本次策略；默认不为 token 成本牺牲蓝图、说明书、源码和截图的一致性。
 
 安装包交付会内置 Playwright Chromium Headless Shell，避免客户机器首次运行时下载浏览器：
 

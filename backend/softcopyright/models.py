@@ -37,8 +37,12 @@ PRODUCT_TYPES = [
 
 
 def slugify(value: str, fallback: str = "software") -> str:
-    cleaned = re.sub(r"[\\/:*?\"<>|]+", "", value).strip()
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    cleaned = re.sub(r"[\\/:*?\"<>|]+", "", cleaned).strip()
     cleaned = re.sub(r"\s+", "-", cleaned)
+    cleaned = cleaned.strip(". ")
+    if len(cleaned) > 80:
+        cleaned = cleaned[:80].rstrip(". -_")
     return cleaned or fallback
 
 

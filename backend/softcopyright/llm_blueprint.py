@@ -22,15 +22,21 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
     last_error: Exception | None = None
     best_blueprint: ProductBlueprint | None = None
     best_score = 0
-    for _attempt in range(2):
+    quality_floor = _blueprint_quality_floor(task)
+    attempt_count = 5 if _authenticity_first(task) else 2
+    for _attempt in range(attempt_count):
         started_at = time.perf_counter()
         trace_event(
             "blueprint_attempt_begin",
             attempt=_attempt + 1,
+            total_attempts=attempt_count,
+            quality_floor=quality_floor,
+            profile=_generation_quality_profile(task),
             software_name=task.software_name,
             product_type=task.product_type,
         )
         try:
+            _emit(emit, 15, f"生成产品蓝图 {_attempt + 1}/{attempt_count}")
             core_plan = _generate_core_plan(task, provider, rejection_reasons, emit=emit)
             module_plan = _generate_modules(task, provider, core_plan, rejection_reasons, emit=emit)
             data = _merge_plan(core_plan, module_plan)
@@ -38,9 +44,9 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
             score, reasons = _quality_review(task, blueprint)
             blueprint.quality_score = score
 
-            if score < 78:
+            if score < quality_floor:
                 try:
-                    _emit(emit, 21, "修复产品方案质量")
+                    _emit(emit, 21, f"修复产品蓝图质量，当前评分 {score}/{quality_floor}")
                     repaired_data = _repair_plan(task, provider, data, score, reasons)
                     repaired_blueprint = _blueprint_from_data(task, repaired_data)
                     repaired_score, repaired_reasons = _quality_review(task, repaired_blueprint)
@@ -56,22 +62,24 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
             if score > best_score:
                 best_blueprint = blueprint
                 best_score = score
-            if score >= 78:
+            if score >= quality_floor:
                 trace_event(
                     "blueprint_attempt_success",
                     attempt=_attempt + 1,
                     elapsed_seconds=round(time.perf_counter() - started_at, 3),
                     quality_score=score,
+                    quality_floor=quality_floor,
                     module_count=len(blueprint.modules),
                 )
                 return blueprint
             rejection_reasons = reasons
-            last_error = ValueError(f"LLM 产品方案质量分 {score}，未达 78：{'；'.join(reasons[:4])}")
+            last_error = ValueError(f"LLM 产品方案质量分 {score}，未达 {quality_floor}：{'；'.join(reasons[:4])}")
             trace_event(
                 "blueprint_attempt_rejected",
                 attempt=_attempt + 1,
                 elapsed_seconds=round(time.perf_counter() - started_at, 3),
                 quality_score=score,
+                quality_floor=quality_floor,
                 reasons=reasons[:6],
             )
         except Exception as exc:
@@ -84,7 +92,7 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
                 error_type=type(exc).__name__,
                 error=str(exc)[:500],
             )
-    if best_blueprint and best_score >= 72:
+    if best_blueprint and not _authenticity_first(task) and best_score >= 72:
         return best_blueprint
     if last_error:
         raise last_error
@@ -192,15 +200,17 @@ def _generate_module_batches(
         raise ValueError(f"LLM 模块轮廓不足，无法分批生成模块{detail}")
 
     modules: list[dict[str, Any]] = []
-    batch_count = (min(len(outline), 8) + 1) // 2
+    batch_size = 1 if _authenticity_first(task) else 2
+    batch_count = (min(len(outline), 8) + batch_size - 1) // batch_size
     batches: list[tuple[int, list[Any]]] = []
-    for start in range(0, min(len(outline), 8), 2):
-        batch = outline[start : start + 2]
-        batch_index = start // 2 + 1
+    for start in range(0, min(len(outline), 8), batch_size):
+        batch = outline[start : start + batch_size]
+        batch_index = start // batch_size + 1
         batches.append((batch_index, batch))
 
     def run_batch(batch_index: int, batch: list[Any]) -> list[dict[str, Any]]:
-        _emit(emit, 17 + batch_index, f"生成模块明细 {batch_index}/{batch_count}")
+        title = _batch_title(batch)
+        _emit(emit, 17 + batch_index, f"细分功能模块 {batch_index}/{batch_count}：{title}")
         data = _chat_json(
             provider,
             [
@@ -214,10 +224,31 @@ def _generate_module_batches(
         batch_modules = data.get("modules")
         if not isinstance(batch_modules, list):
             raise ValueError("LLM 分批模块方案不是 modules 数组")
-        return [item for item in batch_modules if isinstance(item, dict)]
+        modules = [item for item in batch_modules if isinstance(item, dict)]
+        if _authenticity_first(task):
+            reasons = _module_batch_quality_reasons(task, modules, expected_count=len(batch))
+            if reasons:
+                _emit(emit, 17 + batch_index, f"修复功能模块 {batch_index}/{batch_count}：{title}")
+                repair_data = _chat_json(
+                    provider,
+                    [
+                        {"role": "system", "content": _system_prompt()},
+                        {"role": "user", "content": _build_module_repair_prompt(task, core_plan, batch, modules, reasons)},
+                    ],
+                    temperature=min(_temperature(task.randomness) + 0.03, 0.85),
+                    max_tokens=1500,
+                    label=f"模块明细修复批次{batch_index}",
+                )
+                repaired_modules = repair_data.get("modules")
+                if isinstance(repaired_modules, list):
+                    modules = [item for item in repaired_modules if isinstance(item, dict)]
+        reasons = _module_batch_quality_reasons(task, modules, expected_count=len(batch))
+        if reasons:
+            raise ValueError("模块明细质量不足：" + "；".join(reasons[:4]))
+        return modules
 
     batch_results: dict[int, list[dict[str, Any]]] = {}
-    workers = _llm_batch_workers()
+    workers = 1 if _authenticity_first(task) else _llm_batch_workers()
     if workers <= 1 or len(batches) <= 1:
         for batch_index, batch in batches:
             batch_results[batch_index] = run_batch(batch_index, batch)
@@ -241,6 +272,314 @@ def _llm_batch_workers() -> int:
     except ValueError:
         value = 1
     return max(1, min(3, value))
+
+
+def _generation_quality_profile(task: GenerationTask) -> str:
+    value = os.getenv("SOFT_GENERATION_PROFILE", "").strip().lower()
+    if value in {"fast", "speed", "batch"}:
+        return "fast"
+    return "authenticity-first"
+
+
+def _authenticity_first(task: GenerationTask) -> bool:
+    return _generation_quality_profile(task) == "authenticity-first"
+
+
+def _blueprint_quality_floor(task: GenerationTask) -> int:
+    if _authenticity_first(task):
+        raw = os.getenv("SOFT_BLUEPRINT_QUALITY_FLOOR", "92").strip() or "92"
+        try:
+            return max(78, min(95, int(raw)))
+        except ValueError:
+            return 92
+    return 78
+
+
+def _semantic_contract(task: GenerationTask) -> dict[str, Any]:
+    value = getattr(task, "semantic_contract", None)
+    return value if isinstance(value, dict) else {}
+
+
+def _contract_keywords(task: GenerationTask) -> list[str]:
+    contract = _semantic_contract(task)
+    values: list[str] = []
+    for key in ("feature_hint_keywords", "feature_hint_target_users"):
+        raw = contract.get(key)
+        if isinstance(raw, list):
+            values.extend(str(item).strip() for item in raw if str(item).strip())
+    for module in _contract_blueprint_modules(task):
+        values.append(str(module.get("title") or "").strip())
+        values.append(str(module.get("category") or "").strip())
+        for key in ("data_objects", "screens"):
+            raw = module.get(key)
+            if isinstance(raw, list):
+                values.extend(str(item).strip() for item in raw if str(item).strip())
+    values.extend(term for term in re.split(r"[，,、\s]+", task.feature_hint or "") if len(term) >= 2)
+    return list(dict.fromkeys(values))[:28]
+
+
+def _contract_avoid_terms(task: GenerationTask) -> list[str]:
+    contract = _semantic_contract(task)
+    raw = contract.get("feature_hint_avoid_terms")
+    values = [str(item).strip() for item in raw if str(item).strip()] if isinstance(raw, list) else []
+    expanded: list[str] = []
+    for item in values:
+        expanded.append(item)
+        expanded.extend(term for term in re.split(r"[，,、/\s]+", item) if len(term) >= 2)
+    return list(dict.fromkeys(expanded))[:36]
+
+
+def _contract_guidance(task: GenerationTask) -> str:
+    contract = _semantic_contract(task)
+    keywords = _contract_keywords(task)
+    avoid_terms = _contract_avoid_terms(task)
+    blueprint_modules = _contract_blueprint_modules(task)
+    domain = str(contract.get("feature_hint_domain") or "").strip()
+    profile = str(contract.get("feature_hint_profile") or "").strip()
+    target_users = contract.get("feature_hint_target_users") or []
+    parts: list[str] = []
+    if domain or profile:
+        parts.append(f"- 名称理解契约：profile={profile or 'unknown'}，domain={domain or '未提供'}。")
+    if target_users:
+        parts.append(f"- 目标用户必须贴合：{'、'.join(str(item) for item in target_users[:8])}。")
+    if keywords:
+        parts.append(f"- 模块、对象、流程、字段和页面必须优先命中名称理解关键词：{'、'.join(keywords[:18])}。")
+    if blueprint_modules:
+        module_notes = []
+        for module in blueprint_modules[:10]:
+            title = str(module.get("title") or "").strip()
+            category = str(module.get("category") or "").strip()
+            data_objects = "、".join(str(item) for item in (module.get("data_objects") or [])[:3])
+            if title:
+                module_notes.append(f"{title}（{category or '未分类'}；对象：{data_objects or '未提供'}）")
+        if module_notes:
+            parts.append(f"- 名称理解阶段已生成结构化蓝图模块，后续方案必须继承或合理扩展：{'；'.join(module_notes)}。")
+    if avoid_terms:
+        parts.append(f"- 禁止偏离名称理解契约的方向或词语：{'、'.join(avoid_terms[:18])}。")
+    return "\n".join(parts)
+
+
+def _contract_blueprint_modules(task: GenerationTask) -> list[dict[str, Any]]:
+    raw = _semantic_contract(task).get("feature_hint_blueprint_modules")
+    if not isinstance(raw, list):
+        return []
+    modules: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict) and str(item.get("title") or "").strip():
+            modules.append(item)
+    return modules[:12]
+
+
+def _batch_title(batch: list[Any]) -> str:
+    titles: list[str] = []
+    for item in batch:
+        if isinstance(item, dict):
+            titles.append(str(item.get("title") or item.get("key") or "模块").strip())
+        else:
+            titles.append(str(item).strip())
+    return "、".join(title for title in titles if title) or "模块明细"
+
+
+def _is_music_like_text(text: str) -> bool:
+    return any(term in text for term in ["听歌", "音乐", "歌曲", "歌单", "播放器", "歌词", "歌手", "专辑", "电台", "音质", "播放"])
+
+
+def _is_reading_audio_like_text(text: str) -> bool:
+    return any(term in text for term in ["阅读", "听书", "有声", "小说", "书籍", "图书", "朗读", "书城"])
+
+
+def _is_consumer_app_text(text: str) -> bool:
+    if "APP" in text.upper() and not any(term in text for term in ["后台", "管理系统", "OA", "ERP", "CRM"]):
+        return True
+    return any(
+        term in text
+        for term in [
+            "听歌", "音乐", "歌曲", "歌单", "阅读", "听书", "小说", "短视频", "相册", "拍照", "修图",
+            "健身", "打卡", "运动", "日记", "记账", "清单", "便签", "外卖", "商城", "购物",
+        ]
+    )
+
+
+def _consumer_app_forbidden_terms() -> list[str]:
+    return [
+        "风险", "预警", "复核", "审核", "核验", "审批", "工单", "派单", "闭环", "归档", "台账", "留痕",
+        "合单", "合演", "点播核验", "点播申请", "登记记录", "电子菜单发布", "批量输出", "发布汇总",
+        "质量复盘", "复盘", "质检", "风控", "处置", "监管", "看板", "调度", "业务办理",
+    ]
+
+
+def _domain_terms(task: GenerationTask) -> list[str]:
+    text = f"{task.software_name} {task.product_type} {task.feature_hint}"
+    contract_terms = _contract_keywords(task)
+    if contract_terms:
+        return contract_terms
+    if _is_music_like_text(text):
+        return [
+            "听歌", "音乐", "歌曲", "歌单", "播放器", "播放", "暂停", "上一首", "下一首", "歌词", "歌手", "专辑",
+            "电台", "音质", "收藏", "下载", "离线", "最近播放", "搜索", "推荐", "会员", "耳机", "循环", "随机",
+        ]
+    if any(term in text for term in ["阅读", "听书", "有声", "小说", "书籍", "图书", "朗读", "书城"]):
+        return [
+            "阅读",
+            "听书",
+            "有声",
+            "书籍",
+            "图书",
+            "小说",
+            "章节",
+            "书架",
+            "书城",
+            "音频",
+            "播放",
+            "朗读",
+            "进度",
+            "收藏",
+            "订阅",
+            "会员",
+            "推荐",
+            "书单",
+            "作者",
+            "主播",
+        ]
+    return [term for term in re.split(r"[，,、\s]+", text) if len(term) >= 2]
+
+
+def _off_domain_terms(task: GenerationTask) -> list[str]:
+    text = f"{task.software_name} {task.product_type} {task.feature_hint}"
+    contract_terms = _contract_avoid_terms(task)
+    if contract_terms:
+        return contract_terms
+    if _is_music_like_text(text) or _is_consumer_app_text(text):
+        return _consumer_app_forbidden_terms()
+    if any(term in text for term in ["阅读", "听书", "有声", "小说", "书籍", "图书", "朗读", "书城"]):
+        return [
+            "风险",
+            "预警",
+            "复核",
+            "审核",
+            "核验",
+            "审批",
+            "工单",
+            "派单",
+            "闭环",
+            "归档",
+            "批量输出",
+            "发布汇总",
+            "质量复盘",
+            "复盘",
+            "质检",
+            "风控",
+            "处置",
+            "监管",
+        ]
+    return []
+
+
+def _domain_guidance(task: GenerationTask) -> str:
+    terms = _domain_terms(task)
+    blocked = _off_domain_terms(task)
+    contract_guidance = _contract_guidance(task)
+    text = f"{task.software_name} {task.product_type} {task.feature_hint}"
+    if _is_music_like_text(text):
+        return (
+            (contract_guidance + "\n" if contract_guidance else "")
+            +
+            f"- 模块、业务对象、流程、字段和页面必须优先围绕：{'、'.join(terms[:24])}。\n"
+            f"- 禁止偏离消费级音乐 App 的后台/审核/流程词：{'、'.join(blocked)}。\n"
+            "- 如果软件名称包含听歌、音乐、歌曲、歌单或播放器，功能必须围绕首页推荐、音乐搜索、歌曲播放、歌词同步、歌单收藏、歌手专辑、最近播放、离线下载、会员音质和个人中心。\n"
+            "- 不得生成点播申请、登记记录、合单、合演、复核、留痕、电子菜单发布、取餐叫号、质量复盘等餐饮/后台/审核模块。\n"
+        )
+    if _is_consumer_app_text(text):
+        return (
+            (contract_guidance + "\n" if contract_guidance else "")
+            +
+            f"- 模块、业务对象、流程、字段和页面必须优先围绕真实用户 App 功能：{'、'.join(terms[:24])}。\n"
+            f"- 禁止偏离消费级 App 的后台/审核/流程词：{'、'.join(blocked)}。\n"
+            "- 模块应体现用户入口、内容浏览、搜索、详情、收藏、下载/缓存、使用记录、会员/个人中心等面向用户的操作，不得写成后台管理系统。\n"
+        )
+    if blocked:
+        return (
+            (contract_guidance + "\n" if contract_guidance else "")
+            +
+            f"- 模块、业务对象、流程、字段和页面必须优先围绕：{'、'.join(terms[:20])}。\n"
+            f"- 禁止偏离软件领域的后台/审核/风控词：{'、'.join(blocked)}。\n"
+            "- 如果软件是阅读听书类，功能应围绕书城浏览、书架管理、阅读进度、听书播放、章节目录、书单推荐、收藏订阅、会员权益、播放记录、朗读设置等真实用户功能。"
+        )
+    base = f"- 模块、业务对象、流程、字段和页面必须命中软件名称、产品类型或业务补充中的领域词：{'、'.join(terms[:20]) or '未提供'}。"
+    return (contract_guidance + "\n" if contract_guidance else "") + base
+
+
+def _domain_action_words(task: GenerationTask) -> list[str]:
+    text = f"{task.software_name} {task.product_type} {task.feature_hint}"
+    if _is_music_like_text(text):
+        return [
+            "播放", "暂停", "续播", "切歌", "收藏", "加入歌单", "下载", "缓存", "搜索", "推荐",
+            "同步歌词", "切换音质", "查看专辑", "查看歌手", "最近播放", "循环播放", "随机播放",
+        ]
+    if _is_consumer_app_text(text):
+        return ["浏览", "搜索", "查看", "收藏", "使用", "播放", "下载", "缓存", "推荐", "同步", "设置", "分享"]
+    if any(term in text for term in ["阅读", "听书", "有声", "小说", "书籍", "图书", "朗读", "书城"]):
+        return [
+            "阅读",
+            "听书",
+            "播放",
+            "暂停",
+            "续播",
+            "收藏",
+            "订阅",
+            "加入书架",
+            "下载",
+            "缓存",
+            "朗读",
+            "切换章节",
+            "调节语速",
+            "推荐",
+            "搜索",
+            "评论",
+            "评分",
+        ]
+    return []
+
+
+def _contains_any(text: str, terms: list[str]) -> bool:
+    return any(term and term in text for term in terms)
+
+
+def _module_batch_quality_reasons(task: GenerationTask, modules: list[dict[str, Any]], *, expected_count: int) -> list[str]:
+    reasons: list[str] = []
+    if len(modules) < expected_count:
+        reasons.append(f"模块数量不足，期望 {expected_count} 个，实际 {len(modules)} 个")
+    generic_titles = {"数据管理", "业务管理", "统计分析", "系统设置", "权限管理", "信息管理"}
+    generic_ops = {"新增", "编辑", "删除", "查询", "导出", "新增记录", "编辑记录", "删除记录", "查询记录", "导出数据"}
+    generic_fields = {"名称", "编号", "状态", "备注", "创建时间", "更新时间", "创建人", "修改人"}
+    domain_terms = _domain_terms(task)
+    off_domain_terms = _off_domain_terms(task)
+    for index, module in enumerate(modules, start=1):
+        title = str(module.get("title") or "").strip()
+        key = str(module.get("key") or "").strip()
+        description = str(module.get("description") or "").strip()
+        operations = [str(item).strip() for item in module.get("operations") or [] if str(item).strip()]
+        fields = [str(item).strip() for item in module.get("data_fields") or [] if str(item).strip()]
+        rules = [str(item).strip() for item in module.get("rules") or [] if str(item).strip()]
+        module_text = " ".join([title, key, description, " ".join(operations), " ".join(fields), " ".join(rules)])
+        if not key or re.fullmatch(r"module_\d+|module|business|data|manage|management", key):
+            reasons.append(f"第 {index} 个模块 key 过于泛化")
+        if not title or title in generic_titles:
+            reasons.append(f"第 {index} 个模块标题过于泛化")
+        if domain_terms and not _contains_any(module_text, domain_terms):
+            reasons.append(f"{title or key or index} 未命中软件领域词")
+        hits = [term for term in off_domain_terms if term in module_text]
+        if hits:
+            reasons.append(f"{title or key or index} 出现偏离软件领域的词：{'、'.join(hits[:4])}")
+        if len(description) < 70:
+            reasons.append(f"{title or key or index} 描述不足 70 字")
+        if len(set(operations) - generic_ops) < 3:
+            reasons.append(f"{title or key or index} 业务操作不够具体")
+        if len(set(fields) - generic_fields) < 4:
+            reasons.append(f"{title or key or index} 业务字段不够具体")
+        if len(rules) < 3:
+            reasons.append(f"{title or key or index} 规则少于 3 条")
+    return reasons
 
 
 def _repair_plan(
@@ -288,6 +627,7 @@ def _build_core_prompt(task: GenerationTask, rejection_reasons: list[str] | None
     if rejection_reasons:
         retry_note = "\n上一版产品方案被拒绝，原因如下，请逐项修正：\n" + "\n".join(f"- {item}" for item in rejection_reasons[:6])
     variation_strategy = _variation_strategy(task)
+    domain_guidance = _domain_guidance(task)
     return f"""
 请为以下软件生成软著申请材料用“核心产品方案”。这份 JSON 将驱动说明书正文、源码工程、界面截图和后续模块明细，因此必须像真实可开发的软件项目，而不是通用模板。
 
@@ -301,6 +641,9 @@ def _build_core_prompt(task: GenerationTask, rejection_reasons: list[str] | None
 
 本次生成的差异化产品策略：
 {variation_strategy}
+
+领域边界要求：
+{domain_guidance}
 
 返回 JSON 字段必须包含：
 - industry: 面向领域/行业，中文短语
@@ -340,6 +683,7 @@ def _build_business_detail_prompt(
     if rejection_reasons:
         retry_note = "\n上一版产品方案被拒绝，原因如下，请逐项修正：\n" + "\n".join(f"- {item}" for item in rejection_reasons[:5])
     variation_strategy = _variation_strategy(task)
+    domain_guidance = _domain_guidance(task)
     return f"""
 请基于下面的软件身份定位，补齐软著材料需要的业务细节。只返回 JSON，不要返回 Markdown。
 
@@ -351,6 +695,9 @@ def _build_business_detail_prompt(
 
 本次生成的差异化产品策略：
 {variation_strategy}
+
+领域边界要求：
+{domain_guidance}
 
 软件身份定位：
 {_compact_identity_plan(identity_plan)}
@@ -366,7 +713,7 @@ def _build_business_detail_prompt(
 
 质量要求：
 - 每一项都要围绕软件名称、使用场景和业务补充，不要写泛型后台词
-- workflows 的 steps 必须出现具体动作，如发布、提交、审核、批改、同步、归档、预警、推送等
+- workflows 的 steps 必须出现当前软件领域内的具体动作；阅读听书类应使用浏览、加入书架、打开章节、播放、暂停、续播、缓存、订阅、推荐等动作
 - report_metrics 必须像真实软件首页或报表页会展示的指标
 - business_objects、workflows、report_metrics 和 uniqueness_notes 必须呼应差异化产品策略，避免同类软件每次生成同一组对象和指标
 
@@ -382,6 +729,7 @@ def _build_module_prompt(
     retry_note = ""
     if rejection_reasons:
         retry_note = "\n上一版被拒绝原因：\n" + "\n".join(f"- {item}" for item in rejection_reasons[:6])
+    domain_guidance = _domain_guidance(task)
     return f"""
 请基于“核心产品方案”为软件生成功能模块明细。只返回 JSON，顶层只需要 modules 字段。
 
@@ -395,13 +743,16 @@ def _build_module_prompt(
 核心产品方案摘要：
 {_compact_core_plan(core_plan)}
 
+领域边界要求：
+{domain_guidance}
+
 modules 必须包含 6-8 个功能模块，每个对象包含：
 - key: 小写英文或英文下划线，适合作为源码目录/类名前缀
 - title: 中文模块名，必须贴合软件名称、业务补充和核心场景
 - description: 90-180字，具体写出业务对象、业务动作、状态流转、权限/校验点和输出结果
 - entities: 2-4个英文实体名，必须能用于源码类名
-- operations: 4-7个中文操作名称，如“提交排班”“复核处方”“发布地图服务”
-- data_fields: 6-10个中文业务字段，如“课程编号”“风险等级”“处方状态”
+- operations: 4-7个中文操作名称，必须来自当前软件领域；阅读听书类可使用“打开章节”“加入书架”“播放音频”“同步进度”
+- data_fields: 6-10个中文业务字段，必须来自当前软件领域；阅读听书类可使用“书籍名称”“章节标题”“播放进度”“收藏状态”
 - pages: 2-4个当前模块相关页面名
 - rules: 3-5条当前模块业务规则，包含校验、权限、状态流转或审计要求
 
@@ -427,8 +778,9 @@ def _build_module_batch_prompt(
         retry_note = "\n上一版被拒绝原因：\n" + "\n".join(f"- {item}" for item in rejection_reasons[:4])
     first_error_note = f"上一轮完整模块请求失败：{first_error[:180]}\n" if first_error else ""
     variation_strategy = _variation_strategy(task)
+    domain_guidance = _domain_guidance(task)
     return f"""
-{first_error_note}请只为下面 2 个模块轮廓补齐模块明细，返回 JSON，顶层只需要 modules。
+{first_error_note}请只为下面 {len(outline_batch)} 个模块轮廓补齐模块明细，返回 JSON，顶层只需要 modules。
 
 软件全称：{task.software_name}
 产品类型：{task.product_type}
@@ -441,6 +793,9 @@ def _build_module_batch_prompt(
 本次生成的差异化产品策略：
 {variation_strategy}
 
+领域边界要求：
+{domain_guidance}
+
 本批模块轮廓：
 {json.dumps(outline_batch, ensure_ascii=False)}
 
@@ -451,8 +806,55 @@ description 90-180字；operations 4-7个；data_fields 6-10个；rules 3-5条�
 """.strip()
 
 
+def _build_module_repair_prompt(
+    task: GenerationTask,
+    core_plan: dict[str, Any],
+    batch: list[Any],
+    modules: list[dict[str, Any]],
+    reasons: list[str],
+) -> str:
+    domain_guidance = _domain_guidance(task)
+    return f"""
+请修复本批功能模块明细。只返回 JSON，顶层只包含 modules。
+
+软件全称：{task.software_name}
+版本号：{task.version}
+编程语言：{task.language}
+软件技术特点/产品类型：{task.product_type}
+业务补充：{task.feature_hint or "无"}
+
+核心产品方案摘要：
+{_compact_core_plan(core_plan)}
+
+领域边界要求：
+{domain_guidance}
+
+本批模块轮廓：
+{json.dumps(batch, ensure_ascii=False, indent=2)}
+
+上一版模块：
+{json.dumps(modules, ensure_ascii=False, indent=2)}
+
+必须修复的问题：
+{chr(10).join(f"- {item}" for item in reasons[:8])}
+
+真实性要求：
+- 每个模块都必须像真实软件项目中的独立功能边界。
+- key 必须可用于源码目录、类名或接口前缀，不能使用 module/data/manage 等泛化命名。
+- title、description、operations、data_fields、rules 必须呼应软件名称、业务补充、业务对象、流程和指标。
+- description 至少 90 字，写清业务对象、用户动作、状态流转、校验点、输出结果。
+- operations 至少 5 个，不能只写新增、编辑、删除、查询、导出。
+- data_fields 至少 7 个，不能只写名称、编号、状态、备注、创建时间。
+- rules 至少 3 条，必须包含校验、权限、状态流转或审计要求。
+
+返回 JSON 示例：
+{{"modules":[{{"key":"domain_task_trace","title":"业务任务追踪","description":"...","entities":["TaskRecord","TaskTrace"],"operations":["..."],"data_fields":["..."],"pages":["..."],"rules":["..."]}}]}}
+""".strip()
+
+
 def _build_repair_prompt(task: GenerationTask, data: dict[str, Any], score: int, reasons: list[str]) -> str:
     variation_strategy = _variation_strategy(task)
+    domain_guidance = _domain_guidance(task)
     return f"""
 请修复下面的软件产品方案，使质量分达到 78 分以上。只返回需要替换或补充的 JSON 字段；如果模块问题较多，可以返回完整 modules 数组。
 
@@ -465,6 +867,9 @@ def _build_repair_prompt(task: GenerationTask, data: dict[str, Any], score: int,
 
 本次生成的差异化产品策略：
 {variation_strategy}
+
+领域边界要求：
+{domain_guidance}
 
 当前方案压缩快照：
 {_compact_full_plan(data)}
@@ -558,6 +963,8 @@ def _compact_modules(value: Any) -> list[dict[str, Any]]:
 
 def _module_outline_from_core(core_plan: dict[str, Any]) -> list[dict[str, str]]:
     outline: list[dict[str, str]] = []
+    plan_text = json.dumps(core_plan, ensure_ascii=False)
+    consumer_app = _is_consumer_app_text(plan_text)
     pages = core_plan.get("pages")
     if isinstance(pages, list):
         for index, page in enumerate(pages[:8], start=1):
@@ -566,8 +973,12 @@ def _module_outline_from_core(core_plan: dict[str, Any]) -> list[dict[str, str]]
                 outline.append(
                     {
                         "key": f"module_{index}",
-                        "title": title if title.endswith("管理") or title.endswith("分析") else f"{title}管理",
-                        "focus": f"围绕{title}处理核心业务记录、状态流转和统计输出",
+                        "title": title if consumer_app else title if title.endswith("管理") or title.endswith("分析") else f"{title}管理",
+                        "focus": (
+                            f"围绕{title}提供用户入口、内容展示、交互操作和个性化状态"
+                            if consumer_app
+                            else f"围绕{title}处理核心业务记录、状态流转和统计输出"
+                        ),
                     }
                 )
             if len(outline) >= 8:
@@ -581,14 +992,18 @@ def _module_outline_from_core(core_plan: dict[str, Any]) -> list[dict[str, str]]
             label = str(item).strip()
             if not label:
                 continue
-            title = label if label.endswith("管理") or label.endswith("分析") else f"{label}管理"
+            title = label if consumer_app else label if label.endswith("管理") or label.endswith("分析") else f"{label}管理"
             if title in {entry["title"] for entry in outline}:
                 continue
             outline.append(
                 {
                     "key": f"module_{index}",
                     "title": title,
-                    "focus": f"围绕{label}建立业务台账、处理流程和结果留痕",
+                    "focus": (
+                        f"围绕{label}建立用户可见的浏览、搜索、使用、收藏或设置能力"
+                        if consumer_app
+                        else f"围绕{label}建立业务台账、处理流程和结果留痕"
+                    ),
                 }
             )
     return outline[:8]
@@ -801,6 +1216,40 @@ def _variation_strategy(task: GenerationTask) -> str:
         ]
     )
     digest = hashlib.sha256(seed_text.encode("utf-8")).digest()
+    product_text = f"{task.software_name} {task.product_type} {task.feature_hint}"
+    if _is_music_like_text(product_text):
+        return "\n".join(
+            [
+                "- 产品角度：以用户听歌、找歌、收藏歌单、查看歌词和管理播放偏好为中心。",
+                "- 流程重心：重点体现首页推荐、音乐搜索、歌曲详情、播放控制、歌词同步、歌单收藏、最近播放、离线下载和会员音质链路。",
+                "- 模块组织：模块标题必须使用音乐领域名词和用户动作，例如“音乐首页推荐”“歌曲播放控制”“歌词同步显示”“歌单收藏管理”“歌手专辑浏览”。",
+                "- 数据深度：字段应体现歌曲、歌手、专辑、歌单、播放进度、歌词时间轴、音质、收藏状态、下载状态和会员权益。",
+                "- 命名风格：英文 key 使用 song、music、playlist、player、lyric、artist、album、favorite、download 等领域词。",
+                "- 避免套路：不要生成点播申请、点播核验、合单、合演、留痕、复核、电子菜单发布、取餐叫号、工单闭环、质量复盘等后台或餐饮模块。",
+            ]
+        )
+    if _is_consumer_app_text(product_text):
+        return "\n".join(
+            [
+                "- 产品角度：以普通用户在手机 App 内的浏览、搜索、使用、收藏、个人设置和会员权益为中心。",
+                "- 流程重心：重点体现用户入口、首页推荐、内容详情、核心操作、收藏/下载、使用记录和个人中心链路。",
+                "- 模块组织：模块标题必须是用户可见功能，不得写成后台管理、审批流、台账流转或复核追踪。",
+                "- 数据深度：字段应体现内容对象、用户偏好、使用进度、收藏状态、下载状态、会员状态和推荐来源。",
+                "- 命名风格：英文 key 使用 home、search、detail、favorite、profile、download、history、recommendation 等用户功能词。",
+                "- 避免套路：不要生成审核、复核、工单、闭环、台账、留痕、合单、批量输出、质量复盘等后台业务系统模块。",
+            ]
+        )
+    if any(term in product_text for term in ["阅读", "听书", "有声", "小说", "书籍", "图书", "朗读", "书城"]):
+        return "\n".join(
+            [
+                "- 产品角度：以读者的找书、阅读、听书、续播、收藏、订阅和会员权益体验为中心。",
+                "- 流程重心：重点体现书城浏览、书籍详情、章节目录、阅读进度、音频播放、书架收藏、离线缓存和推荐续读链路。",
+                "- 模块组织：模块标题必须使用阅读听书领域名词和用户动作，例如“书城分类浏览”“书架收藏同步”“听书播放控制”“章节进度续读”。",
+                "- 数据深度：字段应体现书籍、章节、作者、主播、播放进度、阅读时长、收藏状态、订阅状态、缓存状态和会员权益。",
+                "- 命名风格：英文 key 使用 book、chapter、audio、shelf、playback、reading、subscription、recommendation 等领域词。",
+                "- 避免套路：不要生成内容风险预警、复核追踪、批量输出、质量复盘、审批核验、工单闭环、监管处置等后台审核或风控模块。",
+            ]
+        )
     product_angles = [
         "以一线操作员的高频办理流程为中心，模块按日常任务闭环拆分",
         "以管理者的监管、复核和异常处置为中心，模块按状态流转拆分",
@@ -997,6 +1446,9 @@ def _quality_review(task: GenerationTask, blueprint: ProductBlueprint) -> tuple[
         "确认",
         "配置",
     ]
+    action_words.extend(_domain_action_words(task))
+    domain_terms = _domain_terms(task)
+    off_domain_terms = _off_domain_terms(task)
 
     if len(blueprint.summary) < 180:
         score -= 12
@@ -1029,6 +1481,31 @@ def _quality_review(task: GenerationTask, blueprint: ProductBlueprint) -> tuple[
     if generic_key_count >= 2:
         score -= 8
         reasons.append("多个模块 key 仍是泛型命名")
+    domain_miss_count = 0
+    off_domain_module_count = 0
+    for module in blueprint.modules:
+        module_text = json.dumps(
+            {
+                "key": module.key,
+                "title": module.title,
+                "description": module.description,
+                "operations": module.operations,
+                "data_fields": module.data_fields,
+                "pages": module.pages,
+                "rules": module.rules,
+            },
+            ensure_ascii=False,
+        )
+        if domain_terms and not _contains_any(module_text, domain_terms):
+            domain_miss_count += 1
+        if off_domain_terms and _contains_any(module_text, off_domain_terms):
+            off_domain_module_count += 1
+    if domain_terms and domain_miss_count >= max(1, len(blueprint.modules) // 3):
+        score -= 18
+        reasons.append("多个模块未命中软件领域词，存在领域偏移")
+    if off_domain_module_count:
+        score -= min(30, 15 + off_domain_module_count * 5)
+        reasons.append("模块出现与软件领域不匹配的后台/审核/风控词")
     weak_description_count = sum(
         1
         for module in blueprint.modules
@@ -1063,9 +1540,24 @@ def _quality_review(task: GenerationTask, blueprint: ProductBlueprint) -> tuple[
             reasons.append("产品方案与业务补充关键词关联不足")
 
     joined_plan = json.dumps(blueprint.to_dict(), ensure_ascii=False)
+    contract_keywords = _contract_keywords(task)
+    if contract_keywords:
+        contract_hit_count = sum(1 for term in contract_keywords[:16] if term in joined_plan)
+        required_hits = max(3, min(7, len(contract_keywords[:16]) // 2))
+        if contract_hit_count < required_hits:
+            score -= 24
+            reasons.append(f"产品方案未充分履行名称理解契约，关键词命中 {contract_hit_count}/{required_hits}")
+    contract_avoid_hits = [term for term in _contract_avoid_terms(task) if term in joined_plan]
+    if contract_avoid_hits:
+        score -= min(40, 18 + len(contract_avoid_hits) * 4)
+        reasons.append(f"产品方案违背名称理解契约，包含应避免方向：{'、'.join(contract_avoid_hits[:8])}")
     if sum(1 for word in generic_words if word in joined_plan) >= 8:
         score -= 6
         reasons.append("方案中泛型后台表达偏多")
+    off_domain_hits = [term for term in off_domain_terms if term in joined_plan]
+    if off_domain_hits:
+        score -= min(25, 10 + len(off_domain_hits) * 3)
+        reasons.append(f"方案包含偏离软件领域的词：{'、'.join(off_domain_hits[:6])}")
 
     if not blueprint.scenario or len(blueprint.scenario) < 12:
         score -= 8

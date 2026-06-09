@@ -37,7 +37,7 @@ def generate_source_project(task: GenerationTask, blueprint: ProductBlueprint, o
     }
 
 
-def read_source_lines(source_dir: Path) -> list[str]:
+def read_source_line_entries(source_dir: Path) -> list[dict]:
     allowed = {
         ".java",
         ".xml",
@@ -56,7 +56,7 @@ def read_source_lines(source_dir: Path) -> list[str]:
         ".yaml",
         ".properties",
     }
-    lines: list[str] = []
+    entries: list[dict] = []
     for path in sorted(source_dir.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in allowed:
             continue
@@ -67,10 +67,25 @@ def read_source_lines(source_dir: Path) -> list[str]:
             content = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             content = path.read_text(encoding="gbk", errors="ignore")
-        for line in content.splitlines():
+        for line_number, line in enumerate(content.splitlines(), start=1):
             sanitized = _sanitize_source_material_line(line.rstrip())
             if sanitized.strip() and not _is_comment_only_source_line(sanitized, path.suffix.lower()):
-                lines.append(sanitized)
+                entries.append(
+                    {
+                        "file": relative,
+                        "line": line_number,
+                        "text": sanitized,
+                    }
+                )
+    return entries
+
+
+def read_source_lines(source_dir: Path) -> list[str]:
+    lines: list[str] = []
+    for entry in read_source_line_entries(source_dir):
+        text = str(entry.get("text", ""))
+        if text.strip():
+            lines.append(text)
     return lines
 
 

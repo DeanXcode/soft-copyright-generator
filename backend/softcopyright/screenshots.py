@@ -16,10 +16,23 @@ from .blueprint import FeatureModule, ProductBlueprint
 from .llm.provider import LLMProvider
 from .models import GenerationTask
 from .packager import write_json
-from .ui_blueprint import UiBlueprint, UiScreenBlueprint, build_ui_blueprint, is_game_like
+from .ui_blueprint import UiBlueprint, UiScreenBlueprint, build_ui_blueprint, is_game_like, is_mobile_app_like
 
 ADMIN_VIEWPORT = {"width": 1280, "height": 820}
 GAME_VIEWPORT = {"width": 720, "height": 1280}
+MOBILE_VIEWPORT = {"width": 720, "height": 1280}
+
+
+def _is_mobile_renderer(renderer: str) -> bool:
+    return renderer in {"game", "mobile_app"}
+
+
+def _viewport_for_renderer(renderer: str) -> dict[str, int]:
+    if renderer == "game":
+        return GAME_VIEWPORT
+    if renderer == "mobile_app":
+        return MOBILE_VIEWPORT
+    return ADMIN_VIEWPORT
 
 
 @dataclass
@@ -66,8 +79,8 @@ def generate_ui_screenshots(
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
-            viewport = GAME_VIEWPORT if ui_blueprint.renderer == "game" else ADMIN_VIEWPORT
-            page = browser.new_page(viewport=viewport, device_scale_factor=1, is_mobile=ui_blueprint.renderer == "game")
+            viewport = _viewport_for_renderer(ui_blueprint.renderer)
+            page = browser.new_page(viewport=viewport, device_scale_factor=1, is_mobile=_is_mobile_renderer(ui_blueprint.renderer))
             project_server = None
             render_base_url = ""
             render_mode = "file"
@@ -221,7 +234,7 @@ def _write_prototype_manifest(
         "source": ui_blueprint.source,
         "visual_style": ui_blueprint.visual_style,
         "entry": "index.html",
-        "viewport": GAME_VIEWPORT if ui_blueprint.renderer == "game" else ADMIN_VIEWPORT,
+        "viewport": _viewport_for_renderer(ui_blueprint.renderer),
         "modules": [{"key": module.key, "title": module.title} for module in blueprint.modules],
         "pages": [
             {
@@ -253,7 +266,7 @@ def _write_prototype_index(
         }
         for item in screenshots
     ]
-    viewport = GAME_VIEWPORT if ui_blueprint.renderer == "game" else ADMIN_VIEWPORT
+    viewport = _viewport_for_renderer(ui_blueprint.renderer)
     first_page = pages[0]["file"] if pages else ""
     page_json = json.dumps(pages, ensure_ascii=False)
     module_titles = " / ".join(module.title for module in blueprint.modules[:5])
@@ -350,7 +363,7 @@ def _write_prototype_readme(
     ui_blueprint: UiBlueprint,
     screenshots: list[UiScreenshot],
 ) -> None:
-    viewport = GAME_VIEWPORT if ui_blueprint.renderer == "game" else ADMIN_VIEWPORT
+    viewport = _viewport_for_renderer(ui_blueprint.renderer)
     page_lines = "\n".join(f"- `{Path(item.html_path).name}`：{item.title}" for item in screenshots)
     content = f"""# {task.software_name} UI Prototype
 
@@ -501,6 +514,8 @@ def _emit(emit, progress: int, message: str, **extra) -> None:
 def _build_pages(task: GenerationTask, blueprint: ProductBlueprint, ui_dir: Path, ui_blueprint: UiBlueprint) -> list[UiScreenshot]:
     if ui_blueprint.renderer == "game":
         return _build_game_pages(task, blueprint, ui_dir, ui_blueprint)
+    if ui_blueprint.renderer == "mobile_app":
+        return _build_mobile_app_pages(task, blueprint, ui_dir, ui_blueprint)
 
     design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
     screen_by_key = {screen.key: screen for screen in ui_blueprint.screens}
@@ -891,6 +906,135 @@ def _operation_sample_value(module: FeatureModule, field: str, index: int) -> st
     return values[index % len(values)]
 
 
+def _build_mobile_app_pages(task: GenerationTask, blueprint: ProductBlueprint, ui_dir: Path, ui_blueprint: UiBlueprint) -> list[UiScreenshot]:
+    module_by_key = {module.key: module for module in blueprint.modules}
+    pages: list[UiScreenshot] = []
+    for screen in ui_blueprint.screens:
+        module = module_by_key.get(screen.module_key or screen.key)
+        body = _mobile_body_from_screen(task, blueprint, screen, module)
+        pages.append(_write_page(ui_dir, screen.key, screen.title, screen.caption, body, renderer="mobile_app"))
+    return pages
+
+
+def _mobile_body_from_screen(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    screen: UiScreenBlueprint,
+    module: FeatureModule | None = None,
+) -> str:
+    if screen.view_type == "mobile_login":
+        return _mobile_login_body(task, blueprint, screen)
+    if screen.view_type == "mobile_player":
+        return _mobile_player_body(task, screen, module)
+    if screen.view_type == "mobile_search":
+        return _mobile_search_body(task, screen, module)
+    if screen.view_type == "mobile_detail":
+        return _mobile_detail_body(task, screen, module)
+    if screen.view_type in {"mobile_profile", "mobile_statistics"}:
+        return _mobile_profile_body(task, screen)
+    return _mobile_home_body(task, blueprint, screen, module)
+
+
+def _mobile_shell(task: GenerationTask, title: str, content: str, active: str = "首页") -> str:
+    nav = ["首页", "发现", "收藏", "我的"]
+    nav_html = "".join(f"<span class='{'active' if item == active else ''}'>{escape(item)}</span>" for item in nav)
+    return f"""
+<div class="mobile-screen">
+  <div class="mobile-status"><span>9:41</span><span>5G 100%</span></div>
+  <div class="mobile-header">
+    <strong>{escape(title)}</strong>
+    <small>{escape(task.software_name)}</small>
+  </div>
+  <main class="mobile-content">{content}</main>
+  <nav class="mobile-nav">{nav_html}</nav>
+</div>
+"""
+
+
+def _mobile_login_body(task: GenerationTask, blueprint: ProductBlueprint, screen: UiScreenBlueprint) -> str:
+    content = f"""
+    <section class="mobile-hero">
+      <div class="mobile-logo">{escape(task.software_name[:2] or "App")}</div>
+      <h1>{escape(task.software_name)}</h1>
+      <p>{escape(screen.caption or blueprint.summary)}</p>
+    </section>
+    <section class="mobile-panel">
+      <label>手机号</label><div class="mobile-input">请输入手机号</div>
+      <label>验证码</label><div class="mobile-input">请输入短信验证码</div>
+      <div class="mobile-primary">登录并进入应用</div>
+      <small>已阅读并同意用户协议与隐私政策</small>
+    </section>
+"""
+    return _mobile_shell(task, screen.title, content, active="我的")
+
+
+def _mobile_home_body(task: GenerationTask, blueprint: ProductBlueprint, screen: UiScreenBlueprint, module: FeatureModule | None = None) -> str:
+    modules = blueprint.modules[:5]
+    chips = "".join(f"<span>{escape(module.title[:8])}</span>" for module in modules)
+    cards = "".join(
+        f"<article class='mobile-card'><b>{escape(module.title)}</b><small>{escape(_clip(module.description, 34))}</small></article>"
+        for module in modules[:4]
+    )
+    content = f"""
+    <div class="mobile-search">搜索 {escape(task.software_name)} 内容或功能</div>
+    <section class="mobile-banner"><b>{escape(screen.title)}</b><span>{escape(_clip(screen.caption, 42))}</span></section>
+    <div class="mobile-chip-row">{chips}</div>
+    <section class="mobile-list">{cards}</section>
+"""
+    return _mobile_shell(task, screen.title, content, active="首页")
+
+
+def _mobile_player_body(task: GenerationTask, screen: UiScreenBlueprint, module: FeatureModule | None) -> str:
+    title = module.title if module else screen.title
+    content = f"""
+    <section class="mobile-cover"><div>{escape(title[:6])}</div></section>
+    <section class="mobile-player-info">
+      <h2>{escape(title)}</h2>
+      <p>{escape(_clip(screen.caption, 54))}</p>
+      <div class="mobile-progress"><span></span></div>
+      <div class="mobile-time"><span>03:28</span><span>04:52</span></div>
+      <div class="mobile-controls"><b>上一首</b><strong>播放</strong><b>下一首</b></div>
+    </section>
+    <section class="mobile-panel compact"><b>相关推荐</b><small>{escape('、'.join(screen.components[:4]))}</small></section>
+"""
+    return _mobile_shell(task, screen.title, content, active="发现")
+
+
+def _mobile_search_body(task: GenerationTask, screen: UiScreenBlueprint, module: FeatureModule | None) -> str:
+    rows = "".join(f"<div><b>{escape(item)}</b><small>与 {escape(task.software_name)} 场景匹配</small></div>" for item in (screen.components[:5] or ["热门推荐", "最近搜索"]))
+    content = f"""
+    <div class="mobile-search active">输入关键词搜索</div>
+    <div class="mobile-chip-row"><span>综合</span><span>最新</span><span>收藏</span><span>离线</span></div>
+    <section class="mobile-result-list">{rows}</section>
+"""
+    return _mobile_shell(task, screen.title, content, active="发现")
+
+
+def _mobile_detail_body(task: GenerationTask, screen: UiScreenBlueprint, module: FeatureModule | None) -> str:
+    title = module.title if module else screen.title
+    fields = module.data_fields[:5] if module else list(screen.sample_data.keys())[:5]
+    rows = "".join(
+        f"<div><span>{escape(field)}</span><b>{escape(_operation_sample_value(module, field, index) if module else '已同步')}</b></div>"
+        for index, field in enumerate(fields)
+    )
+    content = f"""
+    <section class="mobile-detail-head"><b>{escape(title)}</b><small>{escape(_clip(screen.caption, 64))}</small></section>
+    <section class="mobile-detail-list">{rows}</section>
+    <div class="mobile-primary">继续使用</div>
+"""
+    return _mobile_shell(task, screen.title, content, active="首页")
+
+
+def _mobile_profile_body(task: GenerationTask, screen: UiScreenBlueprint) -> str:
+    items = screen.components[:5] or ["用户资料", "收藏记录", "下载缓存", "会员权益", "应用设置"]
+    rows = "".join(f"<div><b>{escape(item)}</b><small>已同步</small></div>" for item in items)
+    content = f"""
+    <section class="mobile-user"><div class="mobile-avatar">用户</div><b>体验用户</b><small>{escape(task.software_name)} 个人中心</small></section>
+    <section class="mobile-result-list">{rows}</section>
+"""
+    return _mobile_shell(task, screen.title, content, active="我的")
+
+
 def _build_game_pages(task: GenerationTask, blueprint: ProductBlueprint, ui_dir: Path, ui_blueprint: UiBlueprint) -> list[UiScreenshot]:
     module_by_key = {module.key: module for module in blueprint.modules}
     pages: list[UiScreenshot] = []
@@ -908,7 +1052,7 @@ def _write_page(ui_dir: Path, key: str, title: str, caption: str, body: str, ren
 
 
 def _page_shell(title: str, body: str, renderer: str = "admin") -> str:
-    body_class = "game" if renderer == "game" else "admin"
+    body_class = "game" if renderer == "game" else "mobile" if renderer == "mobile_app" else "admin"
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1187,6 +1331,58 @@ def _page_shell(title: str, body: str, renderer: str = "admin") -> str:
     .field {{ display: grid; gap: 8px; margin-bottom: 16px; }}
     .field label {{ color: #52637a; font-size: 13px; font-weight: 700; }}
     .field div {{ height: 42px; border: 1px solid #ccd6e3; border-radius: 7px; padding: 0 12px; display: flex; align-items: center; color: #64748b; }}
+    body.mobile {{ width: 720px; min-height: 1280px; overflow: hidden; background: #f4f6fb; }}
+    .mobile-screen {{ width: 720px; height: 1280px; overflow: hidden; display: flex; flex-direction: column; background: linear-gradient(180deg, #f9fbff 0%, #edf3f8 100%); color: #172033; }}
+    .mobile-status {{ height: 42px; padding: 12px 30px 0; display: flex; justify-content: space-between; color: #29364a; font-size: 15px; font-weight: 800; }}
+    .mobile-header {{ min-height: 112px; padding: 26px 34px 18px; display: grid; gap: 8px; }}
+    .mobile-header strong {{ font-size: 34px; line-height: 1.18; color: #172033; }}
+    .mobile-header small {{ color: #66758a; font-size: 18px; }}
+    .mobile-content {{ flex: 1; min-height: 0; overflow: hidden; padding: 0 30px 22px; display: grid; align-content: start; gap: 18px; }}
+    .mobile-nav {{ height: 92px; padding: 10px 34px 22px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; background: rgba(255,255,255,.86); border-top: 1px solid #dfe7f1; }}
+    .mobile-nav span {{ display: grid; place-items: center; border-radius: 18px; color: #708197; font-size: 18px; font-weight: 800; }}
+    .mobile-nav span.active {{ background: #172033; color: #ffffff; }}
+    .mobile-search {{ min-height: 58px; padding: 0 20px; display: flex; align-items: center; border-radius: 22px; background: #ffffff; border: 1px solid #dfe7f1; color: #7b8ba0; font-size: 18px; }}
+    .mobile-search.active {{ color: #172033; box-shadow: 0 12px 26px rgba(23,32,51,.08); }}
+    .mobile-banner {{ min-height: 170px; padding: 24px; display: grid; align-content: space-between; border-radius: 28px; background: linear-gradient(135deg, #182033, #2e5c72); color: #ffffff; box-shadow: 0 20px 42px rgba(23,32,51,.16); }}
+    .mobile-banner b {{ font-size: 28px; line-height: 1.22; }}
+    .mobile-banner span {{ color: rgba(255,255,255,.78); font-size: 17px; line-height: 1.55; }}
+    .mobile-chip-row {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+    .mobile-chip-row span {{ min-height: 40px; display: inline-flex; align-items: center; padding: 0 16px; border-radius: 999px; background: #ffffff; border: 1px solid #dfe7f1; color: #52637a; font-size: 16px; font-weight: 800; }}
+    .mobile-list, .mobile-result-list {{ display: grid; gap: 14px; }}
+    .mobile-card, .mobile-result-list div, .mobile-panel, .mobile-detail-head, .mobile-detail-list, .mobile-user {{ border-radius: 24px; background: #ffffff; border: 1px solid #dfe7f1; box-shadow: 0 12px 28px rgba(23,32,51,.06); }}
+    .mobile-card {{ min-height: 112px; padding: 18px 20px; display: grid; gap: 10px; }}
+    .mobile-card b, .mobile-result-list b, .mobile-panel b {{ color: #172033; font-size: 20px; }}
+    .mobile-card small, .mobile-result-list small, .mobile-panel small {{ color: #66758a; font-size: 15px; line-height: 1.5; }}
+    .mobile-hero {{ min-height: 340px; display: grid; justify-items: center; align-content: center; gap: 18px; text-align: center; }}
+    .mobile-logo, .mobile-avatar {{ width: 116px; height: 116px; border-radius: 34px; display: grid; place-items: center; background: #172033; color: #ffffff; font-size: 30px; font-weight: 900; }}
+    .mobile-hero h1 {{ margin: 0; font-size: 38px; }}
+    .mobile-hero p {{ margin: 0; max-width: 520px; color: #66758a; font-size: 18px; line-height: 1.65; }}
+    .mobile-panel {{ padding: 24px; display: grid; gap: 13px; }}
+    .mobile-panel label {{ color: #52637a; font-size: 15px; font-weight: 800; }}
+    .mobile-input {{ height: 56px; display: flex; align-items: center; padding: 0 16px; border-radius: 16px; background: #f7f9fc; border: 1px solid #dce4ef; color: #8290a3; font-size: 17px; }}
+    .mobile-primary {{ height: 58px; display: grid; place-items: center; border-radius: 18px; background: #172033; color: #ffffff; font-size: 19px; font-weight: 900; }}
+    .mobile-cover {{ height: 430px; border-radius: 36px; display: grid; place-items: center; background: linear-gradient(145deg, #162033, #47616e 55%, #d6b16f); color: #ffffff; box-shadow: 0 24px 48px rgba(23,32,51,.22); }}
+    .mobile-cover div {{ width: 230px; height: 230px; border-radius: 42px; display: grid; place-items: center; background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.32); font-size: 32px; font-weight: 900; text-align: center; }}
+    .mobile-player-info {{ display: grid; gap: 12px; text-align: center; }}
+    .mobile-player-info h2 {{ margin: 0; font-size: 30px; color: #172033; }}
+    .mobile-player-info p {{ margin: 0; color: #66758a; font-size: 16px; line-height: 1.55; }}
+    .mobile-progress {{ height: 8px; border-radius: 999px; background: #dbe4ef; overflow: hidden; }}
+    .mobile-progress span {{ display: block; width: 58%; height: 100%; background: #172033; }}
+    .mobile-time, .mobile-controls {{ display: flex; justify-content: space-between; align-items: center; color: #66758a; font-size: 15px; }}
+    .mobile-controls strong {{ width: 98px; height: 98px; border-radius: 50%; display: grid; place-items: center; background: #172033; color: #ffffff; font-size: 20px; }}
+    .mobile-controls b {{ font-size: 17px; color: #29364a; }}
+    .mobile-panel.compact {{ padding: 18px 20px; }}
+    .mobile-result-list div {{ min-height: 82px; padding: 18px 20px; display: grid; gap: 8px; }}
+    .mobile-detail-head {{ min-height: 154px; padding: 24px; display: grid; align-content: center; gap: 12px; background: #172033; color: #ffffff; }}
+    .mobile-detail-head b {{ font-size: 28px; }}
+    .mobile-detail-head small {{ color: rgba(255,255,255,.76); font-size: 16px; line-height: 1.55; }}
+    .mobile-detail-list {{ overflow: hidden; }}
+    .mobile-detail-list div {{ min-height: 66px; padding: 0 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #edf1f6; }}
+    .mobile-detail-list span {{ color: #66758a; font-size: 16px; }}
+    .mobile-detail-list b {{ color: #172033; font-size: 17px; }}
+    .mobile-user {{ min-height: 238px; padding: 28px; display: grid; justify-items: center; align-content: center; gap: 12px; }}
+    .mobile-user b {{ font-size: 26px; color: #172033; }}
+    .mobile-user small {{ color: #66758a; font-size: 16px; }}
     .game-screen {{ min-height: 100vh; padding: 28px; background: linear-gradient(160deg, #7dd3fc 0%, #fef3c7 45%, #f9a8d4 100%); color: #243044; }}
     .game-frame {{ width: 1180px; min-height: 744px; margin: 0 auto; border-radius: 24px; background: rgba(255,255,255,.78); box-shadow: 0 24px 70px rgba(43,55,90,.22); overflow: hidden; border: 6px solid rgba(255,255,255,.65); }}
     .game-top {{ height: 86px; display: flex; align-items: center; justify-content: space-between; padding: 0 30px; background: rgba(255,255,255,.82); }}
@@ -2881,11 +3077,20 @@ def _render_fallback_images(
     for item in screenshots:
         path = ui_dir / f"{item.key}.png"
         game = is_game_like(task, blueprint)
-        image_size = (GAME_VIEWPORT["width"], GAME_VIEWPORT["height"]) if game else (ADMIN_VIEWPORT["width"], ADMIN_VIEWPORT["height"])
+        mobile = (not game) and is_mobile_app_like(task, blueprint)
+        image_size = (
+            (GAME_VIEWPORT["width"], GAME_VIEWPORT["height"])
+            if game
+            else (MOBILE_VIEWPORT["width"], MOBILE_VIEWPORT["height"])
+            if mobile
+            else (ADMIN_VIEWPORT["width"], ADMIN_VIEWPORT["height"])
+        )
         image = Image.new("RGB", image_size, "#eef2f6")
         draw = ImageDraw.Draw(image)
         if game:
             _draw_game_phone_page(draw, task, blueprint, item, font_title, font_regular, font_small, font_metric)
+        elif mobile:
+            _draw_mobile_app_page(draw, task, blueprint, item, font_title, font_regular, font_small, font_metric)
         elif item.key == "login":
             _draw_login(draw, task, blueprint, font_title, font_regular, font_small)
         else:
@@ -2962,6 +3167,56 @@ def _draw_app_page(draw, task: GenerationTask, blueprint: ProductBlueprint, item
         values = [f"{module.title}记录{row_index:03d}", module.title, "正常", "查看 / 编辑"]
         for col_index, value in enumerate(values):
             draw.text((286 + col_index * 230, y + 6), _clip(value, 16), fill="#1f2937", font=small_font)
+
+
+def _draw_mobile_app_page(draw, task: GenerationTask, blueprint: ProductBlueprint, item: UiScreenshot, title_font, regular_font, small_font, metric_font) -> None:
+    draw.rectangle((0, 0, 720, 1280), fill="#f4f6fb")
+    draw.text((30, 14), "9:41", fill="#29364a", font=small_font)
+    draw.text((604, 14), "5G 100%", fill="#29364a", font=small_font)
+    draw.text((34, 72), _clip(item.title, 16), fill="#172033", font=title_font)
+    draw.text((34, 116), _clip(task.software_name, 24), fill="#66758a", font=regular_font)
+
+    title_text = item.title + item.caption
+    if item.key == "login":
+        draw.rounded_rectangle((302, 250, 418, 366), radius=34, fill="#172033")
+        draw.text((326, 292), _clip(task.software_name[:2] or "App", 4), fill="#ffffff", font=regular_font)
+        draw.text((180, 410), _clip(task.software_name, 16), fill="#172033", font=title_font)
+        y = 540
+        for label in ["手机号", "验证码"]:
+            draw.text((70, y), label, fill="#52637a", font=small_font)
+            draw.rounded_rectangle((70, y + 30, 650, y + 88), radius=18, outline="#dce4ef", fill="#ffffff")
+            y += 112
+        draw.rounded_rectangle((70, y + 10, 650, y + 72), radius=20, fill="#172033")
+        draw.text((280, y + 30), "登录并进入应用", fill="#ffffff", font=regular_font)
+    elif any(word in title_text for word in ["播放", "听歌", "音乐", "歌曲", "听书", "朗读", "视频", "音频"]):
+        draw.rounded_rectangle((88, 190, 632, 704), radius=42, fill="#263445")
+        draw.rounded_rectangle((245, 332, 475, 562), radius=42, fill="#d6b16f")
+        draw.text((278, 430), _clip(item.title, 6), fill="#ffffff", font=regular_font)
+        draw.text((74, 750), _clip(item.title, 18), fill="#172033", font=title_font)
+        draw.text((74, 800), _clip(item.caption, 32), fill="#66758a", font=regular_font)
+        draw.rounded_rectangle((74, 880, 646, 890), radius=5, fill="#dbe4ef")
+        draw.rounded_rectangle((74, 880, 406, 890), radius=5, fill="#172033")
+        for x, label in [(128, "上一首"), (310, "播放"), (504, "下一首")]:
+            radius = 58 if label == "播放" else 38
+            draw.ellipse((x, 950, x + radius, 950 + radius), fill="#172033" if label == "播放" else "#ffffff")
+            draw.text((x + 8, 970), label, fill="#ffffff" if label == "播放" else "#29364a", font=small_font)
+    else:
+        draw.rounded_rectangle((34, 178, 686, 236), radius=22, fill="#ffffff", outline="#dfe7f1")
+        draw.text((58, 198), "搜索内容或功能", fill="#7b8ba0", font=regular_font)
+        draw.rounded_rectangle((34, 262, 686, 432), radius=30, fill="#172033")
+        draw.text((62, 306), _clip(item.title, 18), fill="#ffffff", font=title_font)
+        draw.text((62, 356), _clip(item.caption, 36), fill="#cbd5e1", font=regular_font)
+        rows = blueprint.modules[:5] or []
+        y = 464
+        for module in rows:
+            draw.rounded_rectangle((34, y, 686, y + 98), radius=24, fill="#ffffff", outline="#dfe7f1")
+            draw.text((58, y + 20), _clip(module.title, 18), fill="#172033", font=regular_font)
+            draw.text((58, y + 54), _clip(module.description, 32), fill="#66758a", font=small_font)
+            y += 116
+    draw.rectangle((0, 1188, 720, 1280), fill="#ffffff")
+    for index, label in enumerate(["首页", "发现", "收藏", "我的"]):
+        x = 64 + index * 164
+        draw.text((x, 1220), label, fill="#172033" if index == 0 else "#708197", font=regular_font)
 
 
 def _draw_game_phone_page(draw, task: GenerationTask, blueprint: ProductBlueprint, item: UiScreenshot, title_font, regular_font, small_font, metric_font) -> None:

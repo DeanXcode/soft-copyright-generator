@@ -9,7 +9,7 @@ import tempfile
 
 from .blueprint import ProductBlueprint
 from .models import GenerationTask
-from .sourcegen import read_source_lines
+from .sourcegen import read_source_line_entries, read_source_lines
 
 
 def ensure_docx_available() -> tuple[bool, str | None]:
@@ -33,7 +33,7 @@ def generate_manual_docx(
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.shared import Pt, RGBColor
 
-    path = output_dir / f"{task.software_name}.docx"
+    path = output_dir / f"{task.safe_name}.docx"
     document = Document()
     _set_default_font(document, "宋体", 10.5)
 
@@ -185,17 +185,21 @@ def generate_source_docx(task: GenerationTask, source_dir: Path, output_dir: Pat
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.shared import Pt
 
-    lines = [line for line in read_source_lines(source_dir) if line.strip()]
+    source_entries = [entry for entry in read_source_line_entries(source_dir) if str(entry.get("text", "")).strip()]
+    lines = [str(entry.get("text", "")) for entry in source_entries]
     lines_per_page = 50
-    pages = [lines[index : index + lines_per_page] for index in range(0, len(lines), lines_per_page)]
+    entry_pages = [source_entries[index : index + lines_per_page] for index in range(0, len(source_entries), lines_per_page)]
+    pages = [[str(entry.get("text", "")) for entry in page] for page in entry_pages]
     if len(pages) > 60:
         selected_pages = pages[:30] + pages[-30:]
+        selected_entry_pages = entry_pages[:30] + entry_pages[-30:]
         selection_mode = "first_30_last_30"
     else:
         selected_pages = pages
+        selected_entry_pages = entry_pages
         selection_mode = "all"
 
-    path = output_dir / f"{task.software_name}_代码-({task.language}).docx"
+    path = output_dir / f"{task.safe_name}_代码-({task.language}).docx"
     document = Document()
     _set_default_font(document, "宋体", 9)
     section = document.sections[0]
@@ -229,6 +233,7 @@ def generate_source_docx(task: GenerationTask, source_dir: Path, output_dir: Pat
         "source_selected_pages": len(selected_pages),
         "lines_per_page": lines_per_page,
         "selection_mode": selection_mode,
+        "source_page_sources": _source_page_sources(selected_entry_pages),
     }
     return path, report
 
@@ -272,8 +277,36 @@ def generate_checklist_docx(task: GenerationTask, output_dir: Path) -> Path:
     return path
 
 
+def _source_page_sources(entry_pages: list[list[dict]]) -> list[dict]:
+    page_sources: list[dict] = []
+    for page_index, entries in enumerate(entry_pages, start=1):
+        grouped: dict[str, list[int]] = {}
+        for entry in entries:
+            file_name = str(entry.get("file", ""))
+            line_number = int(entry.get("line") or 0)
+            if not file_name or not line_number:
+                continue
+            grouped.setdefault(file_name, []).append(line_number)
+        page_sources.append(
+            {
+                "page": page_index,
+                "line_count": len(entries),
+                "sources": [
+                    {
+                        "file": file_name,
+                        "start_line": min(line_numbers),
+                        "end_line": max(line_numbers),
+                        "line_count": len(line_numbers),
+                    }
+                    for file_name, line_numbers in sorted(grouped.items())
+                ],
+            }
+        )
+    return page_sources
+
+
 def generate_info_txt(task: GenerationTask, blueprint: ProductBlueprint, source_lines: int, output_dir: Path) -> Path:
-    path = output_dir / f"{task.software_name}.txt"
+    path = output_dir / f"{task.safe_name}.txt"
     text = "\n".join(
         [
             f"【软件全称】{task.software_name}",
@@ -330,6 +363,21 @@ def convert_to_pdf(docx_path: Path, output_dir: Path) -> tuple[Path | None, str 
     if completed.returncode != 0 or not pdf_path.exists():
         return None, completed.stderr.strip() or completed.stdout.strip() or "PDF 转换失败。"
     return pdf_path, None
+
+
+def pdf_converter_info() -> dict:
+    office = _find_office_binary()
+    if office:
+        return {
+            "method": "libreoffice",
+            "soffice_path": office,
+            "fallback": False,
+        }
+    return {
+        "method": "fallback-reportlab",
+        "soffice_path": "",
+        "fallback": True,
+    }
 
 
 def _find_office_binary() -> str | None:

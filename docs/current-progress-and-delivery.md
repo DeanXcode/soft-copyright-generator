@@ -216,7 +216,16 @@ start-desktop.bat
 - 已完成 C#/ASP.NET Core 前端入口验收，输出 `output-project-entry-local-review\源码项目前端入口回归系统-20260607-175846-2594`；原型同步到 `wwwroot\ui-prototype`，入口 URL 为 `http://127.0.0.1:5000/ui-prototype/index.html`，启动命令为 `dotnet run --urls http://127.0.0.1:5000`，`ui_project_served_index_exists: true`，`ui_screenshot_count: 9`，`source_total_lines: 7882`，`warnings: []`。该生成项目已执行 `dotnet build`，结果为 `0 个警告`、`0 个错误`。
 - 已完成 JavaScript/Express 和 Python/FastAPI 前端入口验收：JavaScript 输出 `output-project-entry-local-review\前端入口脚本验收系统-20260607-180403-8638`，启动命令 `npm install && npm start`；Python 输出 `output-project-entry-local-review\前端入口接口验收系统-20260607-180404-8147`，启动命令 `uvicorn app.main:app --host 127.0.0.1 --port 8080`。两者均为 `ui_project_served_index_exists: true`、`ui_screenshot_count: 9`、`source_line_target_met: true`、`warnings: []`。
 - 已新增 C# 生成项目真实服务截图模式：`scripts\run_screenshot_chain_review.py --project-server` 会启动生成出来的 ASP.NET Core 项目，再从 `http://127.0.0.1:{port}/ui-prototype/*.html` 截图；启动失败时回退本地文件截图并记录 warning。使用本地模板验收 `output-project-entry-local-review\源码项目前端入口回归系统-20260607-195104-3983` 通过，`ui_screenshot_render_mode: project-server`，`ui_screenshot_base_url: http://127.0.0.1:5000/ui-prototype`，`ui_project_server_started: true`，`ui_screenshot_count: 9`，`warnings: []`，总耗时 `42.93` 秒；验收结束后未残留 `dotnet` 进程，已视觉抽验 `dashboard.png` 正常。
-- 本阶段最新工程检查：`python-runtime\python.exe -m py_compile backend\generate_materials.py backend\softcopyright\generator.py backend\softcopyright\screenshots.py backend\softcopyright\sourcegen.py scripts\run_gpt_type_sampling.py backend\softcopyright\llm\provider.py backend\softcopyright\llm\trace.py backend\softcopyright\llm_blueprint.py backend\softcopyright\ui_blueprint.py backend\softcopyright\llm_manual.py` 通过，`node --check desktop\electron\main.cjs` 通过，`npm run build` 通过，`git diff --check` 仅提示仓库已有 LF/CRLF 换行转换警告。
+- 已新增材料真实性与规范性校验模块 `backend\softcopyright\validator.py`，完整生成后会输出内部 `validation_report.json`，记录源码文件清单和 SHA-256、产品蓝图 hash、交付文件 hash、ZIP 条目、占位符/乱码扫描、第三方源码目录风险、说明书/源码/截图/信息表业务命中情况，并把 `authenticity_score`、`normative_score`、`validation_ready_for_delivery`、`validation_finding_count`、`validation_source_hash`、`validation_zip_entries_match_deliverables` 等字段同步写入 `generation_report.json`。
+- 使用本地模板验证真实性/规范性校验链路：Java 样例 `output-validation-local-review\AuthenticityValidationSystem-20260609-102505-2660` 触发源码有效行数 `2961` 行未达 3000 行目标的硬性规范发现；C# 样例 `output-validation-local-review\NormativeAuthenticityAcceptanceSystem-20260609-102851-5097--材料包.zip` 通过，`source_total_lines: 3061`，`source_selected_pages: 60`，`authenticity_score: 97`，`normative_score: 100`，`validation_ready_for_delivery: true`，`validation_finding_count: 0`，最终 ZIP 仍为 5 个客户交付文件。
+- 桌面端结果明细已接入真实性/规范性校验展示：后端 `RESULT_JSON` 会返回 `validation` 摘要，Electron 透传到前端，结果明细新增 `真实性评分`、`规范性评分` 和 `交付建议`。使用本地模板验证 `output-validation-ui-review\UiValidationDisplayCheck-20260609-103646-6433--材料包.zip` 通过，`authenticity_score: 97`，`normative_score: 100`，`validation_ready_for_delivery: true`，`validation_finding_count: 0`。
+- 桌面端结果文件列表已加入内部 `validation_report.json` 打开入口；Electron 会把校验报告路径解析为绝对路径，前端在 ZIP 之后展示该报告，方便实施人员直接查看完整真实性/规范性证据链。
+- 已新增内部 `materials_manifest.json` 证据链清单：记录软件名、版本、语言、产品类型、seed、生成模式、产品蓝图 hash、源码文件清单/行数/hash、源码鉴别材料每页对应的真实源码文件和行号范围、说明书引用映射、PDF 转换信息，以及不含 API Key 的 LLM trace 摘要。Electron 会解析 `validation.manifest_path`，桌面端结果文件列表已提供 `materials_manifest.json` 打开入口；该文件不进入最终客户 ZIP。
+- 桌面端生成完成提示下方已新增交付状态条：当 `validation_ready_for_delivery=true` 时显示“校验通过，建议交付”，并展示真实性/规范性分数；当校验未通过时显示“需要复核后再交付”，优先展示 `validation_report.json` 中的前 3 条发现，避免实施人员只看到 ZIP 已生成而忽略硬性规范问题。
+- 已将 GPT 生成链路默认调整为“真实性优先”流水线：产品蓝图质量目标从 78 提升为默认 92，最多 5 轮尝试；真实性优先模式下不再接收低于目标分的次优蓝图；功能模块改为逐模块生成和逐模块质量检查，不合格时单模块修复；说明书正文改为逐章/逐模块生成；截图蓝图改为登录页、首页、各模块页、统计页逐页生成，并输出更细的进度提示。`generation_report.json` 会记录 `generation_quality_profile` 和 `blueprint_quality_target`，桌面端结果明细新增“生成策略”项。
+- 已新增 GPT 软件名称理解与自动业务补充：后端会在蓝图生成前调用 GPT，根据任意软件名称生成业务说明、关键词、目标用户和应避免方向；当业务补充为空或与软件名称领域不匹配时，会自动替换为 GPT 推断结果，GPT 不可用时回退本地规则。`generation_report.json` 会记录 `auto_feature_hint`、`feature_hint_profile`、`feature_hint_source`、`inferred_feature_hint` 和 `feature_hint_avoid_terms`。桌面端名称变化和“按名称自动匹配”按钮都会优先通过 `infer-feature-hint` 调用 GPT 推断，失败时才回退本地规则。
+- 使用本地模板验证新流水线兼容性：`output-authenticity-pipeline-review\AuthenticityFirstPipelineCheck-20260609-125419-6130--材料包.zip` 通过，`generation_quality_profile: authenticity-first`，`source_total_lines: 3061`，`source_selected_pages: 60`，`authenticity_score: 97`，`normative_score: 100`，`validation_ready_for_delivery: true`，`validation_finding_count: 0`，最终 ZIP 仍为 5 个客户交付文件。
+- 本阶段最新工程检查：`python -m py_compile backend\generate_materials.py backend\softcopyright\generator.py backend\softcopyright\validator.py backend\softcopyright\screenshots.py backend\softcopyright\sourcegen.py backend\softcopyright\llm\provider.py backend\softcopyright\llm\trace.py backend\softcopyright\llm_blueprint.py backend\softcopyright\ui_blueprint.py backend\softcopyright\llm_manual.py` 通过，`npm run build` 通过，`git diff --check` 仅提示仓库已有 LF/CRLF 换行转换警告。
 
 完整生成样例：
 
@@ -241,16 +250,16 @@ source_line_target_met: true
 
 1. Windows PowerShell inline / pipeline 传中文参数时可能把中文变成 `????`，长验证命令应使用 UTF-8 文件、JSON 配置、Node/Python 内部构造 Unicode 字符串，或使用 `\u...` 转义。
 2. 客户登录、充值、激活码绑定还没有产品化，目前通过 NewAPI token 配置实现。
-3. 客户预制安装包已内置 Python、Playwright、Chromium Headless Shell 和 LibreOffice，但还需要在一台无 Python/无 Node/无 LibreOffice 的干净 Windows 机器或虚拟机上做最终安装验收。
-4. 内置 LibreOffice 后安装包体积从约 366 MB 增至约 573 MB，安装解压时间明显变长；当前本机静默安装曾超过 4 分钟才完成，需要在客户目标机器上确认可接受。
-5. GPT 完整端到端已跑通，但真实接口耗时仍偏长；当前已明确优先保证生成内容质量，耗时可作为可接受成本。后续优化应先保证材料一致性不下降，再评估蓝图缓存、质量档位或人工启用低并发加速。
+3. 客户预制安装包已在客户环境验证通过；后续重点从安装可用性转为材料真实性、规范性和业务差异化。
+4. 内置 LibreOffice 后安装包体积从约 366 MB 增至约 573 MB，安装解压时间明显变长；客户已验证可用，但仍需在后续版本中关注包体体积和安装体验。
+5. GPT 完整端到端已跑通；当前策略明确以生成内容质量、真实性和材料一致性为第一优先，耗时不作为降级理由。
 6. 默认截图仍由 Playwright 直接截取源码工程内 `ui-prototype` HTML；C# 已支持可选启动生成项目后从真实服务 URL 截图。Java/JS/Python 的真实服务截图模式尚未接入。
-7. 真实 GPT 游戏单独抽样已跑通，但产品蓝图模块明细批次耗时偏长；当前以内容质量优先，后续如要提升体验，应在不降低材料一致性的前提下做蓝图缓存、可选低并发或游戏模块明细 prompt 瘦身。
+7. 真实 GPT 游戏单独抽样已跑通；后续优化必须以不降低材料真实性、一致性和可申请性为前提。
 
 ## 下一步建议
 
 优先级从高到低：
 
-1. 做干净 Windows 环境安装 NSIS 包验收，验证无 Python、无 Node、无 Chrome、无 LibreOffice 时也能生成材料、截图、Word/PDF 和 ZIP。
+1. 用真实 GPT/NewAPI 跑一组“真实性优先”端到端样例，重点观察逐模块、逐页生成后的蓝图质量分、真实性评分、规范性评分和截图/说明书/源码同源性。
 2. 继续扩展真实服务 URL 截图模式到 Java/Spring Boot；本机当前未安装 Maven，需先补 Maven 或使用可用的 Java 构建环境。
-3. 做 GPT 蓝图缓存/复用策略：保留质量优先默认值，同时减少同一软件反复验收时的 5-6 分钟等待和 token 消耗。
+3. 做 GPT 蓝图缓存/复用策略：只缓存已通过高质量阈值和真实性校验的蓝图，避免同一软件反复验收时引入低质量复用。

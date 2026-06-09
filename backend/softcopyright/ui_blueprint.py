@@ -78,6 +78,8 @@ def build_ui_blueprint(
 def _typed_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> UiBlueprint:
     if is_game_like(task, blueprint):
         return _game_ui_blueprint(task, blueprint)
+    if is_mobile_app_like(task, blueprint):
+        return _mobile_app_ui_blueprint(task, blueprint)
     return _admin_ui_blueprint(task, blueprint)
 
 
@@ -88,7 +90,7 @@ def _generate_ui_blueprint_with_llm(
     fallback: UiBlueprint,
     emit=None,
 ) -> UiBlueprint:
-    expected_renderer = "game" if is_game_like(task, blueprint) else "admin"
+    expected_renderer = _expected_renderer(task, blueprint)
     warnings: list[str] = []
     try:
         _emit(emit, 41, "生成界面风格")
@@ -107,11 +109,11 @@ def _generate_ui_blueprint_with_llm(
         warnings.append(f"模型界面风格生成失败，已沿用本地风格：{exc}")
 
     screens: list[dict[str, Any]] = []
-    batches = _screen_batches(fallback.screens, 3)
+    batches = _screen_batches(fallback.screens, 1 if _authenticity_first(task) else 3)
     screen_results: dict[int, list[dict[str, Any]]] = {}
 
     def run_batch(index: int, batch: list[UiScreenBlueprint]) -> list[dict[str, Any]]:
-        _emit(emit, 41 + index, f"生成截图蓝图 {index}/{len(batches)}")
+        _emit(emit, 41 + index, f"生成{_screen_batch_title(batch)}设计图 {index}/{len(batches)}")
         data = _chat_json(
             provider,
             [
@@ -124,9 +126,14 @@ def _generate_ui_blueprint_with_llm(
         batch_screens = data.get("screens")
         if not isinstance(batch_screens, list):
             raise ValueError("模型界面批次缺少 screens 数组")
-        return [item for item in batch_screens if isinstance(item, dict)]
+        screens = [item for item in batch_screens if isinstance(item, dict)]
+        if _authenticity_first(task):
+            reasons = _screen_batch_quality_reasons(screens, batch)
+            if reasons:
+                raise ValueError("界面蓝图质量不足：" + "；".join(reasons[:4]))
+        return screens
 
-    workers = _llm_batch_workers()
+    workers = 1 if _authenticity_first(task) else _llm_batch_workers()
     if workers <= 1 or len(batches) <= 1:
         for index, batch in enumerate(batches, start=1):
             try:
@@ -176,6 +183,59 @@ def _llm_batch_workers() -> int:
     return max(1, min(3, value))
 
 
+def _generation_quality_profile(task: GenerationTask) -> str:
+    value = os.getenv("SOFT_GENERATION_PROFILE", "").strip().lower()
+    if value in {"fast", "speed", "batch"}:
+        return "fast"
+    return "authenticity-first"
+
+
+def _authenticity_first(task: GenerationTask) -> bool:
+    return _generation_quality_profile(task) == "authenticity-first"
+
+
+def _screen_batch_title(batch: list[UiScreenBlueprint]) -> str:
+    if not batch:
+        return "界面"
+    screen = batch[0]
+    if screen.key == "login":
+        return "登录页"
+    if screen.key == "dashboard":
+        return "系统首页"
+    if screen.key == "statistics":
+        return "统计页"
+    return screen.title or screen.module_key or "模块页"
+
+
+def _screen_batch_quality_reasons(screens: list[dict[str, Any]], fallback_batch: list[UiScreenBlueprint]) -> list[str]:
+    reasons: list[str] = []
+    if len(screens) < len(fallback_batch):
+        reasons.append(f"截图数量不足，期望 {len(fallback_batch)} 张，实际 {len(screens)} 张")
+    by_key = {str(item.get("key") or "").strip(): item for item in screens if isinstance(item, dict)}
+    generic_terms = {"通用系统", "管理列表", "数据维护", "统计分析", "系统管理"}
+    for fallback in fallback_batch:
+        item = by_key.get(fallback.key)
+        if not item:
+            reasons.append(f"{fallback.key} 未按原 key 返回")
+            continue
+        title = str(item.get("title") or "").strip()
+        caption = str(item.get("caption") or "").strip()
+        components = [str(value).strip() for value in item.get("components") or [] if str(value).strip()]
+        sample_data = item.get("sample_data") if isinstance(item.get("sample_data"), dict) else {}
+        joined = " ".join([title, caption, " ".join(components), json.dumps(sample_data, ensure_ascii=False)])
+        if not title or title in generic_terms:
+            reasons.append(f"{fallback.key} 标题过于泛化")
+        if len(caption) < 28:
+            reasons.append(f"{fallback.key} 图注过短")
+        if len(components) < 4:
+            reasons.append(f"{fallback.key} 组件少于 4 个")
+        if len(sample_data) < 3:
+            reasons.append(f"{fallback.key} 样例数据少于 3 项")
+        if sum(1 for term in generic_terms if term in joined) >= 2:
+            reasons.append(f"{fallback.key} 存在泛化界面描述")
+    return reasons
+
+
 def _ui_system_prompt() -> str:
     return (
         "你是中文软件产品经理和 UI 信息架构专家。"
@@ -185,6 +245,28 @@ def _ui_system_prompt() -> str:
 
 
 def _build_ui_style_prompt(task: GenerationTask, blueprint: ProductBlueprint, expected_renderer: str) -> str:
+    if expected_renderer == "mobile_app":
+        renderer_note = _renderer_note(expected_renderer)
+        return f"""
+请为软著截图生成整体界面风格。只返回 JSON。
+软件名称：{task.software_name}
+软件类型：{task.product_type}
+本次行业子类型：{getattr(blueprint, "industry_subtype", "") or "未提供"}
+业务补充：{task.feature_hint or "无"}
+行业领域：{blueprint.industry}
+具体场景：{blueprint.scenario or "未提供"}
+产品定位：{blueprint.positioning or "未提供"}
+模块标题：{"、".join(module.title for module in blueprint.modules[:8])}
+本次界面设计 brief：{json.dumps(build_ui_design_brief(task, blueprint), ensure_ascii=False, indent=2)}
+
+强制要求：
+- renderer 必须为 "{expected_renderer}"
+- 风格应符合：{renderer_note}
+- visual_style 用中文短语，体现软件名称和真实业务领域，不要写通用风格
+
+返回 JSON：
+{{"renderer":"{expected_renderer}","visual_style":"中文短语"}}
+""".strip()
     renderer_note = (
         "手机游戏 9:16 竖屏界面，强调玩家、关卡、棋盘、道具、结算等游戏元素。"
         if expected_renderer == "game"
@@ -220,6 +302,30 @@ def _build_ui_screen_batch_prompt(
     expected_renderer: str,
     screens: list[UiScreenBlueprint],
 ) -> str:
+    if expected_renderer == "mobile_app":
+        return f"""
+请为本批软著说明书截图补齐内容。只返回 JSON。
+
+软件上下文：
+{_compact_ui_context(task, blueprint)}
+
+本次界面设计 brief：{json.dumps(build_ui_design_brief(task, blueprint), ensure_ascii=False, indent=2)}
+
+本批截图固定结构：{json.dumps(_screen_batch_payload(screens, blueprint), ensure_ascii=False, indent=2)}
+
+强制要求：
+- renderer 必须为 "{expected_renderer}"
+- 本批截图必须保持面向普通用户的手机 App 场景，不能出现后台侧边栏、审批流、表格台账、复核发布、工单看板或质量复盘。
+- 每个 screen 的 key、view_type、module_key 必须原样返回，不能新增或改名。
+- title/caption/components/sample_data 必须来自软件名称、用户任务、内容对象、交互动作和真实 App 页面。
+- caption 要像说明书图注，说明这张截图展示了什么用户功能。
+- components 返回 4-7 个具体 App 组件或内容区域。
+- sample_data 返回 3-6 个字段和值，字段必须有业务含义。
+- 禁止只写“通用系统、数据维护、管理列表、统计分析”。
+
+返回 JSON：
+{{"renderer":"{expected_renderer}","screens":[{{"key":"...","title":"...","caption":"...","view_type":"...","module_key":"...","components":["..."],"sample_data":{{"字段":"值"}}}}]}}
+""".strip()
     if expected_renderer == "game":
         renderer_note = "本批截图必须保持手机游戏场景，不能出现后台管理表格。"
     else:
@@ -556,6 +662,9 @@ def _normalize_view_type(renderer: str, key: str, value: str, fallback: str) -> 
     if renderer == "game":
         forced = {"login": "game_login", "dashboard": "game_home", "statistics": "game_statistics"}
         allowed = {"game_login", "game_home", "game_level", "game_board", "game_inventory", "game_statistics", "game_profile", "game_shop"}
+    elif renderer == "mobile_app":
+        forced = {"login": "mobile_login", "dashboard": "mobile_home", "statistics": "mobile_statistics"}
+        allowed = {"mobile_login", "mobile_home", "mobile_module", "mobile_search", "mobile_detail", "mobile_player", "mobile_profile", "mobile_statistics"}
     else:
         forced = {"login": "admin_login", "dashboard": "admin_dashboard", "statistics": "admin_statistics"}
         allowed = {"admin_login", "admin_dashboard", "admin_module", "admin_statistics"}
@@ -593,12 +702,58 @@ def _coerce_game_view_type(
     return view_type
 
 
+def _expected_renderer(task: GenerationTask, blueprint: ProductBlueprint) -> str:
+    if is_game_like(task, blueprint):
+        return "game"
+    if is_mobile_app_like(task, blueprint):
+        return "mobile_app"
+    return "admin"
+
+
+def _renderer_note(renderer: str) -> str:
+    if renderer == "game":
+        return "手机游戏 9:16 竖屏界面，强调玩家、关卡、棋盘、道具、结算等游戏元素。"
+    if renderer == "mobile_app":
+        return "面向普通用户的手机 App 9:16 竖屏界面，强调首页内容、搜索、详情、播放/使用/收藏、个人中心等真实用户操作。"
+    return "桌面业务系统界面，强调业务看板、表格列表、筛选、流程状态和统计报表。"
+
+
 def is_game_like(task: GenerationTask, blueprint: ProductBlueprint) -> bool:
     if task.product_type == "游戏软件":
         return True
     text = " ".join([task.software_name, task.product_type, task.feature_hint])
     keywords = ["游戏", "消除", "点消", "关卡", "棋盘", "步数", "道具", "玩家", "星级", "得分", "连消"]
     return any(keyword in text for keyword in keywords)
+
+
+def is_mobile_app_like(task: GenerationTask, blueprint: ProductBlueprint) -> bool:
+    if task.product_type.upper() in {"APP", "MOBILE", "ANDROID", "IOS"}:
+        return True
+    text = " ".join(
+        [
+            task.software_name,
+            task.product_type,
+            task.feature_hint,
+            blueprint.industry,
+            blueprint.scenario,
+            blueprint.positioning,
+            " ".join(blueprint.target_users or []),
+            " ".join(module.title for module in blueprint.modules[:10]),
+            " ".join(module.description for module in blueprint.modules[:10]),
+        ]
+    )
+    consumer_terms = [
+        "听歌", "音乐", "歌曲", "歌单", "播放器", "歌词", "歌手", "专辑", "电台", "音质",
+        "阅读", "听书", "小说", "书架", "书城", "章节", "朗读",
+        "短视频", "相册", "拍照", "修图", "剪辑", "滤镜",
+        "健身", "打卡", "运动", "课程", "食谱", "睡眠",
+        "日记", "记账", "清单", "便签", "天气", "闹钟",
+        "外卖", "商城", "购物", "会员", "收藏", "推荐", "搜索", "播放", "下载", "离线",
+    ]
+    admin_terms = ["后台", "管理系统", "OA", "ERP", "CRM", "工单", "审批", "审核", "复核", "风控", "库存", "仓储", "调度", "监管"]
+    if any(term in text for term in consumer_terms):
+        return not any(term in task.software_name for term in admin_terms[:4])
+    return False
 
 
 def ui_matches_software_type(task: GenerationTask, blueprint: ProductBlueprint, ui_blueprint: UiBlueprint) -> bool:
@@ -617,6 +772,22 @@ def ui_matches_software_type(task: GenerationTask, blueprint: ProductBlueprint, 
             and view_types.issubset(allowed)
             and bool(view_types & required_any)
             and any(keyword in text for keyword in domain_keywords)
+        )
+
+    if is_mobile_app_like(task, blueprint):
+        allowed = {"mobile_login", "mobile_home", "mobile_module", "mobile_search", "mobile_detail", "mobile_player", "mobile_profile", "mobile_statistics"}
+        view_types = {screen.view_type for screen in ui_blueprint.screens}
+        text = " ".join(
+            [ui_blueprint.visual_style]
+            + [screen.title + screen.caption + " ".join(screen.components) for screen in ui_blueprint.screens]
+        )
+        forbidden = ["审核", "复核", "工单", "审批", "风控", "台账", "后台", "批量输出", "质量复盘"]
+        return (
+            ui_blueprint.renderer == "mobile_app"
+            and bool(view_types)
+            and view_types.issubset(allowed)
+            and not any(view_type.startswith("admin_") or view_type.startswith("game_") for view_type in view_types)
+            and not any(term in text for term in forbidden)
         )
 
     view_types = {screen.view_type for screen in ui_blueprint.screens}
@@ -668,6 +839,90 @@ def _game_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> UiB
     )
     visual_style = str(design_brief.get("visual_mood") or "bright-casual-game")
     return UiBlueprint(renderer="game", visual_style=visual_style, screens=screens, design_brief=design_brief)
+
+
+def _mobile_app_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> UiBlueprint:
+    design_brief = build_ui_design_brief(task, blueprint)
+    screens = [
+        UiScreenBlueprint(
+            key="login",
+            title=f"{task.software_name}登录界面",
+            caption="用户通过手机号、验证码或第三方账号进入应用，完成个人服务入口初始化。",
+            view_type="mobile_login",
+            components=["应用标识", "手机号输入", "验证码登录", "隐私协议", "快速体验入口"],
+            sample_data={"登录方式": "手机号验证码", "状态": "可进入应用"},
+        ),
+        UiScreenBlueprint(
+            key="dashboard",
+            title=f"{task.software_name}首页",
+            caption="首页根据软件名称和业务场景展示推荐内容、常用功能入口、搜索入口和个人使用进度。",
+            view_type="mobile_home",
+            components=["顶部搜索", "推荐内容", "快捷入口", "最近使用", "底部导航"],
+            sample_data={"推荐": blueprint.modules[0].title if blueprint.modules else task.software_name, "入口": "首页"},
+        ),
+    ]
+    for module in blueprint.modules[:6]:
+        view_type = _mobile_module_view_type(module)
+        screens.append(
+            UiScreenBlueprint(
+                key=_module_screen_key(module.key),
+                title=module.title,
+                caption=module.description,
+                view_type=view_type,
+                module_key=module.key,
+                components=_mobile_components_for_module(module, view_type),
+                sample_data=_mobile_sample_data(task, module, view_type),
+            )
+        )
+    screens.append(
+        UiScreenBlueprint(
+            key="statistics",
+            title=f"{task.software_name}个人中心界面",
+            caption="个人中心展示用户资料、收藏记录、使用历史、会员权益和应用设置。",
+            view_type="mobile_profile",
+            components=["用户资料", "收藏记录", "使用历史", "会员权益", "应用设置"],
+            sample_data={"收藏": "28项", "最近使用": "12次", "会员": "有效"},
+        )
+    )
+    visual_style = str(design_brief.get("visual_mood") or "mobile-consumer-app")
+    return UiBlueprint(renderer="mobile_app", visual_style=visual_style, screens=screens, design_brief=design_brief)
+
+
+def _mobile_module_view_type(module) -> str:
+    text = f"{module.key} {module.title} {module.description} {' '.join(module.operations)} {' '.join(module.pages)}"
+    if any(term in text for term in ["播放", "听歌", "音乐", "歌曲", "听书", "朗读", "视频", "音频"]):
+        return "mobile_player"
+    if any(term in text for term in ["搜索", "检索", "查找", "发现"]):
+        return "mobile_search"
+    if any(term in text for term in ["详情", "章节", "专辑", "课程", "商品", "内容"]):
+        return "mobile_detail"
+    if any(term in text for term in ["我的", "个人", "会员", "收藏", "下载", "缓存", "记录"]):
+        return "mobile_profile"
+    return "mobile_module"
+
+
+def _mobile_components_for_module(module, view_type: str) -> list[str]:
+    if view_type == "mobile_player":
+        return ["内容封面", "标题信息", "播放控制", "进度条", "收藏下载", "相关推荐"]
+    if view_type == "mobile_search":
+        return ["搜索框", "筛选标签", "结果列表", "历史记录", "热门推荐"]
+    if view_type == "mobile_detail":
+        return ["详情封面", "简介信息", "目录列表", "主操作按钮", "用户收藏"]
+    if view_type == "mobile_profile":
+        return ["用户资料", "收藏列表", "下载缓存", "会员权益", "设置入口"]
+    return ["内容列表", "分类标签", "操作按钮", "状态提示", "底部导航"]
+
+
+def _mobile_sample_data(task: GenerationTask, module, view_type: str) -> dict[str, Any]:
+    if view_type == "mobile_player":
+        return {"当前内容": module.title, "播放进度": "03:28 / 04:52", "播放状态": "播放中", "收藏": "已收藏"}
+    if view_type == "mobile_search":
+        return {"关键词": task.software_name.replace("软件", ""), "结果数": "36", "排序": "综合推荐"}
+    if view_type == "mobile_detail":
+        return {"内容名称": module.title, "更新状态": "已同步", "用户操作": "继续使用"}
+    if view_type == "mobile_profile":
+        return {"收藏数量": "28", "下载缓存": "12项", "会员状态": "有效"}
+    return {"模块": module.title, "状态": "可用", "最近使用": "今天"}
 
 
 def _admin_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> UiBlueprint:
