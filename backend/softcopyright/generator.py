@@ -5,6 +5,7 @@ import shutil
 import time
 import json
 
+from .architecture import select_technical_architecture
 from .blueprint import generate_blueprint
 from .docgen import (
     convert_to_pdf,
@@ -16,6 +17,7 @@ from .docgen import (
 )
 from .feature_inference import harmonize_feature_hint
 from .llm_blueprint import generate_blueprint_with_llm
+from .llm.provider import LocalTemplateProvider
 from .llm_manual import generate_manual_content_with_llm
 from .models import GenerationTask
 from .packager import make_zip_files, write_json
@@ -46,9 +48,15 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         task.product_type,
         task.feature_hint,
         provider=llm_provider,
+        require_llm=bool(llm_provider and not isinstance(llm_provider, LocalTemplateProvider)),
+        min_blueprint_modules=8 if llm_provider and not isinstance(llm_provider, LocalTemplateProvider) else 0,
     )
     task.feature_hint = feature_hint
     setattr(task, "semantic_contract", feature_hint_meta)
+    if llm_provider and not isinstance(llm_provider, LocalTemplateProvider):
+        contract_modules = feature_hint_meta.get("feature_hint_blueprint_modules")
+        if not isinstance(contract_modules, list) or len(contract_modules) < 8:
+            raise RuntimeError("GPT 名称理解未生成合格模块蓝图，请重试；需要至少 8 个完整业务模块。")
 
     send("prepare", 5, "准备输出目录")
     output_dir = task.output_dir
@@ -89,10 +97,34 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         blueprint_source = "llm"
     else:
         blueprint = generate_blueprint(task)
+    architecture = select_technical_architecture(task, blueprint)
+    task.language = architecture.source_language
+    blueprint.language = architecture.source_language
+    blueprint.dev_environment = architecture.dev_environment
+    blueprint.runtime_environment = architecture.runtime_environment
+    blueprint.technical_architecture = architecture.to_dict()
+    blueprint.technical_features = _merge_unique(
+        [
+            f"采用{architecture.name}",
+            f"源码工程包含{'、'.join(architecture.languages)}等语言模块",
+            f"技术栈包含{'、'.join(architecture.stack[:5])}",
+        ],
+        list(blueprint.technical_features or []),
+    )
+    if not blueprint.deployment_topology:
+        blueprint.deployment_topology = (
+            f"{architecture.name}部署在{architecture.runtime_environment.get('os', '目标运行环境')}，"
+            f"依赖{architecture.runtime_environment.get('support', '运行支撑组件')}。"
+        )
     mark("blueprint")
+    report["task"] = task.to_dict()
     report["blueprint"] = blueprint.to_dict()
+    report["technical_architecture"] = architecture.to_dict()
     report["blueprint_source"] = blueprint_source
     report["checks"]["blueprint_source"] = blueprint_source
+    report["checks"]["software_category"] = task.software_category
+    report["checks"]["technical_architecture"] = architecture.name
+    report["checks"]["source_language"] = architecture.source_language
     report["checks"]["blueprint_quality_score"] = blueprint.quality_score
     report["checks"]["blueprint_fingerprint"] = blueprint.generation_fingerprint
     report["checks"]["blueprint_business_object_count"] = len(blueprint.business_objects)
@@ -413,6 +445,15 @@ def _emit_source_page_events(send, source_report: dict, output_dir: Path) -> Non
             file_path=file_name,
             material_type="源码鉴别材料",
         )
+
+
+def _merge_unique(primary: list[str], secondary: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in primary + secondary:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def _emit_screenshot_events(send, ui_screenshots: dict, output_dir: Path) -> None:

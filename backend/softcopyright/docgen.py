@@ -64,7 +64,7 @@ def generate_manual_docx(
             blueprint.summary,
             blueprint.positioning or f"本软件面向{blueprint.industry}场景，重点解决业务数据分散、处理流程不统一、运行状态缺少跟踪、统计分析依赖人工汇总等问题。",
             f"系统具体服务于{blueprint.scenario or blueprint.industry}，围绕{_join_items(blueprint.business_objects[:8]) or '核心业务对象'}完成登记、校验、处理、统计和归档。",
-            f"系统采用{task.language}进行主要功能开发，通过模块化设计完成{_join_items(blueprint.technical_features[:4]) or '用户操作、业务处理、数据查询、统计分析和权限审计'}等能力。",
+            f"系统采用{_architecture_name(blueprint)}，源码工程包含{task.language}等语言模块，通过模块化设计完成{_join_items(blueprint.technical_features[:4]) or '用户操作、业务处理、数据查询、统计分析和权限审计'}等能力。",
             f"产品方案内置{_workflow_summary(blueprint)}，确保说明书、源码工程和界面截图围绕同一业务闭环生成。",
             f"系统关注{_join_items(blueprint.report_metrics[:6]) or '新增记录数、待办数量、完成率和异常预警数'}等统计指标，便于管理人员掌握运行结果。",
         ],
@@ -85,7 +85,9 @@ def generate_manual_docx(
         ("运行硬件环境", blueprint.runtime_environment["hardware"]),
         ("运行操作系统", blueprint.runtime_environment["os"]),
         ("运行支撑环境", blueprint.runtime_environment["support"]),
+        ("软件分类", task.software_category),
         ("编程语言", task.language),
+        ("技术架构", _architecture_name(blueprint)),
         ("软件技术特点", task.product_type),
         ("业务部署拓扑", blueprint.deployment_topology or "客户端访问业务服务，服务端完成数据处理、权限控制和文件导出。"),
     ]
@@ -199,7 +201,7 @@ def generate_source_docx(task: GenerationTask, source_dir: Path, output_dir: Pat
         selected_entry_pages = entry_pages
         selection_mode = "all"
 
-    path = output_dir / f"{task.safe_name}_代码-({task.language}).docx"
+    path = output_dir / f"{task.safe_name}_代码-({_safe_file_label(task.language)}).docx"
     document = Document()
     _set_default_font(document, "宋体", 9)
     section = document.sections[0]
@@ -311,7 +313,7 @@ def generate_info_txt(task: GenerationTask, blueprint: ProductBlueprint, source_
         [
             f"【软件全称】{task.software_name}",
             f"【版本号】{task.version}",
-            "【软件分类】应用软件",
+            f"【软件分类】{task.software_category}",
             f"【开发的硬件环境】{blueprint.dev_environment['hardware']}",
             f"【运行的硬件环境】{blueprint.runtime_environment['hardware']}",
             f"【开发该软件的操作系统】{blueprint.dev_environment['os']}",
@@ -323,7 +325,7 @@ def generate_info_txt(task: GenerationTask, blueprint: ProductBlueprint, source_
             f"【开发目的】{blueprint.purpose}",
             f"【面向领域/行业】{blueprint.industry}",
             f"【软件的主要功能】{blueprint.summary}{_module_summary(blueprint)}软件具体场景为{blueprint.scenario or blueprint.industry}，核心业务对象包括{_join_items(blueprint.business_objects[:8])}。",
-            f"【软件的技术特点】{task.product_type}。{_join_items(blueprint.technical_features[:6]) or '系统采用模块化结构，界面、业务逻辑、数据模型和日志审计相互配合，具有良好的可维护性和扩展性。'}",
+            f"【软件的技术特点】{task.product_type}。{_architecture_name(blueprint)}，{_join_items(blueprint.technical_features[:6]) or '系统采用模块化结构，界面、业务逻辑、数据模型和日志审计相互配合，具有良好的可维护性和扩展性。'}",
             "",
         ]
     )
@@ -701,6 +703,15 @@ def _module_summary(blueprint: ProductBlueprint) -> str:
 
 def _join_items(items: list[str]) -> str:
     return "、".join(str(item) for item in items if str(item).strip())
+
+
+def _architecture_name(blueprint: ProductBlueprint) -> str:
+    architecture = getattr(blueprint, "technical_architecture", {}) or {}
+    return str(architecture.get("name") or "自动选择技术架构")
+
+
+def _safe_file_label(value: str) -> str:
+    return re.sub(r"[\\/:*?\"<>|]+", "_", str(value or "source")).strip() or "source"
 
 
 def _workflow_summary(blueprint: ProductBlueprint) -> str:

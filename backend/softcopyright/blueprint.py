@@ -49,6 +49,7 @@ class ProductBlueprint:
     quality_score: int = 0
     industry_subtype_key: str = ""
     industry_subtype: str = ""
+    technical_architecture: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -79,6 +80,7 @@ class ProductBlueprint:
             "quality_score": self.quality_score,
             "industry_subtype_key": self.industry_subtype_key,
             "industry_subtype": self.industry_subtype,
+            "technical_architecture": self.technical_architecture,
         }
 
 
@@ -437,8 +439,9 @@ def _report_metrics(modules: list[FeatureModule]) -> list[str]:
 
 
 def _technical_features(task: GenerationTask) -> list[str]:
+    language = task.language if task.language != "自动选择" else "自动选择的多语言技术架构"
     return [
-        f"采用{task.language}实现分层业务模块",
+        f"采用{language}实现分层业务模块",
         "支持角色权限、操作日志和数据范围控制",
         "支持条件查询、分页列表、状态流转和报表导出",
         "支持运行环境参数化配置和模块化扩展",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 import time
 from typing import Any
@@ -70,6 +71,7 @@ class OpenAICompatibleProvider(LLMProvider):
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "stream": True,
         }
         if response_format:
             payload["response_format"] = response_format
@@ -95,10 +97,11 @@ class OpenAICompatibleProvider(LLMProvider):
                 response_format=bool(response_format),
             )
             try:
-                response = requests.post(url, json=payload, headers=headers, timeout=self.config.timeout)
+                response = requests.post(url, json=payload, headers=headers, timeout=self.config.timeout, stream=True)
                 response.raise_for_status()
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
+                content = _extract_chat_content(response)
+                if not content:
+                    raise ValueError("LLM response content is empty")
                 trace_event(
                     "provider_request_success",
                     label=trace_label,
@@ -156,4 +159,63 @@ def _with_default(config: LLMConfig, base_url: str) -> LLMConfig:
         timeout=config.timeout,
         retry_count=config.retry_count,
     )
+
+
+def _extract_chat_content(response: requests.Response) -> str:
+    content_type = str(response.headers.get("content-type", "")).lower()
+    if "text/event-stream" in content_type:
+        return _extract_sse_content(response)
+    data = response.json()
+    return _extract_message_content(data)
+
+
+def _extract_sse_content(response: requests.Response) -> str:
+    pieces: list[str] = []
+    for raw_line in response.iter_lines(decode_unicode=False):
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", errors="replace").strip()
+        else:
+            line = str(raw_line or "").strip()
+        if not line:
+            continue
+        if line.startswith("data:"):
+            data_text = line[5:].strip()
+            if not data_text or data_text == "[DONE]":
+                if data_text == "[DONE]":
+                    break
+                continue
+            try:
+                chunk = json.loads(data_text)
+            except json.JSONDecodeError:
+                continue
+            piece = _extract_message_content(chunk, allow_delta=True)
+            if piece:
+                pieces.append(piece)
+    return "".join(pieces)
+
+
+def _extract_message_content(data: Any, allow_delta: bool = False) -> str:
+    if not isinstance(data, dict):
+        return ""
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return ""
+    message = choice.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+    if allow_delta:
+        delta = choice.get("delta")
+        if isinstance(delta, dict):
+            content = delta.get("content")
+            if isinstance(content, str):
+                return content
+    content = choice.get("content")
+    if isinstance(content, str):
+        return content
+    return ""
 

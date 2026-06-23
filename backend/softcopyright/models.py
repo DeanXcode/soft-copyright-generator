@@ -6,8 +6,11 @@ from pathlib import Path
 import random
 import re
 
+from .architecture import SOFTWARE_CATEGORIES, normalize_software_category
+
 
 SUPPORTED_LANGUAGES = [
+    "自动选择",
     "Java",
     "JavaScript",
     "Python",
@@ -55,8 +58,9 @@ def make_seed() -> str:
 class GenerationTask:
     software_name: str
     version: str = "V1.0"
-    language: str = "Java"
+    language: str = "自动选择"
     product_type: str = "智慧城市软件"
+    software_category: str = "应用软件"
     feature_hint: str = ""
     model_provider: str = "local-template"
     model_name: str = "template-v1"
@@ -79,6 +83,7 @@ class GenerationTask:
         return self.output_root / self.task_id
 
     def to_dict(self) -> dict:
+        self.software_category = normalize_software_category(self.software_category)
         data = asdict(self)
         data["output_root"] = str(self.output_root)
         data["output_dir"] = str(self.output_dir)

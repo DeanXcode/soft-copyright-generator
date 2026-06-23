@@ -7,15 +7,16 @@ import sys
 
 from softcopyright.generator import generate_materials
 from softcopyright.llm.provider import build_provider, config_from_env
-from softcopyright.models import GenerationTask, PRODUCT_TYPES, SUPPORTED_LANGUAGES
+from softcopyright.models import GenerationTask, PRODUCT_TYPES, SOFTWARE_CATEGORIES, SUPPORTED_LANGUAGES
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="软著材料一键生成原型")
     parser.add_argument("--name", required=True, help="软件全称")
     parser.add_argument("--version", default="V1.0", help="版本号")
-    parser.add_argument("--language", default="Java", choices=SUPPORTED_LANGUAGES, help="编程语言")
+    parser.add_argument("--language", default="自动选择", choices=SUPPORTED_LANGUAGES, help="编程语言；默认按软件名称和类型自动选择技术架构")
     parser.add_argument("--product-type", default="智慧城市软件", choices=PRODUCT_TYPES, help="产品类型/技术特点")
+    parser.add_argument("--software-category", default="应用软件", choices=SOFTWARE_CATEGORIES, help="软件分类大类")
     parser.add_argument("--feature-hint", default="", help="100字以内业务补充说明")
     parser.add_argument("--model-provider", default="local-template", help="模型供应商")
     parser.add_argument("--model-name", default="template-v1", help="模型名称")
@@ -34,6 +35,7 @@ def main() -> int:
         version=args.version,
         language=args.language,
         product_type=args.product_type,
+        software_category=args.software_category,
         feature_hint=args.feature_hint,
         model_provider=args.model_provider,
         model_name=args.model_name,
@@ -70,6 +72,7 @@ def main() -> int:
                 "validation": report.get("validation", {}),
                 "blueprint_source": report.get("blueprint_source", "local-template"),
                 "manual_source": report.get("manual_source", "local-template"),
+                "technical_architecture": report.get("technical_architecture", {}),
                 "seed": report["task"].get("seed", ""),
                 "randomness": report["task"].get("randomness", ""),
                 "feature_hint": report["task"].get("feature_hint", ""),

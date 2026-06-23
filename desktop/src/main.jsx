@@ -22,7 +22,7 @@ import {
 } from "lucide-react";
 import "./styles.css";
 
-const supportedLanguages = ["Java", "JavaScript", "Python", "PHP", "C#", "C++", "HTML"];
+const softwareCategories = ["应用软件", "嵌入式软件", "中间件", "操作系统"];
 
 const productTypes = [
   "APP",
@@ -72,8 +72,9 @@ function App() {
   const [form, setForm] = useState({
     name: "",
     version: "V1.0",
-    language: "Java",
+    language: "自动选择",
     productType: "APP",
+    softwareCategory: "应用软件",
     featureHint: "",
     modelPlan: "gpt",
     modelProvider: "custom",
@@ -188,7 +189,7 @@ function App() {
       setInputText(value);
     }
     setForm((current) => ({ ...current, [key]: value }));
-    if (key === "name" || key === "productType") {
+    if (key === "name" || key === "productType" || key === "softwareCategory") {
       setOutlineState("empty");
       setBusinessPlan(createEmptyPlan());
       setFeatureHintMeta({});
@@ -735,7 +736,17 @@ function App() {
             </div>
             <div className="parameter-row">
               <label>
-                <span>软件类型</span>
+                <span>软件大类</span>
+                <select value={form.softwareCategory} onChange={(event) => updateField("softwareCategory", event.target.value)}>
+                  {softwareCategories.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>技术特点</span>
                 <select value={form.productType} onChange={(event) => updateField("productType", event.target.value)}>
                   {productTypes.map((item) => (
                     <option key={item} value={item}>
@@ -745,14 +756,8 @@ function App() {
                 </select>
               </label>
               <label>
-                <span>源码语言</span>
-                <select value={form.language} onChange={(event) => updateField("language", event.target.value)}>
-                  {supportedLanguages.map((item) => (
-                    <option key={item} value={item}>
-                      {item}
-                    </option>
-                  ))}
-                </select>
+                <span>源码架构</span>
+                <input value="自动选择技术架构，可多语言生成" readOnly />
               </label>
             </div>
           </>
@@ -1679,6 +1684,7 @@ function buildCommandPreview(form) {
     `  --version ${form.version}`,
     `  --language ${form.language}`,
     `  --product-type ${form.productType}`,
+    `  --software-category ${form.softwareCategory}`,
     `  --feature-hint "${form.featureHint}"`,
     `  --model-plan ${form.modelPlan}`,
     `  --model-provider ${form.modelProvider}`,
@@ -1740,6 +1746,12 @@ function buildQualityItems(result) {
       value: checks.generation_quality_profile === "authenticity-first" ? "真实性优先" : "快速批量",
       detail: `蓝图目标 ${checks.blueprint_quality_target || 78}，实际 ${checks.blueprint_quality_score || 0}`,
       state: checks.generation_quality_profile === "authenticity-first" ? "pass" : "warn"
+    },
+    {
+      label: "技术架构",
+      value: checks.technical_architecture || "自动选择",
+      detail: `${checks.software_category || "应用软件"} / ${checks.source_language || "多语言源码"}`,
+      state: checks.technical_architecture ? "pass" : "warn"
     },
     {
       label: "真实性评分",

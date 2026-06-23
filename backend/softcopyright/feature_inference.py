@@ -100,10 +100,26 @@ def harmonize_feature_hint(
     product_type: str,
     provided: str = "",
     provider: LLMProvider | None = None,
+    require_llm: bool = False,
+    min_blueprint_modules: int = 0,
 ) -> tuple[str, dict]:
-    llm_result = infer_feature_hint_with_llm(software_name, product_type, provided, provider)
+    llm_result = infer_feature_hint_with_llm(
+        software_name,
+        product_type,
+        provided,
+        provider,
+        min_blueprint_modules=min_blueprint_modules,
+    )
     if llm_result:
         return _harmonize_llm_result(provided, llm_result)
+    if require_llm:
+        return "", {
+            "auto_feature_hint": False,
+            "feature_hint_profile": "",
+            "feature_hint_source": "llm-failed",
+            "requires_gpt": True,
+            "original_feature_hint": _clean_hint(provided),
+        }
 
     inferred, profile_id = infer_feature_hint(software_name, product_type)
     provided = _clean_hint(provided)
@@ -139,6 +155,7 @@ def infer_feature_hint_with_llm(
     product_type: str = "",
     provided: str = "",
     provider: LLMProvider | None = None,
+    min_blueprint_modules: int = 0,
 ) -> dict[str, Any] | None:
     if provider is None or isinstance(provider, LocalTemplateProvider):
         return None
@@ -166,13 +183,13 @@ def infer_feature_hint_with_llm(
                 },
             ],
             temperature=0.25,
-            max_tokens=3600,
+            max_tokens=2400,
             response_format={"type": "json_object"},
             trace_label="feature_hint:infer",
         )
         data = _parse_json(content)
         result = _normalize_llm_result(data)
-        if result:
+        if result and _llm_result_meets_blueprint_floor(result, software_name, min_blueprint_modules):
             elapsed_seconds = round(time.perf_counter() - started_at, 3)
             result["elapsed_seconds"] = elapsed_seconds
             trace_event(
@@ -196,33 +213,25 @@ def infer_feature_hint_with_llm(
 
 def _build_llm_prompt(software_name: str, product_type: str, provided: str) -> str:
     return f"""
-请根据软件名称生成“名称理解契约”和“详细业务蓝图”，用于后续生成产品蓝图、源码工程、说明书和界面截图。
+请只返回 JSON，不要 Markdown。根据软件名称推断真实产品边界，并生成可用于软著材料的业务蓝图。
 
-软件全称：{software_name}
+软件名称：{software_name}
 产品类型：{product_type or "未提供"}
-用户已填业务补充：{_clean_hint(provided) or "未填写"}
+用户补充：{_clean_hint(provided) or "未填写"}
 
-任务：
-1. 识别该软件最可能的真实业务领域和目标用户。
-2. 输出 10-16 个适合软著材料的业务关键词/功能关键词。
-3. 如果用户已填业务补充与软件名称领域明显不一致，should_replace 返回 true。
-4. 输出 6-12 个应避免的偏离方向，防止后续模块跑到错误行业。
-5. 输出 8-12 个 blueprint_modules，作为用户可编辑的详细蓝图和后续正式材料的语义约束。
+硬性要求：
+1. blueprint_modules 必须 8-10 个，少于 8 个不合格。
+2. 模块必须覆盖不同业务环节，不能只重复软件名或只写“录入/查询/统计”。
+3. title 为 6-16 字具体功能名，禁止包含完整软件名称。
+4. 至少 4 个不同 category，例如建档、采集、监测、预警、建议、处置、统计、配置等。
+5. description 80-140 个中文字符，写清对象、动作、状态、校验点或输出。
+6. 禁止泛型模块：数据管理、业务处理、统计分析、系统设置、权限管理、核心模块。
+7. 如果名称包含“监测、建议、平台、系统”，要拆出对象/项目建档、采集接入、过程监测、阈值预警、建议生成、处置闭环、记录追溯、报表分析等环节。
+8. 每个模块需要直接给出后续软著材料可用的 key、entities、operations、data_fields、pages、rules，避免后续再次请求模型补模块明细。
 
-质量要求：
-- feature_hint 必须是中文短语，用顿号分隔，长度不超过 120 字。
-- 关键词必须像真实软件功能，例如阅读听书类应围绕书城、书架、章节、播放、阅读进度、收藏订阅、会员权益等。
-- 不要输出泛型词：数据管理、业务处理、统计分析、系统设置、权限管理。
-- 不要把其他行业的审核、风控、工单、复核、批量发布等模块套进不相关软件。
-- 如果软件名称很短，也要根据名称含义推断一个具体产品方向。
-- blueprint_modules 必须像完整项目计划：覆盖入口/浏览或创建、核心操作、详情/播放/编辑/下单/对局等主流程、记录或进度、个人/配置等真实必要模块。
-- 每个模块 description 写 80-140 个中文字符，说明服务对象、关键数据对象、用户动作、状态结果，禁止空泛重复。
-- category 要体现真实分类，例如“内容发现、核心交互、订单履约、对局规则、学习过程、账户权益”等；不要全部写“核心模块”。
-- data_objects、user_flow、screens 必须与模块标题一致，不能复制同一套通用词。
-
-返回 JSON：
+返回 JSON 结构：
 {{
-  "profile": "简短英文领域标识，如 reading_audio / office_oa / inventory / name_understood",
+  "profile": "简短英文领域标识",
   "domain": "中文领域短语",
   "target_users": ["目标用户1", "目标用户2"],
   "keywords": ["关键词1", "关键词2"],
@@ -230,12 +239,18 @@ def _build_llm_prompt(software_name: str, product_type: str, provided: str) -> s
   "avoid_terms": ["应避免方向1", "应避免方向2"],
   "blueprint_modules": [
     {{
+      "key": "lowercase_domain_key",
       "category": "模块分类",
       "title": "模块名称",
-      "description": "80-140字真实业务说明，说明该模块服务谁、处理什么对象、如何流转、输出什么状态或结果。",
+      "description": "80-140字真实业务说明，说明对象、动作、流转、校验点和输出。",
+      "entities": ["EnglishEntityRecord", "EnglishEntityTrace"],
+      "operations": ["具体操作1", "具体操作2", "具体操作3", "具体操作4", "具体操作5"],
+      "data_fields": ["业务字段1", "业务字段2", "业务字段3", "业务字段4", "业务字段5", "业务字段6"],
       "data_objects": ["关键数据对象1", "关键数据对象2"],
       "user_flow": ["用户步骤1", "用户步骤2", "用户步骤3"],
-      "screens": ["页面/界面1", "页面/界面2"]
+      "screens": ["页面/界面1", "页面/界面2"],
+      "pages": ["页面1", "页面2"],
+      "rules": ["校验/权限/状态规则1", "校验/权限/状态规则2", "校验/权限/状态规则3"]
     }}
   ],
   "should_replace": true,
@@ -319,9 +334,17 @@ def _normalize_blueprint_modules(value: Any) -> list[dict[str, Any]]:
             category = ""
         modules.append(
             {
+                "key": _safe_id(str(item.get("key") or item.get("id") or title)),
                 "category": category or "业务模块",
                 "title": title,
                 "description": description,
+                "entities": _clean_entities(item.get("entities"), 4),
+                "operations": _clean_list(item.get("operations") or item.get("actions"), 7, 28),
+                "data_fields": _clean_list(
+                    item.get("data_fields") or item.get("dataFields") or item.get("fields"),
+                    10,
+                    24,
+                ),
                 "data_objects": _clean_list(
                     item.get("data_objects") or item.get("dataObjects") or item.get("objects"),
                     6,
@@ -333,6 +356,8 @@ def _normalize_blueprint_modules(value: Any) -> list[dict[str, Any]]:
                     42,
                 ),
                 "screens": _clean_list(item.get("screens") or item.get("pages"), 5, 28),
+                "pages": _clean_list(item.get("pages") or item.get("screens"), 4, 28),
+                "rules": _clean_list(item.get("rules") or item.get("quality_rules") or item.get("qualityRules"), 5, 80),
             }
         )
         seen_titles.add(title)
@@ -340,6 +365,89 @@ def _normalize_blueprint_modules(value: Any) -> list[dict[str, Any]]:
         if len(modules) >= 12:
             break
     return modules
+
+
+def _llm_result_meets_blueprint_floor(result: dict[str, Any], software_name: str, min_count: int) -> bool:
+    modules = result.get("blueprint_modules") or []
+    if min_count and len(modules) < min_count:
+        trace_event(
+            "feature_hint_inference_rejected",
+            reason="blueprint_module_count_low",
+            expected=min_count,
+            actual=len(modules),
+        )
+        return False
+    if not modules:
+        return True
+
+    titles = [str(module.get("title") or "").strip() for module in modules]
+    generic_titles = sum(1 for title in titles if _is_generic_module_title(title, software_name))
+    if generic_titles > max(1, len(titles) // 4):
+        trace_event(
+            "feature_hint_inference_rejected",
+            reason="generic_module_titles",
+            generic_titles=generic_titles,
+            total=len(titles),
+        )
+        return False
+
+    categories = {str(module.get("category") or "").strip() for module in modules if str(module.get("category") or "").strip()}
+    if min_count >= 8 and len(categories) < 4:
+        trace_event(
+            "feature_hint_inference_rejected",
+            reason="category_diversity_low",
+            category_count=len(categories),
+        )
+        return False
+    if min_count >= 8:
+        weak_detail_count = 0
+        for module in modules:
+            operations = module.get("operations") if isinstance(module, dict) else []
+            data_fields = module.get("data_fields") if isinstance(module, dict) else []
+            pages = module.get("pages") if isinstance(module, dict) else []
+            rules = module.get("rules") if isinstance(module, dict) else []
+            if (
+                not isinstance(operations, list)
+                or len(operations) < 4
+                or not isinstance(data_fields, list)
+                or len(data_fields) < 5
+                or not isinstance(pages, list)
+                or len(pages) < 2
+                or not isinstance(rules, list)
+                or len(rules) < 2
+            ):
+                weak_detail_count += 1
+        if weak_detail_count:
+            trace_event(
+                "feature_hint_inference_rejected",
+                reason="blueprint_module_detail_incomplete",
+                weak_detail_count=weak_detail_count,
+                total=len(modules),
+            )
+            return False
+    return True
+
+
+def _is_generic_module_title(title: str, software_name: str) -> bool:
+    title = _clean_hint(title)
+    if not title:
+        return True
+    normalized_title = re.sub(r"\W+", "", title)
+    normalized_name = re.sub(r"\W+", "", _clean_hint(software_name))
+    if normalized_name and (normalized_name in normalized_title or normalized_title in normalized_name):
+        return True
+    generic_terms = {
+        "核心模块",
+        "业务处理",
+        "数据管理",
+        "统计分析",
+        "系统设置",
+        "权限管理",
+        "记录统计",
+    }
+    if title in generic_terms:
+        return True
+    return False
 
 
 def _keywords_from_modules(modules: list[dict[str, Any]]) -> list[str]:
@@ -423,6 +531,20 @@ def _clean_list(value: Any, max_count: int, limit: int) -> list[str]:
         text = _clean_hint(str(item))[:limit].strip(" 、,，")
         if text and text not in result:
             result.append(text)
+    return result
+
+
+def _clean_entities(value: Any, max_count: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value[:max_count]:
+        text = re.sub(r"[^a-zA-Z0-9]+", " ", str(item or "")).strip()
+        if not text:
+            continue
+        entity = "".join(part[:1].upper() + part[1:] for part in text.split() if part)
+        if entity and entity not in result:
+            result.append(entity[:40])
     return result
 
 

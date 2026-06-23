@@ -348,9 +348,11 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
     "--version",
     payload.version || "V1.0",
     "--language",
-    payload.language || "Java",
+    payload.language || "自动选择",
     "--product-type",
     payload.productType || "智慧城市软件",
+    "--software-category",
+    payload.softwareCategory || "应用软件",
     "--feature-hint",
     payload.featureHint || "",
     "--model-provider",
@@ -451,6 +453,7 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
         files,
         blueprintSource: parsed.blueprint_source || "gpt",
         manualSource: parsed.manual_source || "gpt",
+        technicalArchitecture: parsed.technical_architecture || {},
         featureHint: parsed.feature_hint || payload.featureHint || "",
         featureHintMeta: parsed.feature_hint_meta || {},
         seed: parsed.seed || "",
@@ -484,7 +487,14 @@ ipcMain.handle("infer-feature-hint", async (_event, payload) => {
     "--model-provider",
     modelPlan.provider || "custom",
     "--model-name",
-    modelPlan.modelName || payload.modelName || "gpt-4o-mini"
+    modelPlan.modelName || payload.modelName || "gpt-4o-mini",
+    "--timeout-seconds",
+    "75",
+    "--retry-count",
+    "0",
+    "--require-llm",
+    "--min-blueprint-modules",
+    "8"
   ];
   if (modelPlan.apiBaseUrl) {
     args.push("--api-base-url", modelPlan.apiBaseUrl);
@@ -494,6 +504,7 @@ ipcMain.handle("infer-feature-hint", async (_event, payload) => {
   }
 
   return new Promise((resolve) => {
+    let settled = false;
     const child = spawn(bundledPythonExecutable(), args, {
       cwd: app.isPackaged ? process.resourcesPath : rootDir,
       windowsHide: true,
@@ -510,7 +521,36 @@ ipcMain.handle("infer-feature-hint", async (_event, payload) => {
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString("utf8");
     });
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill();
+      resolve({
+        ok: false,
+        code: -2,
+        stderr,
+        message: "GPT 名称理解超时，请稍后重试或检查模型网关响应速度",
+        featureHint: "",
+        meta: { feature_hint_source: "llm-timeout", requires_gpt: true }
+      });
+    }, 90000);
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve({
+        ok: false,
+        code: -1,
+        stderr: stderr || String(error?.message || error),
+        message: "GPT 名称理解进程启动失败",
+        featureHint: "",
+        meta: { feature_hint_source: "llm-process-error", requires_gpt: true }
+      });
+    });
     child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
       const resultMatch = stdout.match(/RESULT_JSON:(\{.+\})/);
       let parsed = {};
       if (resultMatch) {
@@ -524,6 +564,10 @@ ipcMain.handle("infer-feature-hint", async (_event, payload) => {
         ok: code === 0 && Boolean(parsed.feature_hint),
         code,
         stderr,
+        message:
+          code === 0 && Boolean(parsed.feature_hint)
+            ? ""
+            : "GPT 名称理解未生成合格蓝图，请重试；要求至少 8 个不重复的业务模块",
         featureHint: parsed.feature_hint || "",
         meta: parsed.meta || {}
       });

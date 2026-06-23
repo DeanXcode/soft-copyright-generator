@@ -124,6 +124,9 @@ def _generate_core_plan(
     business_detail = _generate_business_details(task, provider, identity_plan, rejection_reasons)
     data = dict(identity_plan)
     data.update(business_detail)
+    contract_modules = _contract_blueprint_modules(task)
+    if contract_modules:
+        data["module_outline"] = _outline_from_contract_modules(contract_modules)
     if not isinstance(data.get("module_outline"), list) or len(data.get("module_outline", [])) < 6:
         data["module_outline"] = _module_outline_from_core(data)
     if not isinstance(data.get("pages"), list) or len(data.get("pages", [])) < 8:
@@ -180,6 +183,15 @@ def _generate_modules(
     rejection_reasons: list[str] | None = None,
     emit=None,
 ) -> dict[str, Any]:
+    contract_modules = _modules_from_contract(task, core_plan)
+    if contract_modules and not _module_batch_quality_reasons(task, contract_modules, expected_count=min(8, len(contract_modules))):
+        trace_event(
+            "blueprint_contract_modules_reused",
+            module_count=len(contract_modules),
+            titles=[str(item.get("title") or "") for item in contract_modules[:8]],
+        )
+        _emit(emit, 18, f"复用名称理解模块蓝图 {len(contract_modules[:8])} 个")
+        return {"modules": contract_modules[:8]}
     modules = _generate_module_batches(task, provider, core_plan, rejection_reasons, "", emit=emit)
     return {"modules": modules}
 
@@ -368,6 +380,222 @@ def _contract_blueprint_modules(task: GenerationTask) -> list[dict[str, Any]]:
         if isinstance(item, dict) and str(item.get("title") or "").strip():
             modules.append(item)
     return modules[:12]
+
+
+def _outline_from_contract_modules(modules: list[dict[str, Any]]) -> list[dict[str, str]]:
+    outline: list[dict[str, str]] = []
+    for index, item in enumerate(modules[:8], start=1):
+        title = _clean_text(str(item.get("title") or ""), 28)
+        if not title:
+            continue
+        category = _clean_text(str(item.get("category") or ""), 24)
+        description = _clean_text(str(item.get("description") or ""), 120)
+        outline.append(
+            {
+                "key": _contract_module_key(item, index),
+                "title": title,
+                "focus": description or f"围绕{title}组织{category or '业务'}处理、状态跟踪和结果输出",
+            }
+        )
+    return outline
+
+
+def _modules_from_contract(task: GenerationTask, core_plan: dict[str, Any]) -> list[dict[str, Any]]:
+    contract_modules = _contract_blueprint_modules(task)
+    if len(contract_modules) < 6:
+        return []
+    modules: list[dict[str, Any]] = []
+    for index, item in enumerate(contract_modules[:8], start=1):
+        title = _clean_text(str(item.get("title") or ""), 28)
+        if not title:
+            continue
+        category = _clean_text(str(item.get("category") or ""), 24)
+        data_objects = _clean_list(item.get("data_objects"), 6, 26)
+        user_flow = _clean_list(item.get("user_flow"), 6, 34)
+        screens = _clean_list(item.get("screens"), 5, 28)
+        key = _contract_module_key(item, index)
+        operations = _ensure_min_strings(
+            _clean_list(item.get("operations") or item.get("actions"), 7, 28),
+            _contract_operations(title, category, user_flow),
+            minimum=5,
+            limit=7,
+        )
+        data_fields = _ensure_min_strings(
+            _clean_list(item.get("data_fields") or item.get("dataFields") or item.get("fields"), 10, 24),
+            _contract_data_fields(title, category, data_objects),
+            minimum=7,
+            limit=10,
+        )
+        pages = _ensure_min_strings(
+            _clean_list(item.get("pages") or item.get("screens"), 4, 28),
+            _contract_pages(title, screens),
+            minimum=2,
+            limit=4,
+        )
+        rules = _ensure_min_strings(
+            _clean_list(item.get("rules") or item.get("quality_rules") or item.get("qualityRules"), 5, 80),
+            _contract_rules(title, category, data_objects, operations),
+            minimum=3,
+            limit=5,
+        )
+        entities = _ensure_min_strings(
+            [_safe_entity(_entity_name_from_item(entity)) for entity in (item.get("entities") or [])[:4] if _entity_name_from_item(entity)],
+            _contract_entities(key),
+            minimum=2,
+            limit=4,
+        )
+        modules.append(
+            {
+                "key": key,
+                "title": title,
+                "description": _contract_description(item, title, category, data_objects, operations, pages, core_plan),
+                "entities": entities,
+                "operations": operations,
+                "data_fields": data_fields,
+                "pages": pages,
+                "rules": rules,
+            }
+        )
+    return modules
+
+
+def _contract_module_key(item: dict[str, Any], index: int) -> str:
+    raw = str(item.get("key") or item.get("id") or "").strip()
+    key = _safe_key(raw)
+    generic = {"module", "business", "data", "manage", "management", "system", "common", "businessrecord"}
+    if not raw or key in generic or re.fullmatch(r"module_\d+", key or ""):
+        title = str(item.get("title") or item.get("category") or index)
+        digest = hashlib.md5(title.encode("utf-8", errors="ignore")).hexdigest()[:6]
+        key = f"semantic_{index:02d}_{digest}"
+    return key
+
+
+def _contract_operations(title: str, category: str, user_flow: list[str]) -> list[str]:
+    operations: list[str] = []
+    for step in user_flow:
+        cleaned = _operation_label(step)
+        if cleaned:
+            operations.append(cleaned)
+    seed = category or title
+    for action in _operation_templates_for(seed, title):
+        operations.append(action)
+    return _dedupe_strings(operations, 7)
+
+
+def _operation_label(value: str) -> str:
+    value = re.sub(r"^(用户|管理员|人员|系统|平台)?(进行|完成|执行|点击|进入|查看)?", "", value).strip(" ，,、。；;")
+    value = re.sub(r"(后|并|，|,|。|；|;).*$", "", value).strip()
+    return _clean_text(value, 28)
+
+
+def _operation_templates_for(seed: str, title: str) -> list[str]:
+    templates = [
+        ("建档", ["登记建档", "补全档案", "核对参数", "提交复核"]),
+        ("档案", ["登记建档", "补全档案", "核对参数", "变更留痕"]),
+        ("采集", ["采集接入", "样本校验", "记录同步", "异常标注"]),
+        ("接入", ["采集接入", "来源校验", "记录同步", "异常标注"]),
+        ("监测", ["实时监测", "阈值比对", "趋势复核", "异常标注"]),
+        ("温控", ["温度采集", "阈值比对", "曲线复核", "异常标注"]),
+        ("预警", ["阈值预警", "提醒生成", "处置确认", "反馈跟踪"]),
+        ("建议", ["建议生成", "规则匹配", "方案确认", "执行推送"]),
+        ("养护", ["养护建议生成", "执行确认", "效果记录", "复盘归档"]),
+        ("处置", ["处置派发", "反馈记录", "闭环确认", "复盘归档"]),
+        ("统计", ["汇总分析", "报表生成", "趋势对比", "摘要输出"]),
+        ("分析", ["汇总分析", "趋势对比", "指标钻取", "摘要输出"]),
+        ("配置", ["规则维护", "阈值配置", "策略启停", "变更记录"]),
+    ]
+    for marker, values in templates:
+        if marker in seed or marker in title:
+            return values
+    return [f"{seed}登记", f"{seed}校验", f"{title}跟踪", f"{title}确认"]
+
+
+def _contract_data_fields(title: str, category: str, data_objects: list[str]) -> list[str]:
+    fields: list[str] = []
+    for obj in data_objects[:3]:
+        fields.extend([f"{obj}编号", f"{obj}名称"])
+    seed = category or title
+    fields.extend(
+        [
+            f"{seed}来源",
+            f"{seed}状态",
+            "采集时间",
+            "责任人员",
+            "阈值等级",
+            "处理结论",
+            "更新时间",
+            "审计标记",
+        ]
+    )
+    return _dedupe_strings(fields, 10)
+
+
+def _contract_pages(title: str, screens: list[str]) -> list[str]:
+    pages = [screen if screen.endswith("页") or screen.endswith("界面") or screen.endswith("台") else f"{screen}页" for screen in screens]
+    pages.extend([f"{title}页", f"{title}明细页", f"{title}记录页"])
+    return _dedupe_strings(pages, 4)
+
+
+def _contract_rules(title: str, category: str, data_objects: list[str], operations: list[str]) -> list[str]:
+    subject = "、".join(data_objects[:2]) or title
+    action = operations[0] if operations else "业务操作"
+    seed = category or title
+    return [
+        f"{subject}执行{action}前必须校验来源、时间和责任人员完整性。",
+        f"{title}仅允许授权角色处理本人职责范围内的{seed}记录。",
+        f"{title}状态变更必须写入审计标记，并保留原始值、操作人和更新时间。",
+        f"{title}异常结果需进入复核或确认流程后才能形成最终输出。",
+    ]
+
+
+def _contract_entities(key: str) -> list[str]:
+    base = _entity_base_from_key(key) or "SemanticModule"
+    return [f"{base}Record", f"{base}Trace", f"{base}Rule"]
+
+
+def _contract_description(
+    item: dict[str, Any],
+    title: str,
+    category: str,
+    data_objects: list[str],
+    operations: list[str],
+    pages: list[str],
+    core_plan: dict[str, Any],
+) -> str:
+    original = _clean_text(str(item.get("description") or ""), 120)
+    object_text = "、".join(data_objects[:3]) or "业务对象"
+    operation_text = "、".join(operations[:4]) or "采集、校验、确认、输出"
+    page_text = "、".join(pages[:2]) or f"{title}页"
+    metric = ""
+    metrics = core_plan.get("report_metrics")
+    if isinstance(metrics, list) and metrics:
+        metric = f"，并为{str(metrics[(len(title) + len(category)) % len(metrics)])}提供统计口径"
+    supplement = (
+        f"模块围绕{object_text}开展{operation_text}，记录状态、责任人、阈值或处理结论，"
+        f"通过{page_text}形成可追溯的业务入口和输出结果{metric}。"
+    )
+    text = f"{original} {supplement}".strip()
+    if len(text) < 90:
+        text += f" 同时保留校验、权限、状态流转和审计信息，支撑后续说明书、源码实体和界面截图一致呈现。"
+    return _clean_text(text, 220)
+
+
+def _dedupe_strings(values: list[str], limit: int) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        cleaned = _clean_text(str(value or ""), 36).strip(" ，,、。；;")
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _ensure_min_strings(primary: list[str], fallback: list[str], *, minimum: int, limit: int) -> list[str]:
+    values = list(primary)
+    if len(values) < minimum:
+        values.extend(fallback)
+    return _dedupe_strings(values, limit)
 
 
 def _batch_title(batch: list[Any]) -> str:
@@ -633,7 +861,7 @@ def _build_core_prompt(task: GenerationTask, rejection_reasons: list[str] | None
 
 软件全称：{task.software_name}
 版本号：{task.version}
-编程语言：{task.language}
+技术架构要求：{getattr(task, "software_category", "应用软件")}，源码语言由系统根据产品蓝图自动选择，可多语言组合
 软件技术特点/产品类型：{task.product_type}
 业务补充：{task.feature_hint or "无"}
 随机差异要求：{task.randomness}
@@ -688,7 +916,7 @@ def _build_business_detail_prompt(
 请基于下面的软件身份定位，补齐软著材料需要的业务细节。只返回 JSON，不要返回 Markdown。
 
 软件全称：{task.software_name}
-编程语言：{task.language}
+技术架构要求：{getattr(task, "software_category", "应用软件")}，源码语言由系统根据产品蓝图自动选择，可多语言组合
 软件技术特点/产品类型：{task.product_type}
 业务补充：{task.feature_hint or "无"}
 {retry_note}
@@ -735,7 +963,7 @@ def _build_module_prompt(
 
 软件全称：{task.software_name}
 版本号：{task.version}
-编程语言：{task.language}
+技术架构要求：{getattr(task, "software_category", "应用软件")}，源码语言由系统根据产品蓝图自动选择，可多语言组合
 软件技术特点/产品类型：{task.product_type}
 业务补充：{task.feature_hint or "无"}
 {retry_note}
@@ -819,7 +1047,7 @@ def _build_module_repair_prompt(
 
 软件全称：{task.software_name}
 版本号：{task.version}
-编程语言：{task.language}
+技术架构要求：{getattr(task, "software_category", "应用软件")}，源码语言由系统根据产品蓝图自动选择，可多语言组合
 软件技术特点/产品类型：{task.product_type}
 业务补充：{task.feature_hint or "无"}
 

@@ -13,16 +13,35 @@ def generate_source_project(task: GenerationTask, blueprint: ProductBlueprint, o
     source_dir = output_dir / "generated_source"
     source_dir.mkdir(parents=True, exist_ok=True)
 
-    if task.language == "Java":
-        files = _generate_java_project(task, blueprint, source_dir)
+    architecture = getattr(blueprint, "technical_architecture", {}) or {}
+    source_strategy = str(architecture.get("source_strategy") or "").strip()
+    files: list[Path] = []
+    if source_strategy == "java_with_web_console":
+        files.extend(_generate_java_project(task, blueprint, source_dir))
+        files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
+    elif source_strategy == "javascript_with_java_api":
+        files.extend(_generate_javascript_project(task, blueprint, source_dir))
+        files.extend(_generate_java_project(task, blueprint, source_dir / "api-service", include_readme=False))
+    elif source_strategy == "python_with_web_console":
+        files.extend(_generate_python_project(task, blueprint, source_dir))
+        files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
+    elif source_strategy == "java_with_node_gateway":
+        files.extend(_generate_java_project(task, blueprint, source_dir))
+        files.extend(_generate_javascript_project(task, blueprint, source_dir / "gateway-service", include_readme=False))
+    elif source_strategy == "embedded_mixed":
+        files.extend(_generate_embedded_mixed_project(task, blueprint, source_dir))
+    elif source_strategy == "system_service_mixed":
+        files.extend(_generate_system_service_project(task, blueprint, source_dir))
+    elif task.language == "Java":
+        files.extend(_generate_java_project(task, blueprint, source_dir))
     elif task.language == "C#":
-        files = _generate_csharp_project(task, blueprint, source_dir)
+        files.extend(_generate_csharp_project(task, blueprint, source_dir))
     elif task.language == "Python":
-        files = _generate_python_project(task, blueprint, source_dir)
+        files.extend(_generate_python_project(task, blueprint, source_dir))
     elif task.language == "JavaScript":
-        files = _generate_javascript_project(task, blueprint, source_dir)
+        files.extend(_generate_javascript_project(task, blueprint, source_dir))
     else:
-        files = _generate_generic_project(task, blueprint, source_dir)
+        files.extend(_generate_generic_project(task, blueprint, source_dir))
 
     blueprint_path = _write(source_dir / "product-blueprint.json", json.dumps(blueprint.to_dict(), ensure_ascii=False, indent=2))
     files.append(blueprint_path)
@@ -33,6 +52,9 @@ def generate_source_project(task: GenerationTask, blueprint: ProductBlueprint, o
         "blueprint_path": str(blueprint_path),
         "module_keys": [module.key for module in blueprint.modules],
         "module_titles": [module.title for module in blueprint.modules],
+        "technical_architecture": architecture,
+        "source_language": architecture.get("source_language") or task.language,
+        "source_strategy": source_strategy or "language-single",
         "total_lines": total_lines,
     }
 
@@ -151,7 +173,7 @@ def _is_comment_only_source_line(line: str, suffix: str) -> bool:
     return False
 
 
-def _generate_java_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path) -> list[Path]:
+def _generate_java_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path, include_readme: bool = True) -> list[Path]:
     base = source_dir / "src" / "main"
     java_root = base / "java" / "com" / "copyright" / _package_token(task.software_name)
     resources = base / "resources"
@@ -256,7 +278,8 @@ software:
         files.extend(_java_module_files(java_root, mapper_dir, module, task, blueprint))
         files.extend(_java_support_files(java_root, module, task))
 
-    files.append(_write(source_dir / "README.md", _readme(task, blueprint)))
+    if include_readme:
+        files.append(_write(source_dir / "README.md", _readme(task, blueprint)))
     files.append(_write(resources / "schema.sql", _java_schema_sql(blueprint)))
     files = _ensure_line_target(files, java_root, task, blueprint, target_lines=3200)
     files = _align_source_material_pages(files, source_dir, java_root / "service", ".java")
@@ -911,12 +934,11 @@ create index idx_{module.key}_code on {module.key}_record(code);
     return "\n".join(blocks)
 
 
-def _generate_python_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path) -> list[Path]:
+def _generate_python_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path, include_readme: bool = True) -> list[Path]:
     app_dir = source_dir / "app"
     for folder in [app_dir / "routers", app_dir / "services", app_dir / "models", app_dir / "schemas", app_dir / "core"]:
         folder.mkdir(parents=True, exist_ok=True)
     files = [
-        _write(source_dir / "README.md", _readme(task, blueprint)),
         _write(source_dir / "requirements.txt", "fastapi\nuvicorn\npydantic\n"),
         _write(app_dir / "__init__.py", ""),
         _write(
@@ -940,6 +962,8 @@ def prototype_entry():
 ''',
         ),
     ]
+    if include_readme:
+        files.insert(0, _write(source_dir / "README.md", _readme(task, blueprint)))
     for module in blueprint.modules:
         token = _snake(module.key)
         title = module.title
@@ -1034,12 +1058,11 @@ def create_record(code: str, name: str, owner_role: str, description: str):
     return files
 
 
-def _generate_javascript_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path) -> list[Path]:
+def _generate_javascript_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path, include_readme: bool = True) -> list[Path]:
     src = source_dir / "src"
     for folder in [src / "routes", src / "services", src / "models", src / "middleware"]:
         folder.mkdir(parents=True, exist_ok=True)
     files = [
-        _write(source_dir / "README.md", _readme(task, blueprint)),
         _write(
             source_dir / "package.json",
             f'''{{
@@ -1078,6 +1101,8 @@ app.listen(8080, () => {{
 ''',
         ),
     ]
+    if include_readme:
+        files.insert(0, _write(source_dir / "README.md", _readme(task, blueprint)))
     for module in blueprint.modules:
         token = _snake(module.key)
         title = module.title
@@ -1186,7 +1211,143 @@ def _generate_generic_project(task: GenerationTask, blueprint: ProductBlueprint,
     return files
 
 
-def _generate_csharp_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path) -> list[Path]:
+def _generate_embedded_mixed_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path) -> list[Path]:
+    for folder in [source_dir / "firmware" / "src", source_dir / "firmware" / "include", source_dir / "edge" / "services", source_dir / "scripts", source_dir / "config"]:
+        folder.mkdir(parents=True, exist_ok=True)
+    files = [_write(source_dir / "README.md", _readme(task, blueprint))]
+    files.append(
+        _write(
+            source_dir / "CMakeLists.txt",
+            f"""cmake_minimum_required(VERSION 3.20)
+project({_ascii_token(task.software_name)}_embedded)
+set(CMAKE_CXX_STANDARD 17)
+add_executable(edge_monitor firmware/src/main.cpp firmware/src/device_driver.c)
+""",
+        )
+    )
+    files.append(
+        _write(
+            source_dir / "firmware" / "include" / "device_driver.h",
+            """#pragma once
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct SensorSample {
+    int channel;
+    double value;
+    long long timestamp;
+} SensorSample;
+int device_driver_open(const char* port_name);
+SensorSample device_driver_read(int channel);
+void device_driver_close(void);
+#ifdef __cplusplus
+}
+#endif
+""",
+        )
+    )
+    files.append(
+        _write(
+            source_dir / "firmware" / "src" / "device_driver.c",
+            f"""#include "../include/device_driver.h"
+#include <time.h>
+
+static const char* SOFTWARE_NAME = "{_c_literal(task.software_name)}";
+static int driver_ready = 0;
+
+int device_driver_open(const char* port_name) {{
+    (void)SOFTWARE_NAME;
+    (void)port_name;
+    driver_ready = 1;
+    return driver_ready;
+}}
+
+SensorSample device_driver_read(int channel) {{
+    SensorSample sample;
+    sample.channel = channel;
+    sample.value = 20.0 + channel;
+    sample.timestamp = (long long)time(0);
+    return sample;
+}}
+
+void device_driver_close(void) {{
+    driver_ready = 0;
+}}
+""",
+        )
+    )
+    files.append(
+        _write(
+            source_dir / "firmware" / "src" / "main.cpp",
+            _cpp_runtime_main(task, blueprint),
+        )
+    )
+    for module in blueprint.modules:
+        files.append(_write(source_dir / "firmware" / "src" / f"{_snake(module.key)}_service.cpp", _generic_source_content(task, module, ".cpp")))
+        files.append(_write(source_dir / "edge" / "services" / f"{_snake(module.key)}_worker.py", _python_edge_worker(task, module)))
+    files.append(_write(source_dir / "scripts" / "device_smoke_test.py", _python_device_smoke(task, blueprint)))
+    files.append(_write(source_dir / "scripts" / "start_edge_service.sh", _shell_start_script(task)))
+    files.append(_write(source_dir / "config" / "device-profile.yml", _device_profile_yaml(task, blueprint)))
+    files = _ensure_generic_line_target(files, source_dir / "edge" / "services", task, blueprint, target_lines=3200, extension=".py")
+    files = _align_source_material_pages(files, source_dir, source_dir / "edge" / "services", ".py")
+    return files
+
+
+def _generate_system_service_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path) -> list[Path]:
+    for folder in [source_dir / "system" / "src", source_dir / "system" / "include", source_dir / "admin_cli", source_dir / "scripts", source_dir / "config"]:
+        folder.mkdir(parents=True, exist_ok=True)
+    files = [_write(source_dir / "README.md", _readme(task, blueprint))]
+    files.append(
+        _write(
+            source_dir / "system" / "include" / "service_registry.h",
+            """#pragma once
+typedef struct ServiceStatus {
+    const char* name;
+    const char* state;
+    long long updated_at;
+} ServiceStatus;
+ServiceStatus registry_query(const char* service_name);
+int registry_update(const char* service_name, const char* state);
+""",
+        )
+    )
+    files.append(
+        _write(
+            source_dir / "system" / "src" / "service_registry.c",
+            f"""#include "../include/service_registry.h"
+#include <time.h>
+
+static const char* SOFTWARE_NAME = "{_c_literal(task.software_name)}";
+static const char* current_state = "RUNNING";
+
+ServiceStatus registry_query(const char* service_name) {{
+    ServiceStatus status;
+    status.name = service_name ? service_name : SOFTWARE_NAME;
+    status.state = current_state;
+    status.updated_at = (long long)time(0);
+    return status;
+}}
+
+int registry_update(const char* service_name, const char* state) {{
+    (void)service_name;
+    current_state = state ? state : "UNKNOWN";
+    return 1;
+}}
+""",
+        )
+    )
+    files.append(_write(source_dir / "system" / "src" / "daemon_main.cpp", _cpp_runtime_main(task, blueprint)))
+    for module in blueprint.modules:
+        files.append(_write(source_dir / "system" / "src" / f"{_snake(module.key)}_manager.cpp", _generic_source_content(task, module, ".cpp")))
+        files.append(_write(source_dir / "admin_cli" / f"{_snake(module.key)}_command.py", _python_edge_worker(task, module)))
+    files.append(_write(source_dir / "scripts" / "install_service.sh", _shell_start_script(task)))
+    files.append(_write(source_dir / "config" / "service-policy.yml", _device_profile_yaml(task, blueprint)))
+    files = _ensure_generic_line_target(files, source_dir / "admin_cli", task, blueprint, target_lines=3200, extension=".py")
+    files = _align_source_material_pages(files, source_dir, source_dir / "admin_cli", ".py")
+    return files
+
+
+def _generate_csharp_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path, include_readme: bool = True) -> list[Path]:
     root_namespace = _pascal(_ascii_token(task.software_name))
     src = source_dir / "src"
     for folder in [
@@ -1201,7 +1362,6 @@ def _generate_csharp_project(task: GenerationTask, blueprint: ProductBlueprint, 
         folder.mkdir(parents=True, exist_ok=True)
 
     files = [
-        _write(source_dir / "README.md", _readme(task, blueprint)),
         _write(
             source_dir / f"{root_namespace}.csproj",
             f"""<Project Sdk="Microsoft.NET.Sdk.Web">
@@ -1240,6 +1400,8 @@ app.Run();
 """,
         ),
     ]
+    if include_readme:
+        files.insert(0, _write(source_dir / "README.md", _readme(task, blueprint)))
     files.extend(_csharp_common_files(src, root_namespace, task, blueprint))
     for module in blueprint.modules:
         files.extend(_csharp_module_files(src, root_namespace, module))
@@ -1911,6 +2073,131 @@ class {_pascal(module.key)}Service {{
     )
 
 
+def _cpp_runtime_main(task: GenerationTask, blueprint: ProductBlueprint) -> str:
+    modules = ", ".join(f'"{_cpp_escape(module.title)}"' for module in blueprint.modules[:8])
+    return f"""#include <iostream>
+#include <map>
+#include <string>
+#include <vector>
+
+class RuntimeModuleRegistry {{
+public:
+    void registerModule(const std::string& name, const std::string& status) {{
+        modules[name] = status;
+    }}
+
+    std::string statusOf(const std::string& name) const {{
+        auto iter = modules.find(name);
+        return iter == modules.end() ? "UNKNOWN" : iter->second;
+    }}
+
+    void printSummary() const {{
+        for (const auto& item : modules) {{
+            std::cout << item.first << ":" << item.second << std::endl;
+        }}
+    }}
+
+private:
+    std::map<std::string, std::string> modules;
+}};
+
+int main() {{
+    RuntimeModuleRegistry registry;
+    std::vector<std::string> moduleNames = {{{modules}}};
+    for (const auto& name : moduleNames) {{
+        registry.registerModule(name, "READY");
+    }}
+    std::cout << "{_cpp_escape(task.software_name)} {task.version}" << std::endl;
+    registry.printSummary();
+    return 0;
+}}
+"""
+
+
+def _python_edge_worker(task: GenerationTask, module: FeatureModule) -> str:
+    fields = ", ".join(repr(field) for field in module.data_fields[:8])
+    operations = ", ".join(repr(operation) for operation in module.operations[:6])
+    return f'''from dataclasses import dataclass, field
+from datetime import datetime
+
+
+@dataclass
+class {_pascal(module.key)}WorkerState:
+    software_name: str = "{task.software_name}"
+    module_title: str = "{module.title}"
+    status: str = "READY"
+    fields: list[str] = field(default_factory=lambda: [{fields}])
+    operations: list[str] = field(default_factory=lambda: [{operations}])
+    updated_at: datetime = field(default_factory=datetime.now)
+
+
+class {_pascal(module.key)}Worker:
+    def __init__(self):
+        self.state = {_pascal(module.key)}WorkerState()
+        self.records = []
+
+    def collect(self, payload: dict) -> dict:
+        record = dict(payload or {{}})
+        record["module"] = self.state.module_title
+        record["collected_at"] = datetime.now().isoformat()
+        self.records.append(record)
+        return record
+
+    def validate(self, record: dict) -> list[str]:
+        missing = [field for field in self.state.fields[:3] if not record.get(field)]
+        return missing
+
+    def submit(self, payload: dict) -> dict:
+        record = self.collect(payload)
+        record["missing_fields"] = self.validate(record)
+        record["status"] = "INVALID" if record["missing_fields"] else "ACCEPTED"
+        return record
+'''
+
+
+def _python_device_smoke(task: GenerationTask, blueprint: ProductBlueprint) -> str:
+    module_titles = ", ".join(repr(module.title) for module in blueprint.modules[:8])
+    return f'''SOFTWARE_NAME = "{task.software_name}"
+MODULES = [{module_titles}]
+
+
+def run_smoke_test():
+    results = []
+    for index, title in enumerate(MODULES, start=1):
+        results.append({{"index": index, "module": title, "status": "PASS"}})
+    return results
+
+
+if __name__ == "__main__":
+    for item in run_smoke_test():
+        print(f"{{SOFTWARE_NAME}}|{{item['index']}}|{{item['module']}}|{{item['status']}}")
+'''
+
+
+def _shell_start_script(task: GenerationTask) -> str:
+    return f"""#!/usr/bin/env sh
+set -eu
+APP_NAME="{task.software_name}"
+APP_VERSION="{task.version}"
+echo "starting $APP_NAME $APP_VERSION"
+python3 scripts/device_smoke_test.py 2>/dev/null || python3 admin_cli/*_command.py --help 2>/dev/null || true
+"""
+
+
+def _device_profile_yaml(task: GenerationTask, blueprint: ProductBlueprint) -> str:
+    modules = "\n".join(f"  - key: {_snake(module.key)}\n    title: {module.title}" for module in blueprint.modules[:8])
+    return f"""software:
+  name: {task.software_name}
+  version: {task.version}
+  category: {task.software_category}
+  language: {task.language}
+modules:
+{modules}
+runtime:
+  support: {blueprint.runtime_environment.get('support', 'runtime support')}
+"""
+
+
 def _align_source_material_pages(files: list[Path], source_dir: Path, target_dir: Path, extension: str) -> list[Path]:
     remainder = len(read_source_lines(source_dir)) % 50
     if remainder == 0:
@@ -2361,6 +2648,14 @@ def _cpp_literal(value: str) -> str:
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _cpp_escape(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _c_literal(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _csharp_operation_trace_service(namespace: str, task: GenerationTask, blueprint: ProductBlueprint) -> str:
     module_titles = ", ".join(module.title for module in blueprint.modules)
     return f"""namespace {namespace}.Services;
@@ -2678,13 +2973,20 @@ def _readme(task: GenerationTask, blueprint: ProductBlueprint) -> str:
         for item in blueprint.workflows[:5]
         if isinstance(item, dict)
     )
+    architecture = getattr(blueprint, "technical_architecture", {}) or {}
     return f"""# {task.software_name}
 
 版本：{task.version}
 
-类型：{task.product_type}
+软件大类：{task.software_category}
 
-编程语言：{task.language}
+技术特点：{task.product_type}
+
+技术架构：{architecture.get("name") or "-"}
+
+源码语言：{architecture.get("source_language") or task.language}
+
+技术栈：{"、".join(architecture.get("stack") or []) or "-"}
 
 ## 软件概述
 
