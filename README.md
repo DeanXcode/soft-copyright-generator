@@ -75,12 +75,9 @@ start-desktop.bat
 
 ## 模型配置
 
-桌面端客户界面支持两种生成模式：
+桌面端客户界面当前只支持 `GPT` 生成模式。生成流程会通过 OpenAI-compatible / NewAPI 网关完成名称理解、产品蓝图、技术架构选择、说明书正文和界面蓝图生成；任一关键 GPT 阶段失败都会明确提示重试，不再切换到默认模板生成。
 
-- `默认模板`：使用本地模板生成，不调用模型接口，不消耗 token。
-- `GPT`：通过服务端中转生成产品蓝图和说明书正文，默认按质量优先策略分阶段生成。
-
-客户交付版安装包会预置 GPT 配置，客户安装后可在高级设置里直接看到并修改请求地址、模型名称和 API Key；默认模板模式仍保留为不消耗 token 的兜底入口。
+客户交付版安装包会预置 GPT 请求地址、模型名称和 API Key；客户安装后可在高级设置里直接查看和修改这三项配置。
 
 生成客户交付版安装包：
 
@@ -98,11 +95,16 @@ npm run pack:win:customer
   "SOFT_MODEL_GPT_BASE_URL": "https://smoke2.learn-flow.cn/v1",
   "SOFT_MODEL_GPT_API_KEY": "sk-你的NewAPI调用Token",
   "SOFT_MODEL_GPT_NAME": "gpt-5.5",
+  "SOFT_MODEL_GPT_IMAGE_NAME": "gpt-image-2",
+  "SOFT_MODEL_GPT_OUTLINE_NAME": "gpt-5.5",
+  "SOFT_MODEL_GPT_OUTLINE_TIMEOUT_SECONDS": "60",
+  "SOFT_LLM_IMAGE_RETRY_COUNT": "3",
   "SOFT_MODEL_MODE": "gpt"
 }
 ```
 
 `config\production.json` 已加入 `.gitignore`，不要提交真实 token。
+`SOFT_MODEL_GPT_NAME` 用于正式材料生成，`SOFT_MODEL_GPT_OUTLINE_NAME` 用于桌面端“生成蓝图”阶段，`SOFT_MODEL_GPT_IMAGE_NAME` 用于界面视觉参考稿阶段，当前应配置为 `gpt-image-2`。`SOFT_LLM_IMAGE_RETRY_COUNT` 是图片生成专用重试次数，用来处理图片网关临时 503/504/524/429；重试后仍失败时会保留蓝图并停止，不使用模板或中间图兜底。为了保证蓝图和正式内容的语义质量一致，建议文本生成模型保持同一个高质量模型。
 
 如果不是客户预制安装包，也可以由实施人员把真实配置放在安装目录或 exe 同级目录下的 `config\production.json`：
 
@@ -126,7 +128,11 @@ $env:SOFT_DESKTOP_CONFIG_DIR="D:\SoftCopyrightConfig"
 ```powershell
 $env:SOFT_MODEL_GPT_BASE_URL="https://your-newapi.example.com/v1"
 $env:SOFT_MODEL_GPT_API_KEY="你的NEWAPI_KEY"
-$env:SOFT_MODEL_GPT_NAME="gpt-4o-mini"
+$env:SOFT_MODEL_GPT_NAME="gpt-5.5"
+$env:SOFT_MODEL_GPT_IMAGE_NAME="gpt-image-2"
+$env:SOFT_MODEL_GPT_OUTLINE_NAME="gpt-5.5"
+$env:SOFT_MODEL_GPT_OUTLINE_TIMEOUT_SECONDS="60"
+$env:SOFT_LLM_IMAGE_RETRY_COUNT="3"
 $env:SOFT_MODEL_BALANCE_LABEL="100000 tokens"
 $env:SOFT_MODEL_ACCOUNT_NAME="客户账户"
 npm run build
@@ -138,10 +144,11 @@ npm run electron
 ```powershell
 $env:SOFT_MODEL_GATEWAY_BASE_URL="https://your-newapi.example.com/v1"
 $env:SOFT_MODEL_GATEWAY_API_KEY="你的NEWAPI_KEY"
-$env:SOFT_MODEL_GATEWAY_MODEL="gpt-4o-mini"
+$env:SOFT_MODEL_GATEWAY_MODEL="gpt-5.5"
+$env:SOFT_MODEL_GATEWAY_IMAGE_MODEL="gpt-image-2"
 ```
 
-当前模型会优先参与“产品蓝图”和“说明书正文”生成。网关未配置、余额不足或模型请求失败时，会自动回退本地模板，不中断材料生成。
+当前模型会参与“名称理解、产品蓝图、技术架构选择、说明书正文、界面蓝图、全局视觉风格提示词、gpt-image-2 风格参考图、按图生成业务工程和按图生成界面代码”生成。正式 GPT 流程只生成 1 张全局风格参考图，随后根据参考图生成业务工程源码与运行接口，再按参考图生成全部可运行 HTML/CSS，最后启动生成项目服务重新截图并写入手册；失败会明确提示重试，不使用模板或中间图片兜底。
 
 ## 业务后台余额接口
 
@@ -167,7 +174,7 @@ Authorization: Bearer sk-你的NewAPI调用Token
 }
 ```
 
-桌面端会优先读取业务后台余额接口。选择 `默认模板` 时界面显示“不消耗 token”，不会请求余额接口：
+桌面端会优先读取 NewAPI 余额接口。若需要使用业务后台自定义余额接口，也可以配置：
 
 ```powershell
 $env:SOFT_ACCOUNT_API_BASE_URL="https://your-domain.com"
@@ -245,7 +252,7 @@ npm run electron
 - 功能模块页面
 - 统计报表界面
 
-优先使用 GPT 生成或修正 `ui_blueprint.json`，再由 Playwright/Chromium 对 HTML 页面截图；游戏软件输出 720×1280 的 9:16 手机竖屏截图，桌面管理类软件输出 1280×820 横向截图，并按产品类型套用行业画像。如果浏览器运行时不可用，会自动使用本地图像渲染生成 PNG，仍会插入说明书，不中断材料生成。截图 PNG 会保存在输出目录的 `ui_screenshots/` 中；对应 HTML、原型入口、蓝图和清单会保存在源码工程的 `generated_source/ui-prototype/` 中，作为内部生成过程文件保留；最终 zip 只包含客户交付所需的 5 个文件，不包含截图源文件、源码工程、生成报告或材料清单。
+正式 GPT 流程会先生成 `ui_blueprint.json` 和页面清单，再生成 1 张 gpt-image-2 全局视觉风格参考图；参考图成功后才生成业务工程源码、运行接口和 `ui-visual-reference-contract.json`，随后 GPT 根据同一张参考图为全部页面生成可运行 HTML/CSS，最后启动生成源码项目服务并由 Playwright/Chromium 对运行页面重新截图。正式 GPT 模式在参考图生成前只会建立页面清单和文件名，不提前写入业务工程源码或占位界面 HTML/CSS；业务工程和界面代码都必须在全局风格参考图之后落地。桌面软件输出 1280×720 的 16:9 横向截图；手机 APP、小程序和手机游戏输出 720×1280 的 9:16 竖屏截图，并按产品类型、体验形态和视觉身份规格拉开界面差异。`local-template` 仅作为显式开发/无 token 模式保留；正式 GPT 模式下全局风格参考图、按图生成页面或项目服务截图任一缺失都会失败，不使用模板或中间图片兜底。截图 PNG 会保存在输出目录的 `ui_screenshots/` 中；对应 HTML、原型入口、蓝图、视觉参考图和清单会保存在源码工程的 `generated_source/ui-prototype/` 中，作为内部生成过程文件保留；最终 zip 只包含客户交付所需的 5 个文件，不包含截图源文件、源码工程、生成报告或材料清单。
 
 快速验收截图链路可以只生成源码项目、UI 原型和 PNG，不生成 Word/PDF，也不打包：
 
@@ -262,7 +269,7 @@ npm run electron
   "language": "C#",
   "product_type": "游戏软件",
   "feature_hint": "三消关卡、糖果棋盘、步数目标、道具背包、星级结算",
-  "model_provider": "local-template",
+  "model_provider": "custom",
   "output_root": "output-screenshot-chain-local-review"
 }
 ```
@@ -443,9 +450,9 @@ release/customer-installer/Soft Copyright Generator Setup 0.1.0.exe
 release/customer-installer/win-unpacked/
 ```
 
-客户预制安装器会把本机 `config/production.json` 注入到安装包资源目录，并写入 `SOFT_MODEL_MODE=gpt` 和 `SOFT_CUSTOMER_PRESET_CONFIG=true`。同时会内置 LibreOffice 运行时。客户安装后可在界面高级设置里看到并修改请求地址、模型名称和 API Key，并可直接生成高保真 PDF。
+客户预制安装器会把本机 `config/production.json` 注入到安装包资源目录，并写入 `SOFT_MODEL_MODE=gpt` 和 `SOFT_CUSTOMER_PRESET_CONFIG=true`。同时会内置 LibreOffice 运行时。客户安装后可在界面高级设置里修改请求地址、模型名称和 API Key，并可直接生成高保真 PDF。
 
-注意：当前预制配置属于客户端随包配置，客户界面可见可改；如果后续要改回不暴露 API Key 和网关地址，应使用服务端授权代理，由桌面端只持有客户授权码。
+注意：当前预制配置属于客户端随包配置，API Key 客户界面可见可改；如果后续要避免暴露 API Key，应使用服务端授权代理，由桌面端只持有客户授权码。
 
 ## 后续开发
 

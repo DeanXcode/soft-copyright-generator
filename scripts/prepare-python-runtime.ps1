@@ -55,7 +55,7 @@ function Test-RuntimeReady($PythonExe) {
   try {
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    & $PythonExe -c "import sys, docx, reportlab, playwright, softcopyright; print('embedded-python-ok')" > $null 2>$null
+    & $PythonExe -c "import sys, docx, reportlab, playwright, pypdf, softcopyright; print('embedded-python-ok')" > $null 2>$null
     $exitCode = $LASTEXITCODE
     $ErrorActionPreference = $previousErrorActionPreference
     return $exitCode -eq 0
@@ -121,6 +121,6 @@ Write-Host "Installing project Python dependencies"
 Invoke-Checked $pythonExe @("-m", "pip", "install", "--no-warn-script-location", "-r", (Join-Path $root "requirements.txt"))
 
 Write-Host "Verifying embedded Python"
-Invoke-Checked $pythonExe @("-c", "import sys, docx, reportlab, playwright; print(sys.version); print('embedded-python-ok')")
+Invoke-Checked $pythonExe @("-c", "import sys, docx, reportlab, playwright, pypdf; print(sys.version); print('embedded-python-ok')")
 
 Write-Host "Python runtime ready: $runtimePath"

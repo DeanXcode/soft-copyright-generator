@@ -62,13 +62,16 @@ class GenerationTask:
     product_type: str = "智慧城市软件"
     software_category: str = "应用软件"
     feature_hint: str = ""
-    model_provider: str = "local-template"
-    model_name: str = "template-v1"
+    model_provider: str = "custom"
+    model_name: str = "gpt-5.5"
     llm_base_url: str = ""
     llm_api_key_configured: bool = False
     randomness: str = "standard"
     seed: str = field(default_factory=make_seed)
     output_root: Path = field(default_factory=lambda: Path("output"))
+    confirmed_outline: dict = field(default_factory=dict)
+    resume_output_dir: str = ""
+    resume_existing_output: bool = False
 
     @property
     def safe_name(self) -> str:
@@ -80,11 +83,14 @@ class GenerationTask:
 
     @property
     def output_dir(self) -> Path:
+        if str(self.resume_output_dir or "").strip():
+            return Path(str(self.resume_output_dir))
         return self.output_root / self.task_id
 
     def to_dict(self) -> dict:
         self.software_category = normalize_software_category(self.software_category)
         data = asdict(self)
         data["output_root"] = str(self.output_root)
+        data["resume_output_dir"] = str(self.resume_output_dir or "")
         data["output_dir"] = str(self.output_dir)
         return data

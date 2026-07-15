@@ -59,7 +59,7 @@ def main() -> int:
         product_type=args.product_type,
         feature_hint=args.feature_hint,
         model_provider="custom",
-        model_name=os.environ.get("SOFT_MODEL_GPT_NAME", "gpt-4o-mini"),
+        model_name=os.environ.get("SOFT_MODEL_GPT_NAME", "gpt-5.5"),
         randomness=args.randomness,
         output_root=Path(args.output_root),
     )

@@ -12,6 +12,7 @@ from .blueprint import FeatureModule, ProductBlueprint, _environment_for_languag
 from .llm.provider import LLMProvider, LocalTemplateProvider
 from .llm.trace import trace_event
 from .models import GenerationTask
+from .module_keys import normalize_entity_names, semantic_module_key
 
 
 def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | None, emit=None) -> ProductBlueprint | None:
@@ -23,7 +24,7 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
     best_blueprint: ProductBlueprint | None = None
     best_score = 0
     quality_floor = _blueprint_quality_floor(task)
-    attempt_count = 5 if _authenticity_first(task) else 2
+    attempt_count = _blueprint_attempt_count(task)
     for _attempt in range(attempt_count):
         started_at = time.perf_counter()
         trace_event(
@@ -280,9 +281,9 @@ def _generate_module_batches(
 
 def _llm_batch_workers() -> int:
     try:
-        value = int(os.getenv("SOFT_LLM_BATCH_WORKERS", "1"))
+        value = int(os.getenv("SOFT_LLM_BATCH_WORKERS", "2"))
     except ValueError:
-        value = 1
+        value = 2
     return max(1, min(3, value))
 
 
@@ -290,20 +291,38 @@ def _generation_quality_profile(task: GenerationTask) -> str:
     value = os.getenv("SOFT_GENERATION_PROFILE", "").strip().lower()
     if value in {"fast", "speed", "batch"}:
         return "fast"
-    return "authenticity-first"
+    if value in {"authenticity-first", "authenticity", "quality", "strict"}:
+        return "authenticity-first"
+    return "balanced"
 
 
 def _authenticity_first(task: GenerationTask) -> bool:
     return _generation_quality_profile(task) == "authenticity-first"
 
 
+def _blueprint_attempt_count(task: GenerationTask) -> int:
+    profile = _generation_quality_profile(task)
+    if profile == "authenticity-first":
+        return 5
+    if profile == "fast":
+        return 2
+    return 3
+
+
 def _blueprint_quality_floor(task: GenerationTask) -> int:
-    if _authenticity_first(task):
+    profile = _generation_quality_profile(task)
+    if profile == "authenticity-first":
         raw = os.getenv("SOFT_BLUEPRINT_QUALITY_FLOOR", "92").strip() or "92"
         try:
             return max(78, min(95, int(raw)))
         except ValueError:
             return 92
+    if profile == "balanced":
+        raw = os.getenv("SOFT_BLUEPRINT_QUALITY_FLOOR", "86").strip() or "86"
+        try:
+            return max(82, min(92, int(raw)))
+        except ValueError:
+            return 86
     return 78
 
 
@@ -461,13 +480,17 @@ def _modules_from_contract(task: GenerationTask, core_plan: dict[str, Any]) -> l
 
 def _contract_module_key(item: dict[str, Any], index: int) -> str:
     raw = str(item.get("key") or item.get("id") or "").strip()
-    key = _safe_key(raw)
-    generic = {"module", "business", "data", "manage", "management", "system", "common", "businessrecord"}
-    if not raw or key in generic or re.fullmatch(r"module_\d+", key or ""):
-        title = str(item.get("title") or item.get("category") or index)
-        digest = hashlib.md5(title.encode("utf-8", errors="ignore")).hexdigest()[:6]
-        key = f"semantic_{index:02d}_{digest}"
-    return key
+    title = str(item.get("title") or item.get("category") or "")
+    context_terms: list[str] = []
+    for field in ("category", "description"):
+        value = item.get(field)
+        if isinstance(value, str):
+            context_terms.append(value)
+    for field in ("data_objects", "dataObjects", "entities", "operations", "data_fields", "dataFields", "pages"):
+        value = item.get(field)
+        if isinstance(value, list):
+            context_terms.extend(str(entry) for entry in value[:6])
+    return semantic_module_key(title, index, raw_key=raw, context_terms=context_terms)
 
 
 def _contract_operations(title: str, category: str, user_flow: list[str]) -> list[str]:
@@ -865,6 +888,7 @@ def _build_core_prompt(task: GenerationTask, rejection_reasons: list[str] | None
 软件技术特点/产品类型：{task.product_type}
 业务补充：{task.feature_hint or "无"}
 随机差异要求：{task.randomness}
+本次创意种子：{task.seed}（只用于形成独立的产品角度、信息架构和业务流程，不得出现在成品文字中）
 {retry_note}
 
 本次生成的差异化产品策略：
@@ -896,6 +920,7 @@ module_outline 规则：
 - 至少 70% 模块轮廓和页面必须体现软件名称或业务补充中的具体领域
 - 必须按“本次生成的差异化产品策略”组织产品角度、流程重心、模块边界和页面命名
 - 同类软件再次生成时也不能复用固定的“首页+数据管理+统计+权限”套壳结构
+- 必须把本次创意种子解释成一套独立的信息架构；新 seed 应产生不同的模块边界、页面角色、核心流程和指标组合，而不是只改名称
 - 说明书读者应能看出这是一个可申请软著的具体软件，不是泛型后台管理系统
 
 只返回 JSON。
@@ -1342,9 +1367,17 @@ def _blueprint_from_data(task: GenerationTask, data: dict[str, Any]) -> ProductB
     for index, item in enumerate(modules_data[:8], start=1):
         if not isinstance(item, dict):
             continue
-        key = _safe_key(str(item.get("key") or f"module_{index}"))
         title = _clean_text(str(item.get("title") or f"业务模块{index}"), 24)
         description = _clean_text(str(item.get("description") or f"{title}用于业务数据维护和流程处理。"), 220)
+        operations = _clean_list(item.get("operations"), 7, 28)
+        data_fields = _clean_list(item.get("data_fields"), 10, 24)
+        key = semantic_module_key(
+            title,
+            index,
+            raw_key=str(item.get("key") or ""),
+            used={module.key for module in modules},
+            context_terms=[description, *operations[:4], *data_fields[:6]],
+        )
         entities = item.get("entities")
         if not isinstance(entities, list):
             entities = [f"Module{index}Record", f"Module{index}Query"]
@@ -1353,15 +1386,15 @@ def _blueprint_from_data(task: GenerationTask, data: dict[str, Any]) -> ProductB
             for entity in entities[:4]
             if _entity_name_from_item(entity)
         ]
-        safe_entities = _normalize_entities(safe_entities, key, index)
+        safe_entities = _normalize_entities(safe_entities, key, index, old_key=str(item.get("key") or ""))
         modules.append(
             FeatureModule(
                 key=key,
                 title=title,
                 description=description,
                 entities=safe_entities,
-                operations=_clean_list(item.get("operations"), 7, 28),
-                data_fields=_clean_list(item.get("data_fields"), 10, 24),
+                operations=operations,
+                data_fields=data_fields,
                 pages=_clean_list(item.get("pages"), 4, 28),
                 rules=_clean_list(item.get("rules"), 5, 80),
             )
@@ -1567,21 +1600,8 @@ def _entity_name_from_item(item: Any) -> str:
     return str(item).strip()
 
 
-def _normalize_entities(entities: list[str], key: str, index: int) -> list[str]:
-    base = _entity_base_from_key(key) or f"Module{index}"
-    cleaned: list[str] = []
-    for entity in entities:
-        if not entity or entity == "BusinessRecord" or entity in cleaned:
-            continue
-        cleaned.append(entity)
-    while len(cleaned) < 2:
-        suffix = "Record" if len(cleaned) == 0 else "Query"
-        candidate = f"{base}{suffix}"
-        if candidate not in cleaned:
-            cleaned.append(candidate)
-        else:
-            cleaned.append(f"{base}Detail")
-    return cleaned[:4]
+def _normalize_entities(entities: list[str], key: str, index: int, old_key: str = "") -> list[str]:
+    return normalize_entity_names(entities, key, index, old_key=old_key)
 
 
 def _entity_base_from_key(key: str) -> str:

@@ -1,6 +1,6 @@
 {
   "name": "soft-copyright-generator-desktop",
-  "version": "0.1.0",
+  "version": "0.1.8",
   "private": true,
   "type": "module",
   "main": "desktop/electron/main.cjs",
@@ -37,12 +37,17 @@
     "directories": {
       "output": "release/installer"
     },
+    "icon": "build/icon.ico",
     "files": [
       "dist/**/*",
       "desktop/electron/**/*",
       "package.json"
     ],
     "extraResources": [
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      },
       {
         "from": "backend",
         "to": "backend"
@@ -65,12 +70,16 @@
       }
     ],
     "win": {
+      "icon": "build/icon.ico",
       "signAndEditExecutable": false,
       "target": [
         "nsis"
       ]
     },
     "nsis": {
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
       "oneClick": false,
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,

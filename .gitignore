@@ -4,7 +4,12 @@ __pycache__/
 venv/
 node_modules/
 dist/
-build/
+.playwright-cli/
+data/
+build/*
+!build/icon.svg
+!build/icon.png
+!build/icon.ico
 ms-playwright/
 python-runtime/
 libreoffice/

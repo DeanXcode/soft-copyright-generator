@@ -64,12 +64,12 @@ DOMAIN_PROFILES = [
     },
     {
         "id": "game",
-        "triggers": ["游戏", "消除", "关卡", "棋盘", "玩家", "道具", "得分", "星级"],
+        "triggers": ["游戏", "手游", "小游戏", "消除", "点消", "三消", "连消", "关卡地图", "玩家", "道具背包"],
         "keywords": ["玩家账号", "关卡地图", "对局棋盘", "目标得分", "剩余步数", "道具背包", "结算统计", "星级评价"],
     },
     {
         "id": "education",
-        "triggers": ["教育", "学习", "课程", "作业", "考试", "题库", "学情", "课堂"],
+        "triggers": ["教育", "学习", "课程", "作业", "考试", "题库", "学情", "课堂", "培训", "实训", "考核"],
         "keywords": ["课程资源", "学习任务", "作业收交", "批改进度", "学情分析", "错题记录", "班级管理", "学习报告"],
     },
     {
@@ -79,8 +79,8 @@ DOMAIN_PROFILES = [
     },
     {
         "id": "medical",
-        "triggers": ["医疗", "医院", "诊疗", "处方", "病历", "药品", "随访", "护理"],
-        "keywords": ["患者档案", "诊疗记录", "处方管理", "药品库存", "随访计划", "护理任务", "检查报告", "医嘱执行"],
+        "triggers": ["医疗", "医院", "诊疗", "处方", "病历", "药品", "随访", "护理", "患者", "检验", "手术", "麻醉", "科室", "医生", "排班", "排程", "气道", "插管", "急救", "临床", "医护", "技能演练"],
+        "keywords": ["患者档案", "诊疗记录", "气道评估", "插管操作", "急救演练", "技能考核", "手术申请", "手术排班", "术前确认", "麻醉协同", "科室协调", "护理任务", "检查报告", "医嘱执行"],
     },
     {
         "id": "ticketing",
@@ -103,7 +103,7 @@ def harmonize_feature_hint(
     require_llm: bool = False,
     min_blueprint_modules: int = 0,
 ) -> tuple[str, dict]:
-    llm_result = infer_feature_hint_with_llm(
+    llm_result, failure_message = infer_feature_hint_with_llm(
         software_name,
         product_type,
         provided,
@@ -119,6 +119,7 @@ def harmonize_feature_hint(
             "feature_hint_source": "llm-failed",
             "requires_gpt": True,
             "original_feature_hint": _clean_hint(provided),
+            "failure_message": failure_message,
         }
 
     inferred, profile_id = infer_feature_hint(software_name, product_type)
@@ -156,9 +157,9 @@ def infer_feature_hint_with_llm(
     provided: str = "",
     provider: LLMProvider | None = None,
     min_blueprint_modules: int = 0,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, str]:
     if provider is None or isinstance(provider, LocalTemplateProvider):
-        return None
+        return None, "未配置 GPT 模型服务"
     started_at = time.perf_counter()
     trace_event(
         "feature_hint_inference_begin",
@@ -167,28 +168,11 @@ def infer_feature_hint_with_llm(
         provided=bool(_clean_hint(provided)),
     )
     try:
-        content = provider.chat(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是中文软件产品经理和软著材料业务分析专家。"
-                        "请根据软件名称推断真实软件业务边界，生成可用于软著材料的结构化产品蓝图。"
-                        "只返回 JSON，不要 Markdown，不要编造公司主体信息。"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": _build_llm_prompt(software_name, product_type, provided),
-                },
-            ],
-            temperature=0.25,
-            max_tokens=2400,
-            response_format={"type": "json_object"},
-            trace_label="feature_hint:infer",
-        )
-        data = _parse_json(content)
-        result = _normalize_llm_result(data)
+        detailed_modules = min_blueprint_modules >= 8
+        if detailed_modules:
+            result = _infer_detailed_feature_hint_with_llm(provider, software_name, product_type, provided)
+        else:
+            result = _infer_lightweight_feature_hint_two_step(provider, software_name, product_type, provided)
         if result and _llm_result_meets_blueprint_floor(result, software_name, min_blueprint_modules):
             elapsed_seconds = round(time.perf_counter() - started_at, 3)
             result["elapsed_seconds"] = elapsed_seconds
@@ -200,18 +184,167 @@ def infer_feature_hint_with_llm(
                 should_replace=bool(result.get("should_replace")),
                 blueprint_module_count=len(result.get("blueprint_modules") or []),
             )
-            return result
+            return result, ""
+        if result:
+            failure_message = "GPT 返回的蓝图模块不符合质量要求，请重试。"
+        else:
+            failure_message = "GPT 返回内容为空或不是可解析的 JSON 蓝图。"
+    except FeatureHintStageError as exc:
+        failure_message = str(exc)
+        trace_event(
+            "feature_hint_inference_error",
+            elapsed_seconds=round(time.perf_counter() - started_at, 3),
+            error_type=type(exc).__name__,
+            stage=exc.stage,
+            error=str(exc)[:500],
+        )
     except Exception as exc:
+        failure_message = _safe_llm_error_message(exc)
         trace_event(
             "feature_hint_inference_error",
             elapsed_seconds=round(time.perf_counter() - started_at, 3),
             error_type=type(exc).__name__,
             error=str(exc)[:500],
         )
-    return None
+    return None, failure_message
 
 
-def _build_llm_prompt(software_name: str, product_type: str, provided: str) -> str:
+class FeatureHintStageError(RuntimeError):
+    def __init__(self, stage: str, message: str):
+        super().__init__(message)
+        self.stage = stage
+
+
+def _infer_detailed_feature_hint_with_llm(
+    provider: LLMProvider,
+    software_name: str,
+    product_type: str,
+    provided: str,
+) -> dict[str, Any] | None:
+    content = provider.chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "你是中文软件产品经理和软著材料业务分析专家。"
+                    "请根据软件名称推断真实软件业务边界，生成可用于软著材料的结构化产品蓝图。"
+                    "只返回 JSON，不要 Markdown，不要编造公司主体信息。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": _build_llm_prompt(
+                    software_name,
+                    product_type,
+                    provided,
+                    detailed_modules=True,
+                ),
+            },
+        ],
+        temperature=0.25,
+        max_tokens=6000,
+        response_format={"type": "json_object"},
+        trace_label="feature_hint:infer_full",
+    )
+    return _normalize_llm_result(_parse_json(content))
+
+
+def _infer_lightweight_feature_hint_two_step(
+    provider: LLMProvider,
+    software_name: str,
+    product_type: str,
+    provided: str,
+) -> dict[str, Any] | None:
+    try:
+        profile_content = provider.chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是中文软件产品经理。请只根据软件名称判断真实业务领域和关键词。"
+                        "只返回 JSON，不要 Markdown，不要编造公司主体信息。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": _build_domain_profile_prompt(software_name, product_type, provided),
+                },
+            ],
+            temperature=0.15,
+            max_tokens=700,
+            response_format={"type": "json_object"},
+            trace_label="feature_hint:profile",
+        )
+        profile = _normalize_domain_profile(_parse_json(profile_content))
+    except Exception as exc:
+        raise FeatureHintStageError("profile", _stage_failure_message("名称理解", exc)) from exc
+    if not profile.get("feature_hint"):
+        raise FeatureHintStageError("profile", "GPT 名称理解失败：模型未返回可用关键词。")
+
+    try:
+        modules_content = provider.chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是中文软件产品经理。请基于已识别的业务领域生成可编辑模块草案。"
+                        "只返回 JSON，不要 Markdown，不要编造公司主体信息。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": _build_outline_modules_prompt(software_name, product_type, provided, profile),
+                },
+            ],
+            temperature=0.25,
+            max_tokens=1400,
+            response_format={"type": "json_object"},
+            trace_label="feature_hint:modules",
+        )
+        modules_data = _parse_json(modules_content)
+    except Exception as exc:
+        raise FeatureHintStageError("modules", _stage_failure_message("模块草案生成", exc)) from exc
+    combined = {
+        **profile,
+        "blueprint_modules": modules_data.get("blueprint_modules") or modules_data.get("modules") or [],
+        "reason": _clean_hint(str(modules_data.get("reason") or profile.get("reason") or "")),
+        "should_replace": True,
+    }
+    return _normalize_llm_result(combined)
+
+
+def _safe_llm_error_message(exc: Exception) -> str:
+    raw = str(exc or "")
+    lowered = raw.lower()
+    if "timeout" in lowered or "timed out" in lowered or "read timed out" in lowered:
+        return "GPT 蓝图请求超时：模型网关响应过慢，请稍后重试或检查网关状态。"
+    status_match = re.search(r"(?:HTTP\s+|status(?:_code)?[=:]\s*|([45]\d{2})\s+Server Error)", raw, re.IGNORECASE)
+    if status_match:
+        status = status_match.group(1) or status_match.group(2)
+        if status == "503":
+            return "GPT 蓝图请求失败：模型网关返回 503 服务不可用，请稍后重试或切换可用模型。"
+        if status == "429":
+            return "GPT 蓝图请求失败：模型网关限流或额度不足，请稍后重试或检查账户额度。"
+        if status in {"401", "403"}:
+            return "GPT 蓝图请求失败：API Key 无效或无模型访问权限，请检查 GPT 配置。"
+        return f"GPT 蓝图请求失败：模型网关返回 HTTP {status}，请检查模型服务状态。"
+    if "json" in lowered:
+        return "GPT 蓝图请求失败：模型返回内容不是有效 JSON，请重试。"
+    if raw:
+        return f"GPT 蓝图请求失败：{raw[:120]}"
+    return "GPT 蓝图请求失败：模型服务未返回可用结果。"
+
+
+def _stage_failure_message(stage_label: str, exc: Exception) -> str:
+    message = _safe_llm_error_message(exc)
+    message = re.sub(r"^GPT 蓝图请求失败：", "", message)
+    message = re.sub(r"^GPT 蓝图请求超时：", "请求超时：", message)
+    return f"GPT {stage_label}失败：{message}"
+
+
+def _build_llm_prompt(software_name: str, product_type: str, provided: str, detailed_modules: bool = True) -> str:
+    if not detailed_modules:
+        return _build_lightweight_llm_prompt(software_name, product_type, provided)
     return f"""
 请只返回 JSON，不要 Markdown。根据软件名称推断真实产品边界，并生成可用于软著材料的业务蓝图。
 
@@ -255,6 +388,122 @@ def _build_llm_prompt(software_name: str, product_type: str, provided: str) -> s
   ],
   "should_replace": true,
   "reason": "为什么这样补充"
+}}
+""".strip()
+
+
+def _build_domain_profile_prompt(software_name: str, product_type: str, provided: str) -> str:
+    return f"""
+请只返回 JSON，不要 Markdown。根据软件名称快速识别真实产品领域，输出后续软著材料蓝图会用到的业务语义。
+
+软件名称：{software_name}
+产品类型：{product_type or "未提供"}
+用户补充：{_clean_hint(provided) or "未填写"}
+
+要求：
+1. 不生成模块明细，只判断领域、对象、用户和关键词。
+2. keywords 8-14 个，必须是业务对象或业务动作，不要写“数据管理、系统设置、统计分析”。
+3. feature_hint 用 keywords 串联，长度不超过 120 字。
+4. avoid_terms 写 3-6 个容易跑偏的方向。
+
+返回 JSON 结构：
+{{
+  "profile": "简短英文领域标识",
+  "domain": "中文领域短语",
+  "target_users": ["目标用户1", "目标用户2"],
+  "keywords": ["业务关键词1", "业务关键词2"],
+  "feature_hint": "业务关键词1、业务关键词2、业务关键词3",
+  "avoid_terms": ["应避免方向1", "应避免方向2"],
+  "should_replace": true,
+  "reason": "为什么这样理解"
+}}
+""".strip()
+
+
+def _build_outline_modules_prompt(
+    software_name: str,
+    product_type: str,
+    provided: str,
+    profile: dict[str, Any],
+) -> str:
+    profile_json = json.dumps(
+        {
+            "domain": profile.get("domain") or "",
+            "target_users": profile.get("target_users") or [],
+            "keywords": profile.get("keywords") or [],
+            "feature_hint": profile.get("feature_hint") or "",
+            "avoid_terms": profile.get("avoid_terms") or [],
+        },
+        ensure_ascii=False,
+    )
+    return f"""
+请只返回 JSON，不要 Markdown。基于已识别的业务语义生成可编辑的蓝图模块草案。
+
+软件名称：{software_name}
+产品类型：{product_type or "未提供"}
+用户补充：{_clean_hint(provided) or "未填写"}
+已识别业务语义：{profile_json}
+
+要求：
+1. 生成 8-10 个候选业务模块，用于前端可编辑蓝图。
+2. 每个模块只需要 key、category、title、description、data_objects、screens。
+3. description 40-90 个中文字符，说明业务对象、动作、状态或输出。
+4. 至少 4 个不同 category，避免泛型模块名称。
+5. 模块应覆盖完整业务链路，不要只围绕同一个关键词换说法。
+6. 禁止模块标题：数据管理、业务处理、统计分析、系统设置、权限管理、核心模块。
+
+返回 JSON 结构：
+{{
+  "blueprint_modules": [
+    {{
+      "key": "lowercase_domain_key",
+      "category": "模块分类",
+      "title": "模块名称",
+      "description": "40-90字业务说明，说明对象、动作、状态或输出。",
+      "data_objects": ["关键数据对象1", "关键数据对象2"],
+      "screens": ["页面/界面1", "页面/界面2"]
+    }}
+  ],
+  "reason": "模块这样拆分的原因"
+}}
+""".strip()
+
+
+def _build_lightweight_llm_prompt(software_name: str, product_type: str, provided: str) -> str:
+    return f"""
+请只返回 JSON，不要 Markdown。根据软件名称推断真实产品边界，生成可编辑的业务蓝图。
+
+软件名称：{software_name}
+产品类型：{product_type or "未提供"}
+用户补充：{_clean_hint(provided) or "未填写"}
+
+要求：
+1. 快速生成 8-10 个候选业务模块，用于前端可编辑蓝图。
+2. 每个模块只需要 key、category、title、description、data_objects、screens。
+3. description 40-90 个中文字符，说明业务对象、动作和输出结果。
+4. 至少 4 个不同 category，避免泛型模块名称。
+5. feature_hint 用 8-14 个关键词串联，后续正式生成会再次生成完整产品蓝图。
+
+返回 JSON 结构：
+{{
+  "profile": "简短英文领域标识",
+  "domain": "中文领域短语",
+  "target_users": ["目标用户1", "目标用户2"],
+  "keywords": ["关键词1", "关键词2"],
+  "feature_hint": "关键词1、关键词2、关键词3",
+  "avoid_terms": ["应避免方向1", "应避免方向2"],
+  "blueprint_modules": [
+    {{
+      "key": "lowercase_domain_key",
+      "category": "模块分类",
+      "title": "模块名称",
+      "description": "40-90字业务说明，说明对象、动作、状态或输出。",
+      "data_objects": ["关键数据对象1", "关键数据对象2"],
+      "screens": ["页面/界面1", "页面/界面2"]
+    }}
+  ],
+  "should_replace": true,
+  "reason": "为什么这样补全"
 }}
 """.strip()
 
@@ -310,6 +559,26 @@ def _normalize_llm_result(data: dict[str, Any]) -> dict[str, Any] | None:
         "blueprint_modules": blueprint_modules,
         "should_replace": bool(data.get("should_replace")),
         "reason": _clean_hint(str(data.get("reason") or "")),
+    }
+
+
+def _normalize_domain_profile(data: dict[str, Any]) -> dict[str, Any]:
+    blueprint_free = dict(data)
+    blueprint_free.pop("blueprint_modules", None)
+    keywords = _clean_list(blueprint_free.get("keywords"), 16, 18)
+    feature_hint = _clean_hint(str(blueprint_free.get("feature_hint") or ""))
+    if not feature_hint and keywords:
+        feature_hint = "、".join(keywords)
+    return {
+        "profile": _safe_id(str(blueprint_free.get("profile") or "llm")),
+        "domain": _clean_hint(str(blueprint_free.get("domain") or ""))[:40],
+        "target_users": _clean_list(blueprint_free.get("target_users"), 8, 20),
+        "keywords": keywords or [part for part in re.split(r"[，,、\s]+", feature_hint) if part],
+        "feature_hint": _limit_hint(feature_hint),
+        "avoid_terms": _clean_list(blueprint_free.get("avoid_terms"), 12, 24),
+        "blueprint_modules": [],
+        "should_replace": bool(blueprint_free.get("should_replace", True)),
+        "reason": _clean_hint(str(blueprint_free.get("reason") or "")),
     }
 
 

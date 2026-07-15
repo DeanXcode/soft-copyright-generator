@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from .blueprint import ProductBlueprint
+from .errors import sanitize_error_message
 from .llm.provider import LLMProvider, LocalTemplateProvider
 from .llm.trace import trace_event
 from .models import GenerationTask
@@ -28,6 +29,7 @@ def generate_manual_content_with_llm(
     batch_size = 1 if _authenticity_first(task) else 2
     section_batches = list(_chunks(_section_specs(), batch_size))
     section_results: dict[int, dict[str, Any]] = {}
+    failed_section_batches: list[tuple[int, list[tuple[str, str, str, int, int, int]], str]] = []
     workers = 1 if _authenticity_first(task) else _llm_batch_workers()
     with ThreadPoolExecutor(max_workers=min(workers, len(section_batches) or 1)) as executor:
         futures = {}
@@ -39,9 +41,9 @@ def generate_manual_content_with_llm(
             try:
                 section_results[batch_index] = future.result()
             except Exception as exc:
-                titles = "、".join(title for _key, title, *_rest in specs)
-                warnings.append(f"{titles}模型生成失败，已由本地模板补齐：{exc}")
+                failed_section_batches.append((batch_index, specs, sanitize_error_message(exc)))
 
+    missing_sections: list[tuple[tuple[str, str, str, int, int, int], str]] = []
     for batch_index, specs in enumerate(section_batches, start=1):
         batch_data = section_results.get(batch_index)
         if not batch_data:
@@ -51,10 +53,15 @@ def generate_manual_content_with_llm(
             if paragraphs:
                 result[key] = paragraphs
             else:
-                warnings.append(f"{title}模型生成有效段落不足，已由本地模板补齐")
+                missing_sections.append(((key, title, _count_hint, min_count, _max_tokens, limit), "模型生成有效段落不足"))
+    for _batch_index, specs, error in failed_section_batches:
+        for spec in specs:
+            missing_sections.append((spec, f"批次请求失败：{error}"))
+    _retry_missing_sections(task, blueprint, provider, missing_sections, result, warnings, emit)
 
     module_batches = list(_chunks(blueprint.modules, batch_size))
     module_results: dict[int, dict[str, Any]] = {}
+    failed_module_batches: list[tuple[int, list[Any], str]] = []
     with ThreadPoolExecutor(max_workers=min(workers, len(module_batches) or 1)) as executor:
         futures = {}
         for batch_index, modules in enumerate(module_batches, start=1):
@@ -65,9 +72,9 @@ def generate_manual_content_with_llm(
             try:
                 module_results[batch_index] = future.result()
             except Exception as exc:
-                titles = "、".join(module.title for module in modules)
-                warnings.append(f"{titles}模型生成失败，已由本地模板补齐：{exc}")
+                failed_module_batches.append((batch_index, modules, sanitize_error_message(exc)))
 
+    missing_modules: list[tuple[Any, str]] = []
     for batch_index, modules in enumerate(module_batches, start=1):
         batch_data = module_results.get(batch_index)
         if not batch_data:
@@ -77,7 +84,11 @@ def generate_manual_content_with_llm(
             if module_content:
                 result["modules"][module.key] = module_content
             else:
-                warnings.append(f"{module.title}模型生成有效段落不足，已由本地模板补齐")
+                missing_modules.append((module, "模型生成有效段落不足"))
+    for _batch_index, modules, error in failed_module_batches:
+        for module in modules:
+            missing_modules.append((module, f"批次请求失败：{error}"))
+    _retry_missing_modules(task, blueprint, provider, missing_modules, result, warnings, emit)
 
     generated_section_count = sum(1 for key, *_rest in _section_specs() if result.get(key))
     generated_module_count = len(result["modules"])
@@ -110,15 +121,30 @@ def _generate_manual_content_with_llm_sequential(
                 specs=specs,
             )
         except Exception as exc:
-            titles = "、".join(title for _key, title, *_rest in specs)
-            warnings.append(f"{titles}模型生成失败，已由本地模板补齐：{exc}")
+            _retry_missing_sections(
+                task,
+                blueprint,
+                provider,
+                [(spec, f"批次请求失败：{sanitize_error_message(exc)}") for spec in specs],
+                result,
+                warnings,
+                emit,
+            )
             continue
         for key, title, _count_hint, min_count, _max_tokens, limit in specs:
             paragraphs = _section_paragraphs_from_data(batch_data, key, min_count, limit)
             if paragraphs:
                 result[key] = paragraphs
             else:
-                warnings.append(f"{title}模型生成有效段落不足，已由本地模板补齐")
+                _retry_missing_sections(
+                    task,
+                    blueprint,
+                    provider,
+                    [((key, title, _count_hint, min_count, _max_tokens, limit), "模型生成有效段落不足")],
+                    result,
+                    warnings,
+                    emit,
+                )
 
     module_batches = list(_chunks(blueprint.modules, batch_size))
     for batch_index, modules in enumerate(module_batches, start=1):
@@ -126,15 +152,30 @@ def _generate_manual_content_with_llm_sequential(
         try:
             batch_data = _generate_module_batch(task, blueprint, provider, modules)
         except Exception as exc:
-            titles = "、".join(module.title for module in modules)
-            warnings.append(f"{titles}模型生成失败，已由本地模板补齐：{exc}")
+            _retry_missing_modules(
+                task,
+                blueprint,
+                provider,
+                [(module, f"批次请求失败：{sanitize_error_message(exc)}") for module in modules],
+                result,
+                warnings,
+                emit,
+            )
             continue
         for module in modules:
             module_content = _module_content_from_data(batch_data, module)
             if module_content:
                 result["modules"][module.key] = module_content
             else:
-                warnings.append(f"{module.title}模型生成有效段落不足，已由本地模板补齐")
+                _retry_missing_modules(
+                    task,
+                    blueprint,
+                    provider,
+                    [(module, "模型生成有效段落不足")],
+                    result,
+                    warnings,
+                    emit,
+                )
 
     generated_section_count = sum(1 for key, *_rest in _section_specs() if result.get(key))
     generated_module_count = len(result["modules"])
@@ -151,6 +192,60 @@ def _emit(emit, progress: int, message: str, **extra) -> None:
         emit(progress, message, **extra)
 
 
+def _retry_missing_sections(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    provider: LLMProvider,
+    missing_sections: list[tuple[tuple[str, str, str, int, int, int], str]],
+    result: dict[str, Any],
+    warnings: list[str],
+    emit=None,
+) -> None:
+    seen: set[str] = set()
+    for spec, reason in missing_sections:
+        key, title, count_hint, min_count, max_tokens, limit = spec
+        if result.get(key) or key in seen:
+            continue
+        seen.add(key)
+        _emit(emit, 30, f"拆分重试说明书公共章节：{title}", material_type="GPT 拆分重试")
+        try:
+            paragraphs = _generate_section(task, blueprint, provider, key, title, count_hint, min_count, max_tokens, limit)
+            if paragraphs:
+                result[key] = paragraphs
+                continue
+        except Exception as exc:
+            reason = f"{reason}；拆分重试失败：{sanitize_error_message(exc)}"
+        warnings.append(f"{title}模型生成失败，需重试：{sanitize_error_message(reason)}")
+
+
+def _retry_missing_modules(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    provider: LLMProvider,
+    missing_modules: list[tuple[Any, str]],
+    result: dict[str, Any],
+    warnings: list[str],
+    emit=None,
+) -> None:
+    seen: set[str] = set()
+    modules_result = result.setdefault("modules", {})
+    for module, reason in missing_modules:
+        module_key = str(getattr(module, "key", "") or "")
+        module_title = str(getattr(module, "title", "") or module_key or "功能模块")
+        if not module_key or module_key in modules_result or module_key in seen:
+            continue
+        seen.add(module_key)
+        _emit(emit, 31, f"拆分重试说明书模块章节：{module_title}", material_type="GPT 拆分重试")
+        try:
+            module_content = _generate_module_section(task, blueprint, provider, module)
+            if module_content:
+                modules_result[module_key] = module_content
+                continue
+        except Exception as exc:
+            reason = f"{reason}；拆分重试失败：{sanitize_error_message(exc)}"
+        warnings.append(f"{module_title}模型生成失败，需重试：{sanitize_error_message(reason)}")
+
+
 def _chunks(items, size: int):
     items = list(items)
     for index in range(0, len(items), size):
@@ -159,9 +254,9 @@ def _chunks(items, size: int):
 
 def _llm_batch_workers() -> int:
     try:
-        value = int(os.getenv("SOFT_LLM_BATCH_WORKERS", "1"))
+        value = int(os.getenv("SOFT_LLM_BATCH_WORKERS", "2"))
     except ValueError:
-        value = 1
+        value = 2
     return max(1, min(3, value))
 
 
@@ -169,7 +264,9 @@ def _generation_quality_profile(task: GenerationTask) -> str:
     value = os.getenv("SOFT_GENERATION_PROFILE", "").strip().lower()
     if value in {"fast", "speed", "batch"}:
         return "fast"
-    return "authenticity-first"
+    if value in {"authenticity-first", "authenticity", "quality", "strict"}:
+        return "authenticity-first"
+    return "balanced"
 
 
 def _authenticity_first(task: GenerationTask) -> bool:
@@ -178,11 +275,11 @@ def _authenticity_first(task: GenerationTask) -> bool:
 
 def _section_specs() -> list[tuple[str, str, str, int, int, int]]:
     return [
-        ("overview", "软件概述", "6-8个段落", 4, 1300, 220),
-        ("login_main", "登录与主界面", "6-8个段落", 4, 1300, 220),
-        ("statistics", "统计分析", "6-8个段落", 4, 1300, 220),
-        ("security", "权限与安全", "6-8个段落", 4, 1300, 220),
-        ("faq", "常见问题处理", "4-6个段落", 3, 900, 180),
+        ("overview", "软件概述", "2-3个段落", 2, 850, 150),
+        ("login_main", "登录与主界面", "2-3个段落", 2, 850, 150),
+        ("statistics", "统计分析", "2-3个段落", 2, 850, 150),
+        ("security", "权限与安全", "2-3个段落", 2, 850, 150),
+        ("faq", "常见问题处理", "3个段落", 2, 700, 130),
     ]
 
 
@@ -217,9 +314,12 @@ def _generate_section_batch(
 
 要求：
 - 每个章节按 count_hint 生成段落，至少达到 min_count
-- 段落写成软件说明书口吻，描述具体操作、界面、规则或业务能力
+- 段落写成真实软件用户手册口吻，像人工编写的操作指南，描述具体入口、页面、数据项、按钮和保存后的变化
+- 每段控制在 80-140 个中文字符，避免长报告式堆叠
 - 内容必须贴合产品方案中的具体场景、业务对象、流程、指标和规则
 - 不要只写通用后台能力，每段至少包含一个具体业务对象、页面、指标、状态或操作
+- 不要使用“操作说明：”“字段说明：”“处理结果：”“业务一致性：”“界面说明：”这类固定标签
+- 避免每章都重复“登记、校验、分析、确认”的同一组动作，按当前模块实际 operations 改写
 - 不要出现“AI”“模板”“示例”“假设”等字样
 - 不要写申请主体、公司名称、联系人、费用、包过承诺
 - 只返回 JSON
@@ -273,9 +373,12 @@ def _generate_section(
 
 章节要求：
 - 生成 {count_hint}
-- 段落写成软件说明书口吻，描述具体操作、界面、规则或业务能力
+- 段落写成真实软件用户手册口吻，像人工编写的操作指南，描述具体入口、页面、数据项、按钮和保存后的变化
+- 每段控制在 80-140 个中文字符，避免长报告式堆叠
 - 内容必须贴合产品方案中的具体场景、业务对象、流程、指标和规则
 - 不要只写通用后台能力，每段至少包含一个具体业务对象、页面、指标、状态或操作
+- 不要使用“操作说明：”“字段说明：”“处理结果：”“业务一致性：”“界面说明：”这类固定标签
+- 避免每章都重复“登记、校验、分析、确认”的同一组动作，按当前章节实际业务改写
 - 只返回 JSON，格式为：{{"paragraphs":["段落1","段落2"]}}
 
 禁止：
@@ -333,12 +436,15 @@ def _generate_module_batch(
 
 返回 JSON 字段：
 - modules: 对象，key 为模块 key，值包含 title 和 paragraphs
-- 每个模块 paragraphs 生成 6-8 个段落，说明入口、查询、新增、编辑、审核、导出、日志、校验、权限联动等操作
+- 每个模块 paragraphs 生成 2-3 个段落，说明入口、查询、新增、编辑、审核、导出、日志、校验、权限联动等操作
 
 要求：
 - 每个模块内容必须只围绕该模块展开
 - 必须使用该模块的 operations、data_fields、pages、rules 中的具体词语
-- 段落写成用户手册/操作手册口吻
+- 段落写成真实软件用户手册口吻，像人工编写的模块使用指南
+- 每段控制在 80-140 个中文字符，避免长报告式堆叠
+- 不要使用“操作说明：”“字段说明：”“处理结果：”“业务一致性：”“界面说明：”这类固定标签
+- 不要把所有模块都写成同一套“查询、新增、编辑、审核、导出、日志、校验、权限联动”；应按当前模块 operations 选择不同动作顺序和句式
 - 不要出现“AI”“模板”“示例”“假设”等字样
 - 不要写申请主体、公司名称、联系人、费用、包过承诺
 - 只返回 JSON
@@ -368,7 +474,7 @@ def _module_content_from_data(data: dict[str, Any], module) -> dict[str, Any] | 
         value = data.get(module.key)
     if not isinstance(value, dict):
         return None
-    paragraphs = _paragraphs(value.get("paragraphs"), min_count=4, limit=220)
+    paragraphs = _paragraphs(value.get("paragraphs"), min_count=2, limit=150)
     if not paragraphs:
         return None
     return {
@@ -408,12 +514,15 @@ def _generate_module_section(
 返回 JSON 字段：
 - key: 必须为 "{module.key}"
 - title: 模块中文标题
-- paragraphs: 8-10个段落，说明入口、查询、新增、编辑、审核、导出、日志、校验、权限联动等操作
+- paragraphs: 2-3个段落，说明入口、查询、新增、编辑、审核、导出、日志、校验、权限联动等操作
 
 要求：
 - 内容必须只围绕当前模块展开
 - 必须使用当前模块的 operations、data_fields、pages、rules 中的具体词语
-- 段落写成用户手册/操作手册口吻
+- 段落写成真实软件用户手册口吻，像人工编写的模块使用指南
+- 每段控制在 80-140 个中文字符，避免长报告式堆叠
+- 不要使用“操作说明：”“字段说明：”“处理结果：”“业务一致性：”“界面说明：”这类固定标签
+- 不要把所有模块都写成同一套“查询、新增、编辑、审核、导出、日志、校验、权限联动”；应按当前模块 operations 选择不同动作顺序和句式
 - 不要出现“AI”“模板”“示例”“假设”等字样
 - 不要写申请主体、公司名称、联系人、费用、包过承诺
 - 只返回 JSON
@@ -423,12 +532,12 @@ def _generate_module_section(
     content = provider.chat(
         messages,
         temperature=_temperature(task.randomness),
-        max_tokens=1600,
+        max_tokens=900,
         response_format={"type": "json_object"},
         trace_label=f"manual:{module.title}",
     )
     data = _parse_json(content)
-    paragraphs = _paragraphs(data.get("paragraphs"), min_count=4, limit=220)
+    paragraphs = _paragraphs(data.get("paragraphs"), min_count=2, limit=150)
     if not paragraphs:
         raise ValueError("模块有效段落不足")
     return {
@@ -478,6 +587,7 @@ def _build_context(task: GenerationTask, blueprint: ProductBlueprint) -> str:
 def _system_prompt() -> str:
     return (
         "你是中文软件著作权软件说明书撰写专家。请根据产品蓝图生成可直接写入 Word 的说明书正文。"
+        "文字应接近客户提交材料中的传统用户手册，不要写成模板字段说明，也不要出现内部生成流程。"
         "只返回 JSON，不要返回 Markdown，不要编造申请主体信息，不要承诺包过。"
     )
 
@@ -542,6 +652,7 @@ def _chat_json(
             return data
         except Exception as exc:
             last_error = exc
+            safe_error = sanitize_error_message(exc, limit=500)
             trace_event(
                 "chat_json_error",
                 layer="manual",
@@ -549,19 +660,19 @@ def _chat_json(
                 attempt=attempt + 1,
                 elapsed_seconds=round(time.perf_counter() - started_at, 3),
                 error_type=type(exc).__name__,
-                error=str(exc)[:500],
+                error=safe_error,
             )
             if attempt < total_attempts - 1:
                 current_messages = messages + [
                     {
                         "role": "user",
                         "content": (
-                            f"上一次{label}没有得到可解析 JSON，错误摘要：{str(exc)[:120]}。"
+                            f"上一次{label}没有得到可解析 JSON，错误摘要：{sanitize_error_message(exc, limit=120)}。"
                             "请重新输出严格 JSON 对象，不要 Markdown，不要解释文字。"
                         ),
                     }
                 ]
-    raise RuntimeError(f"{label}请求失败：{last_error}")
+    raise RuntimeError(f"{label}请求失败：{sanitize_error_message(last_error)}")
 
 
 def _paragraphs(value: Any, min_count: int, limit: int) -> list[str]:
