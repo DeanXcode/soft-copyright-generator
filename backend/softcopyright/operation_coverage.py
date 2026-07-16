@@ -105,6 +105,25 @@ def operation_category(action: str) -> str:
     return "workflow"
 
 
+def module_operation_category(module: Any, action: str, action_key: str = "") -> str:
+    normalized_action = str(action or "").strip()
+    normalized_key = str(action_key or "").strip()
+    for value in getattr(module, "operation_specs", None) or []:
+        if not isinstance(value, dict):
+            continue
+        value_key = str(value.get("action_key") or value.get("actionKey") or "").strip()
+        value_label = str(value.get("label") or value.get("action") or value.get("name") or "").strip()
+        if normalized_key:
+            if value_key != normalized_key:
+                continue
+        elif value_label != normalized_action:
+            continue
+        spec = operation_spec_from_mapping(value)
+        if spec is not None:
+            return spec.category
+    return operation_category(normalized_action)
+
+
 def operation_spec(action: str, *, source: str = "module") -> OperationCoverageSpec:
     label = operation_action_label(action)
     category = operation_category(label)

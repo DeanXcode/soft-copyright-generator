@@ -9,12 +9,18 @@ from backend.softcopyright.blueprint import FeatureModule, ProductBlueprint
 from backend.softcopyright.docgen import (
     _actual_screenshot_action_labels,
     _actual_screenshot_operation_notes,
+    _manual_ui_button_label_match,
     analyze_manual_ui_consistency,
 )
 from backend.softcopyright.screenshots import UiScreenshot
 
 
 class ManualUiConsistencyTests(unittest.TestCase):
+    def test_symbol_only_button_labels_match_exact_screenshot_actions(self):
+        self.assertTrue(_manual_ui_button_label_match("↻", ["查询计划", "↻"]))
+        self.assertTrue(_manual_ui_button_label_match(" ◉ ", ["◉"]))
+        self.assertFalse(_manual_ui_button_label_match("!", ["确认"]))
+
     def _blueprint(self):
         return ProductBlueprint(
             software_name="质量管理系统",

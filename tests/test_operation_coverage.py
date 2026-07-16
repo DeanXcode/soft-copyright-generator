@@ -5,6 +5,7 @@ import unittest
 
 from backend.softcopyright.operation_coverage import (
     configured_operation_screen_count,
+    module_operation_category,
     module_operation_coverage,
     operation_spec,
 )
@@ -116,6 +117,32 @@ class OperationCoverageTests(unittest.TestCase):
         self.assertEqual(specs[0].role, "车间主管")
         self.assertIn("工单编号", specs[0].input_fields)
         self.assertTrue(any(spec.action == "下达生产工单" for spec in specs))
+
+    def test_structured_action_key_preserves_lookup_category_for_non_keyword_label(self):
+        module = SimpleNamespace(
+            operation_specs=[
+                {
+                    "action_key": "compare_forecast_scenarios",
+                    "label": "对比产能预测方案",
+                    "category": "lookup",
+                },
+                {
+                    "action_key": "generate_capacity_forecast",
+                    "label": "生成可用产能预测",
+                    "category": "workflow",
+                },
+            ]
+        )
+
+        self.assertEqual(
+            module_operation_category(module, "对比产能预测方案", "compare_forecast_scenarios"),
+            "lookup",
+        )
+        self.assertEqual(
+            module_operation_category(module, "生成可用产能预测", "generate_capacity_forecast"),
+            "workflow",
+        )
+        self.assertEqual(module_operation_category(module, "查看预测详情"), "lookup")
 
     def test_only_destructive_operations_require_confirmation(self):
         delete_spec = operation_spec("\u5220\u9664")

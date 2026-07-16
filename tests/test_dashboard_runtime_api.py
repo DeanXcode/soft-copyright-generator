@@ -153,6 +153,193 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}.operation-result{width:
         self.assertNotEqual(runtime["resultMaxHeight"], "42px")
         self.assertFalse(issues)
 
+    def test_detail_operation_result_stays_inside_fixed_admin_workspace(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            page_path = root / "operation-detail.html"
+            page_path.write_text(
+                """<!doctype html><html><head><style>
+body{margin:0;width:1280px;height:720px;overflow:hidden}
+.shared-app-main{height:654px;margin-top:66px;overflow:hidden}
+.screen-root{height:100%;display:flex;flex-direction:column;gap:8px;padding:10px;overflow:hidden}
+.query-strip{height:96px;flex:0 0 96px;background:#fff}
+.work-area{min-height:0;flex:1;display:grid;grid-template-columns:255px 1fr;gap:8px}
+.result-rail,.detail-panel{min-height:0;border:1px solid #ddd}
+.detail-panel{display:flex;flex-direction:column;overflow:hidden}
+.order-banner{height:67px;flex:0 0 67px;padding:9px 13px;background:#132f49;color:#fff}
+.metrics{height:91px;flex:0 0 91px}
+.detail-grid{padding:8px;display:grid;grid-template-columns:1.55fr 1fr;grid-template-rows:1.03fr .97fr;gap:8px}
+.detail-grid>section{min-height:246px;border:1px solid #ddd;overflow:hidden}
+</style></head><body data-page-kind="operation" data-module-key="inventory" data-renderer="admin" data-ai-frontend="true">
+<div class="shared-app-main"><div class="screen-root"><section class="query-strip">生产工单查询条件</section>
+<div class="work-area"><aside class="result-rail">关联工单</aside><main class="detail-panel operation-result">
+<div class="order-banner"><div class="eyebrow">当前生产工单 · 来源 MPS-2026-W29 / V4.1 WO-20260716-0386</div><h2>生产工单详情</h2></div>
+<div class="metrics">计划数量、执行进度、计划交期、物料齐套</div>
+<div class="detail-grid"><section>工艺路线</section><section>风险提示</section><section>物料需求与齐套快照</section><section>状态时间线</section></div>
+</main></div></div></div></body></html>""",
+                encoding="utf-8",
+            )
+            _inject_runtime_script_into_ai_page(page_path, module_keys=["inventory"])
+            handler = partial(_RuntimeApiHandler, directory=str(root))
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                from playwright.sync_api import sync_playwright
+
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(headless=True)
+                    page = browser.new_page(viewport={"width": 1280, "height": 720})
+                    page.goto(f"http://127.0.0.1:{server.server_port}/operation-detail.html", wait_until="networkidle")
+                    page.wait_for_function("() => window.__runtimeApiReady === true || window.__runtimeApiError")
+                    _auto_repair_page_text_layout(page, "admin")
+                    runtime = page.evaluate(
+                        """() => ({
+                          sourceText: document.querySelector('.eyebrow')?.textContent || '',
+                          detailBottom: document.querySelector('.detail-panel')?.getBoundingClientRect().bottom || 0,
+                          gridBottom: document.querySelector('.detail-grid')?.getBoundingClientRect().bottom || 0
+                        })"""
+                    )
+                    issues = _collect_page_text_layout_issues(page, include_overlaps=True)
+                    browser.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertIn("当前生产工单 · 来源 MPS-2026-W29 / V4.1", runtime["sourceText"])
+        self.assertLessEqual(runtime["detailBottom"], 720)
+        self.assertLessEqual(runtime["gridBottom"], 720)
+        self.assertFalse(issues)
+
+    def test_table_operation_result_resists_cross_screen_metric_flex_rules(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            page_path = root / "operation-comparison.html"
+            page_path.write_text(
+                """<!doctype html><html><head><style>
+body{margin:0;width:1280px;height:720px;overflow:hidden}
+.shared-app-main{height:654px;margin-top:66px;overflow:hidden}
+.screen-root{height:100%;display:flex;flex-direction:column;gap:8px;padding:10px 14px 12px;overflow:hidden}
+.condition-bar{height:110px;flex:0 0 110px;background:#fff}
+.metric-strip{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid #ddd}
+.workspace{min-height:0;flex:1;display:grid;grid-template-columns:minmax(0,1fr) 252px;gap:8px;overflow:hidden}
+.comparison-main{min-width:0;display:grid;grid-template-rows:minmax(205px,1fr) auto;gap:8px}
+.trend-panel{min-height:205px;border:1px solid #ddd;overflow:hidden}
+.table-panel{min-height:246px;padding:9px 10px;border:1px solid #ddd;overflow:hidden}
+.table-panel table{width:100%;border-collapse:collapse;margin-top:7px}
+.table-panel th,.table-panel td{padding:6px;border:1px solid #ddd;white-space:nowrap}
+.execution-rail{min-height:495px;border:1px solid #ddd;overflow:hidden}
+.metric-strip{flex:1}
+</style></head><body data-page-kind="operation" data-module-key="inventory" data-renderer="admin" data-ai-frontend="true">
+<div class="shared-app-main"><div class="screen-root"><section class="condition-bar">方案对比条件</section>
+<section class="metric-strip"><div>最优可用产能</div><div>最小产能缺口</div><div>峰值资源负荷</div><div>预计按期交付</div></section>
+<div class="workspace"><main class="comparison-main"><section class="trend-panel">供需与可用产能差异</section>
+<section class="table-panel table-frame operation-result"><div class="panel-title"><b>方案结果证据</b><span>统一口径：件 / 日，停机损失已去重</span></div>
+<table><thead><tr><th>方案</th><th>可用产能</th><th>产能缺口</th></tr></thead><tbody>
+<tr><td>当前计划</td><td>11,510</td><td>-1,590</td></tr><tr><td>加开晚班</td><td>12,480</td><td>-620</td></tr><tr><td>停机压缩</td><td>12,060</td><td>-1,040</td></tr>
+</tbody></table></section></main><aside class="execution-rail runtime-record-panel">执行状态与决策摘要</aside></div>
+</div></div></body></html>""",
+                encoding="utf-8",
+            )
+            _inject_runtime_script_into_ai_page(page_path, module_keys=["inventory"])
+            handler = partial(_RuntimeApiHandler, directory=str(root))
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                from playwright.sync_api import sync_playwright
+
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(headless=True)
+                    page = browser.new_page(viewport={"width": 1280, "height": 720})
+                    page.goto(f"http://127.0.0.1:{server.server_port}/operation-comparison.html", wait_until="networkidle")
+                    page.wait_for_function("() => window.__runtimeApiReady === true || window.__runtimeApiError")
+                    _auto_repair_page_text_layout(page, "admin")
+                    runtime = page.evaluate(
+                        """() => ({
+                          metricHeight: document.querySelector('.metric-strip')?.getBoundingClientRect().height || 0,
+                          workspaceBottom: document.querySelector('.workspace')?.getBoundingClientRect().bottom || 0,
+                          tableBottom: document.querySelector('.table-panel')?.getBoundingClientRect().bottom || 0,
+                          evidence: document.querySelector('.panel-title')?.textContent || ''
+                        })"""
+                    )
+                    issues = _collect_page_text_layout_issues(page, include_overlaps=True)
+                    browser.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertLessEqual(runtime["metricHeight"], 86)
+        self.assertLessEqual(runtime["workspaceBottom"], 720)
+        self.assertLessEqual(runtime["tableBottom"], 720)
+        self.assertIn("方案结果证据", runtime["evidence"])
+        self.assertFalse(issues)
+
+    def test_modal_overlay_keeps_full_canvas_and_does_not_conflict_with_background_tags(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            page_path = root / "operation-modal.html"
+            page_path.write_text(
+                """<!doctype html><html><head><style>
+body{margin:0;width:1280px;height:720px;overflow:hidden}
+.screen-root{position:relative;width:1280px;height:720px;overflow:hidden}
+.tag{position:absolute;left:340px;top:298px;padding:2px 7px;background:#fce8dc}
+.confirm-layer{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(7,25,41,.48);z-index:5}
+.confirm-dialog{width:1120px;background:#fff;border:1px solid #83909b}
+.confirm-head,.confirm-footer{padding:16px 20px}.confirm-footer{display:flex;justify-content:flex-end;gap:8px}
+</style></head><body data-page-kind="operation" data-module-key="inventory" data-renderer="admin" data-ai-frontend="true">
+<main class="screen-root"><span class="tag">优先级 P1</span>
+<div class="confirm-layer" role="dialog" aria-modal="true" aria-label="确认评估产能改善建议">
+<section class="confirm-dialog operation-result"><div class="confirm-head"><h2>确认评估产能改善建议</h2><p>此操作将更新建议状态并建立后续产能验证范围。</p></div>
+<div class="confirm-footer"><button>取消</button><button>确认评估产能改善建议</button></div></section>
+</div></main></body></html>""",
+                encoding="utf-8",
+            )
+            _inject_runtime_script_into_ai_page(page_path, module_keys=["inventory"])
+            handler = partial(_RuntimeApiHandler, directory=str(root))
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                from playwright.sync_api import sync_playwright
+
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(headless=True)
+                    page = browser.new_page(viewport={"width": 1280, "height": 720})
+                    page.goto(f"http://127.0.0.1:{server.server_port}/operation-modal.html", wait_until="networkidle")
+                    page.wait_for_function("() => window.__runtimeApiReady === true || window.__runtimeApiError")
+                    _auto_repair_page_text_layout(page, "admin")
+                    runtime = page.evaluate(
+                        """() => {
+                          const layer = document.querySelector('.confirm-layer');
+                          const dialog = document.querySelector('.confirm-dialog');
+                          const layerRect = layer.getBoundingClientRect();
+                          const dialogRect = dialog.getBoundingClientRect();
+                          return {
+                            layerPosition: getComputedStyle(layer).position,
+                            layerRect: [layerRect.left, layerRect.top, layerRect.right, layerRect.bottom],
+                            dialogPosition: getComputedStyle(dialog).position,
+                            dialogRect: [dialogRect.left, dialogRect.top, dialogRect.right, dialogRect.bottom],
+                            dialogText: dialog.textContent || ''
+                          };
+                        }"""
+                    )
+                    issues = _collect_page_text_layout_issues(page, include_overlaps=True)
+                    browser.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(runtime["layerPosition"], "absolute")
+        self.assertEqual(runtime["layerRect"], [0, 0, 1280, 720])
+        self.assertEqual(runtime["dialogPosition"], "fixed")
+        self.assertGreater(runtime["dialogRect"][2] - runtime["dialogRect"][0], 600)
+        self.assertIn("确认评估产能改善建议", runtime["dialogText"])
+        self.assertFalse(issues)
+
     def test_dashboard_uses_injected_module_keys_and_renders_runtime_data(self):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

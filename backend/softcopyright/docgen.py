@@ -989,6 +989,9 @@ def _manual_ui_token(value: str) -> str:
 
 
 def _manual_ui_button_label_match(label: str, available: list[str]) -> bool:
+    exact = re.sub(r"\s+", "", str(label or "")).strip()
+    if exact and any(exact == re.sub(r"\s+", "", str(item or "")).strip() for item in available):
+        return True
     token = _manual_ui_token(label)
     if not token:
         return False

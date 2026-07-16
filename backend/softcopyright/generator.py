@@ -29,7 +29,7 @@ from .llm.provider import LocalTemplateProvider
 from .llm_manual import generate_manual_content_with_llm
 from .models import GenerationTask
 from .module_keys import is_placeholder_module_key, semantic_module_key
-from .operation_coverage import configured_operation_screen_count, operation_category
+from .operation_coverage import configured_operation_screen_count, module_operation_category
 from .packager import make_zip_files, write_json
 from .blueprint import generate_blueprint
 from .product_experience import build_product_experience_spec, design_brief_matches_experience
@@ -659,7 +659,11 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         ]
         categories = list(
             dict.fromkeys(
-                operation_category(str(getattr(item, "interaction_action", "") or ""))
+                module_operation_category(
+                    module,
+                    str(getattr(item, "interaction_action", "") or ""),
+                    str(getattr(item, "interaction_action_key", "") or ""),
+                )
                 for item in module_items
                 if str(getattr(item, "interaction_action", "") or "")
             )
