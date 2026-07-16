@@ -320,6 +320,17 @@ def _generate_react_frontend_pages(
                 "file": Path(str(getattr(item, "html_path", ""))).name,
                 "page_kind": str(getattr(item, "page_kind", "") or "general"),
                 "module_key": str(getattr(item, "module_key", "") or ""),
+                "interaction_action": str(getattr(item, "interaction_action", "") or ""),
+                "interaction_mode": str(getattr(item, "interaction_mode", "") or ""),
+                "interaction_surface": str(getattr(item, "interaction_surface", "") or ""),
+                "requires_confirmation": bool(getattr(item, "requires_confirmation", False)),
+                "interaction_action_key": str(getattr(item, "interaction_action_key", "") or ""),
+                "interaction_role": str(getattr(item, "interaction_role", "") or ""),
+                "interaction_trigger": str(getattr(item, "interaction_trigger", "") or ""),
+                "interaction_input_fields": list(getattr(item, "interaction_input_fields", None) or []),
+                "interaction_pre_state": str(getattr(item, "interaction_pre_state", "") or ""),
+                "interaction_post_state": str(getattr(item, "interaction_post_state", "") or ""),
+                "interaction_result_evidence": str(getattr(item, "interaction_result_evidence", "") or ""),
                 "source": "react-vite-component",
                 "component": str(component_path),
                 "creative_key": creative_key,
@@ -352,6 +363,7 @@ def _generate_react_frontend_pages(
     imports = [str(item["import"]) for item in results]
     registrations = [str(item["registration"]) for item in results]
     pages = [dict(item["page"]) for item in results]
+    shared_confirmation_page_count = sum(1 for page in pages if bool(page.get("requires_confirmation")))
     _write_react_app_files(
         task=task,
         blueprint=blueprint,
@@ -378,6 +390,9 @@ def _generate_react_frontend_pages(
         "build_tool": "vite",
         "renderer": str(getattr(ui_blueprint, "renderer", "") or "admin"),
         "page_count": len(pages),
+        "shared_confirmation_contract": "shared-confirm-dialog-v1",
+        "shared_confirmation_page_count": shared_confirmation_page_count,
+        "shared_confirmation_ready": (react_dir / "src" / "SharedConfirmDialog.jsx").is_file(),
         "source_dir": str(react_dir),
         "visual_references": visual_reference_report,
         "pages": pages,
@@ -468,8 +483,11 @@ def _operation_prompt_rule(screenshot: Any) -> str:
     )
     if bool(getattr(screenshot, "requires_confirmation", False)):
         return (
-            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}该动作确需确认：使用接近屏幕宽度的居中弹窗，"
-            "说明影响范围并提供取消与确认；禁止贴底窄抽屉，禁止使用‘登记’替代真实动作名称。"
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}该动作确需确认。"
+            "系统将通过 SharedConfirmDialog 统一渲染可见弹窗，本组件禁止自行设计可见遮罩、弹窗卡片或按钮栏。"
+            "必须在页面根节点内提供 <section hidden data-shared-confirm-source=\"true\"> 语义源，其中包含 "
+            "data-confirm-title 标题、data-confirm-description 说明、2-4 个带 data-confirm-item/data-label/data-value 的影响项、"
+            "data-confirm-note 状态影响和 data-confirm-action 确认按钮文字；禁止使用‘登记’替代真实动作名称。"
         )
     if mode == "query":
         return (
@@ -581,6 +599,7 @@ def _generate_react_component(
 - 相邻页面只在内容区的主体拓扑、数据呈现和操作路径上体现差异，不得改变共享外壳或重新设计顶栏。
 - 登录、仪表盘、模块工作区、操作页和统计页要像同一产品中的不同真实路由，而不是同一模板换文字。
 - 操作页必须严格服从 interaction_action、interaction_surface 和 requires_confirmation；即时操作不得擅自增加确认弹窗、登记表单或“确认登记”按钮。
+- requires_confirmation=true 时只提供 data-shared-confirm-source 隐藏语义源，不得输出另一套可见弹窗；可见确认框统一由系统公共组件渲染。
 - 使用真实中文业务数据、按钮、状态、表单、表格、图表、流程、时间线、任务板或地图工作区；按当前业务选择，不要求每类控件都出现。
 - CSS 必须以 .{css_scope} 为作用域，不引用 CDN、图片、字体、SVG 或网络资源；首屏铺满且文字不能溢出。
 - 所有样式都写入 css 字段，JSX 中不要使用 style 字符串或 style 对象。
@@ -625,6 +644,10 @@ def _generate_react_component(
         raise ValueError("React 页面 CSS 未按页面作用域隔离")
     if re.search(r"@import|url\s*\(", css, flags=re.I):
         raise ValueError("React 页面 CSS 引用了外部资源")
+    if bool(getattr(screenshot, "requires_confirmation", False)):
+        required_markers = ("data-shared-confirm-source", "data-confirm-title", "data-confirm-action")
+        if not all(marker in jsx for marker in required_markers):
+            raise ValueError("确认操作页缺少 SharedConfirmDialog 语义源")
     return {"jsx": jsx, "css": css}
 
 
@@ -757,6 +780,17 @@ def _write_react_app_files(
             "page_kind": str(page.get("page_kind") or "general"),
             "module_key": str(page.get("module_key") or ""),
             "section": _shared_shell_section(page),
+            "interaction_action": str(page.get("interaction_action") or ""),
+            "interaction_mode": str(page.get("interaction_mode") or ""),
+            "interaction_surface": str(page.get("interaction_surface") or ""),
+            "requires_confirmation": bool(page.get("requires_confirmation")),
+            "interaction_action_key": str(page.get("interaction_action_key") or ""),
+            "interaction_role": str(page.get("interaction_role") or ""),
+            "interaction_trigger": str(page.get("interaction_trigger") or ""),
+            "interaction_input_fields": list(page.get("interaction_input_fields") or []),
+            "interaction_pre_state": str(page.get("interaction_pre_state") or ""),
+            "interaction_post_state": str(page.get("interaction_post_state") or ""),
+            "interaction_result_evidence": str(page.get("interaction_result_evidence") or ""),
         }
         for page in pages
         if str(page.get("key") or "")
@@ -775,22 +809,25 @@ def _write_react_app_files(
         ],
     }
     (src_dir / "SharedAppShell.jsx").write_text(_shared_app_shell_source(), encoding="utf-8")
-    app_source = "\n".join(imports) + '\nimport SharedAppShell from "./SharedAppShell.jsx";\n\nconst screens = {\n' + "\n".join(registrations) + "\n};\n" + f'''\nconst screenMeta = {json.dumps(screen_meta, ensure_ascii=False, indent=2)};
+    (src_dir / "SharedConfirmDialog.jsx").write_text(_shared_confirm_dialog_source(), encoding="utf-8")
+    app_source = "\n".join(imports) + '\nimport SharedAppShell from "./SharedAppShell.jsx";\nimport SharedConfirmDialog from "./SharedConfirmDialog.jsx";\n\nconst screens = {\n' + "\n".join(registrations) + "\n};\n" + f'''\nconst screenMeta = {json.dumps(screen_meta, ensure_ascii=False, indent=2)};
 const shellConfig = {json.dumps(shell_config, ensure_ascii=False, indent=2)};
 
 export default function App() {{
   const key = window.__SOFT_SCREEN_KEY__ || new URLSearchParams(window.location.search).get("screen") || {json.dumps(default_key, ensure_ascii=False)};
   const Screen = screens[key] || screens[{json.dumps(default_key, ensure_ascii=False)}];
-  return <div className="generated-product" data-renderer={json.dumps(renderer)} data-software={json.dumps(task.software_name, ensure_ascii=False)}>
-    <SharedAppShell renderer={json.dumps(renderer)} screenKey={{key}} screenMeta={{screenMeta[key] || {{}}}} config={{shellConfig}}>
+  const meta = screenMeta[key] || {{}};
+  return <div className="generated-product" data-renderer={json.dumps(renderer)} data-software={json.dumps(task.software_name, ensure_ascii=False)} data-shared-confirmation-contract="v1" data-shared-confirmation={{meta.requires_confirmation ? "true" : "false"}}>
+    <SharedAppShell renderer={json.dumps(renderer)} screenKey={{key}} screenMeta={{meta}} config={{shellConfig}}>
       <Screen />
+      <SharedConfirmDialog screenKey={{key}} screenMeta={{meta}} />
     </SharedAppShell>
   </div>;
 }}
 '''
     (src_dir / "App.jsx").write_text(app_source, encoding="utf-8")
     mobile_css = "max-width:720px;margin:0 auto;" if renderer in {"mobile_app", "game"} else "width:100%;"
-    (src_dir / "theme.css").write_text(_shared_app_shell_css(mobile_css), encoding="utf-8")
+    (src_dir / "theme.css").write_text(_shared_app_shell_css(mobile_css) + _shared_confirm_dialog_css(), encoding="utf-8")
 
 
 def _shared_shell_section(page: dict[str, Any]) -> str:
@@ -828,8 +865,157 @@ export default function SharedAppShell({ renderer, screenKey, screenMeta, config
 '''
 
 
+def _shared_confirm_dialog_source() -> str:
+    return '''import React, { useEffect, useMemo, useState } from "react";
+
+const clean = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+const clip = (value, limit) => {
+  const text = clean(value);
+  return text.length > limit ? `${text.slice(0, Math.max(1, limit - 1))}…` : text;
+};
+const splitList = (value) => {
+  const values = Array.isArray(value) ? value : String(value || "").replace(/[\\[\\]'\"]/g, "").split(/[,，、;；|]/);
+  return Array.from(new Set(values.map((item) => clean(item)).filter(Boolean)));
+};
+const fallbackData = (meta) => {
+  const action = clip(meta?.interaction_action || meta?.title || "当前操作", 32);
+  const roles = splitList(meta?.interaction_role).slice(0, 3).join("、") || "当前授权用户";
+  const pairs = [
+    { label: "当前操作", value: action },
+    { label: "执行角色", value: roles },
+    { label: "执行前状态", value: clip(meta?.interaction_pre_state || "当前业务状态已核验", 42) },
+    { label: "执行后状态", value: clip(meta?.interaction_post_state || "系统将记录处理结果", 42) },
+  ];
+  return {
+    title: action.startsWith("确认") ? action : `确认${action}`,
+    description: clip(meta?.interaction_trigger || "该操作将更新业务状态，请核对影响范围。", 92),
+    pairs,
+    evidence: splitList(meta?.interaction_result_evidence).slice(0, 4),
+    note: clip(meta?.interaction_post_state || "确认后系统将保存处理结果并记录操作轨迹。", 116),
+    actionLabel: action.startsWith("确认") ? action : `确认${action}`,
+  };
+};
+const itemPairs = (root) => Array.from(root?.querySelectorAll?.("[data-confirm-item],.impact-grid>div,.impact-summary>div,.confirm-summary>div,.confirm-order") || []).map((node) => {
+  const children = Array.from(node.children || []);
+  const labelNode = children.find((child) => child.matches?.("span,dt,label,small"));
+  const valueNode = children.find((child) => child.matches?.("strong,b,dd"));
+  const label = clip(node.getAttribute("data-label") || labelNode?.textContent, 20);
+  const value = clip(node.getAttribute("data-value") || valueNode?.textContent, 46);
+  return label && value ? { label, value } : null;
+}).filter(Boolean);
+const semanticData = (root) => {
+  const source = root?.querySelector?.('[data-shared-confirm-source="true"]');
+  if (!source) return null;
+  return {
+    title: clip(source.querySelector("[data-confirm-title]")?.textContent, 38),
+    description: clip(source.querySelector("[data-confirm-description]")?.textContent, 92),
+    pairs: itemPairs(source),
+    evidence: Array.from(source.querySelectorAll("[data-confirm-evidence]")).map((node) => clip(node.textContent, 20)).filter(Boolean),
+    note: clip(source.querySelector("[data-confirm-note]")?.textContent, 116),
+    actionLabel: clip(source.querySelector("[data-confirm-action]")?.textContent, 32),
+  };
+};
+const legacyData = (root) => {
+  const dialog = root?.querySelector?.('[role="dialog"],.confirm-dialog,.confirm-modal,.modal-dialog,.modal-card,.dialog-panel,.confirm-panel,.danger-confirm');
+  if (!dialog) return null;
+  const buttons = Array.from(dialog.querySelectorAll("button")).map((button) => clean(button.textContent)).filter(Boolean);
+  const actionLabel = [...buttons].reverse().find((label) => !/取消|返回|关闭/.test(label)) || "";
+  return {
+    title: clip(dialog.querySelector("[data-confirm-title],h1,h2,h3")?.textContent, 38),
+    description: clip(dialog.querySelector("[data-confirm-description],p")?.textContent, 92),
+    pairs: itemPairs(dialog),
+    evidence: [],
+    note: clip(dialog.querySelector("[data-confirm-note],.confirm-warning,.impact-note,.notice,.confirm-note")?.textContent, 116),
+    actionLabel: clip(actionLabel, 32),
+  };
+};
+const mergeData = (extracted, fallback) => {
+  const pairs = [];
+  for (const pair of [...(extracted?.pairs || []), ...fallback.pairs]) {
+    if (!pair?.label || !pair?.value || pairs.some((item) => item.label === pair.label && item.value === pair.value)) continue;
+    pairs.push(pair);
+    if (pairs.length >= 4) break;
+  }
+  return {
+    title: extracted?.title || fallback.title,
+    description: extracted?.description || fallback.description,
+    pairs,
+    evidence: extracted?.evidence?.length ? extracted.evidence.slice(0, 4) : fallback.evidence,
+    note: extracted?.note || fallback.note,
+    actionLabel: extracted?.actionLabel || fallback.actionLabel,
+  };
+};
+
+export default function SharedConfirmDialog({ screenKey, screenMeta }) {
+  const fallback = useMemo(() => fallbackData(screenMeta), [screenMeta]);
+  const [dialog, setDialog] = useState(fallback);
+  useEffect(() => {
+    if (!screenMeta?.requires_confirmation) return undefined;
+    const frame = requestAnimationFrame(() => {
+      const root = document.querySelector(".shared-app-main .screen-root,.screen-root");
+      setDialog(mergeData(semanticData(root) || legacyData(root), fallback));
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [screenKey, screenMeta, fallback]);
+  if (!screenMeta?.requires_confirmation) return null;
+  const titleId = `shared-confirm-title-${String(screenKey || "page").replace(/[^A-Za-z0-9_-]/g, "-")}`;
+  return <div className="shared-confirm-layer" data-shared-confirm-layer="true">
+    <section className="shared-confirm-dialog" data-shared-confirm-dialog="true" data-shared-confirm-ready="true" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+      <header className="shared-confirm-header">
+        <span className="shared-confirm-mark" aria-hidden="true">!</span>
+        <div><span className="shared-confirm-kicker">关键业务操作确认</span><h2 id={titleId}>{dialog.title}</h2><p>{dialog.description}</p></div>
+      </header>
+      <div className="shared-confirm-body">
+        <div className="shared-confirm-summary">{dialog.pairs.slice(0, 4).map((item, index) => <div key={`${item.label}-${index}`}><span>{item.label}</span><strong>{item.value}</strong></div>)}</div>
+        {dialog.evidence.length > 0 && <div className="shared-confirm-evidence"><span>结果依据</span>{dialog.evidence.slice(0, 4).map((item) => <b key={item}>{item}</b>)}</div>}
+        <div className="shared-confirm-note"><strong>状态影响</strong><span>{dialog.note}</span></div>
+      </div>
+      <footer className="shared-confirm-actions"><button className="shared-confirm-cancel" type="button">取消</button><button className="shared-confirm-primary" type="button">{dialog.actionLabel}</button></footer>
+    </section>
+  </div>;
+}
+'''
+
+
 def _shared_app_shell_css(mobile_css: str) -> str:
     return f'''*{{box-sizing:border-box}}html,body,#root{{margin:0;width:100%;height:100%;overflow:hidden}}body{{font-family:'Microsoft YaHei','PingFang SC',Arial,sans-serif;background:#eef2f7;color:#172033}}button,input,select,textarea{{font:inherit}}.generated-product{{height:100%;{mobile_css}}}.shared-app-shell{{height:100%;display:grid;grid-template-rows:66px minmax(0,1fr);background:#081a31;overflow:hidden}}.shared-app-header{{display:grid;grid-template-columns:minmax(280px,360px) minmax(420px,1fr) minmax(210px,280px);align-items:center;gap:18px;padding:0 18px;background:linear-gradient(90deg,#0a1c35,#102b4d 58%,#0a203c);border-bottom:1px solid rgba(96,165,250,.28);color:#e8f3ff;box-shadow:0 8px 22px rgba(2,12,27,.24);z-index:20}}.shared-app-brand{{display:flex;align-items:center;gap:11px;min-width:0}}.shared-app-mark{{width:38px;height:38px;flex:0 0 38px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(135deg,#f59e0b,#2563eb);color:white;font-weight:900;box-shadow:0 4px 14px rgba(37,99,235,.35)}}.shared-app-brand div,.shared-app-context{{min-width:0}}.shared-app-brand strong,.shared-app-brand small{{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-brand strong{{font-size:15px}}.shared-app-brand small{{margin-top:4px;color:#93c5fd;font-size:11px}}.shared-app-nav{{display:flex;align-items:center;justify-content:center;gap:6px;min-width:0;overflow:hidden}}.shared-app-nav span{{height:34px;display:inline-flex;align-items:center;padding:0 13px;border:1px solid rgba(147,197,253,.2);border-radius:6px;background:rgba(9,30,57,.62);color:#bfd7f5;font-size:12px;white-space:nowrap}}.shared-app-nav span.active{{background:#2563eb;border-color:#60a5fa;color:white;box-shadow:inset 0 -3px 0 #f59e0b}}.shared-app-context{{display:grid;grid-template-columns:1fr auto;align-items:center;column-gap:9px;text-align:right}}.shared-app-context span{{grid-column:1/3;color:#93c5fd;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-context strong{{margin-top:3px;color:#fef3c7;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-context em{{margin-top:3px;color:#7dd3fc;font-size:10px;font-style:normal;white-space:nowrap}}.shared-app-main{{min-height:0;overflow:hidden;position:relative}}.shared-app-main .screen-root{{width:100%!important;height:100%!important;min-height:0!important;max-height:100%!important;overflow:hidden!important}}.shared-app-main .screen-root>header:first-child,.shared-app-main .screen-root>.topbar:first-child,.shared-app-main .screen-root>.mobile-header:first-child,.shared-app-main .screen-root>.app-header:first-child{{display:none!important}}.shared-app-main .screen-root:has(>.mobile-header:first-child){{grid-template-rows:minmax(0,1fr) 78px!important}}@media(max-width:980px){{.shared-app-header{{grid-template-columns:minmax(220px,1fr) auto;padding:0 14px}}.shared-app-nav{{justify-content:flex-end}}.shared-app-nav span{{padding:0 9px}}.shared-app-context{{display:none}}}}.shared-app-shell-mobile_app{{grid-template-rows:72px minmax(0,1fr)}}.shared-app-shell-mobile_app .shared-app-header{{grid-template-columns:minmax(210px,1fr) minmax(300px,1.4fr);gap:10px;padding:0 16px}}.shared-app-shell-mobile_app .shared-app-context{{display:none}}.shared-app-shell-mobile_app .shared-app-nav{{justify-content:flex-end;overflow:hidden}}.shared-app-shell-mobile_app .shared-app-nav span{{padding:0 9px;font-size:11px}}.screen-root{{width:100%;height:100%;overflow:hidden}}
+'''
+
+
+def _shared_confirm_dialog_css() -> str:
+    return '''
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[class*="confirm"][class*="mask"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[class*="confirm"][class*="layer"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[class*="confirm"][class*="overlay"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[class*="modal"][class*="mask"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[class*="modal"][class*="layer"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[class*="modal"][class*="overlay"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[role="dialog"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>.confirm-dialog,
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>.confirm-modal{display:none!important;}
+.shared-confirm-layer{position:absolute;inset:0;z-index:120;display:grid;place-items:center;padding:24px;background:rgba(9,24,39,.64);backdrop-filter:blur(1px);}
+.shared-confirm-dialog{width:min(720px,calc(100vw - 48px));height:390px;max-height:calc(100vh - 48px);display:grid;grid-template-rows:104px minmax(0,1fr) 58px;overflow:hidden;background:#fff;border:1px solid #b9c3cc;border-top:4px solid #ea580c;border-radius:6px;box-shadow:0 22px 54px rgba(2,15,27,.38);color:#1c2a36;letter-spacing:0;}
+.shared-confirm-header{display:grid;grid-template-columns:38px minmax(0,1fr);gap:14px;align-items:start;padding:17px 22px 14px;border-bottom:1px solid #dce2e7;background:#fff;}
+.shared-confirm-mark{width:34px;height:34px;display:grid;place-items:center;border:1px solid #f0a06d;border-radius:50%;background:#fff1e8;color:#d94f08;font-size:20px;font-weight:800;line-height:1;}
+.shared-confirm-kicker{display:block;color:#b54708;font-size:10px;font-weight:700;}
+.shared-confirm-header h2{margin:2px 0 3px;font-size:19px;line-height:1.35;letter-spacing:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-confirm-header p{display:-webkit-box;overflow:hidden;margin:0;color:#667482;font-size:11px;line-height:1.5;-webkit-box-orient:vertical;-webkit-line-clamp:2;}
+.shared-confirm-body{min-height:0;display:grid;grid-template-rows:auto auto minmax(48px,1fr);gap:10px;padding:14px 22px;background:#fff;overflow:hidden;}
+.shared-confirm-summary{display:grid;grid-template-columns:1fr 1fr;border:1px solid #dce2e7;background:#dce2e7;gap:1px;min-height:112px;}
+.shared-confirm-summary>div{min-width:0;padding:10px 13px;background:#f6f8f9;}
+.shared-confirm-summary span,.shared-confirm-summary strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-confirm-summary span{color:#70808d;font-size:10px;}
+.shared-confirm-summary strong{margin-top:4px;color:#233545;font-size:12px;}
+.shared-confirm-evidence{min-height:28px;display:flex;align-items:center;gap:6px;overflow:hidden;white-space:nowrap;}
+.shared-confirm-evidence>span{flex:0 0 auto;color:#667482;font-size:10px;font-weight:700;}
+.shared-confirm-evidence b{min-width:0;padding:4px 7px;border:1px solid #b9dccc;background:#eef8f3;color:#176a48;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-confirm-note{min-height:48px;display:grid;grid-template-columns:64px minmax(0,1fr);gap:10px;align-items:start;padding:9px 11px;border-left:3px solid #ea580c;background:#fff6ef;color:#5b493d;overflow:hidden;}
+.shared-confirm-note strong{color:#b54708;font-size:11px;white-space:nowrap;}
+.shared-confirm-note span{display:-webkit-box;overflow:hidden;font-size:11px;line-height:1.55;-webkit-box-orient:vertical;-webkit-line-clamp:2;}
+.shared-confirm-actions{display:flex;align-items:center;justify-content:flex-end;gap:9px;padding:10px 22px;border-top:1px solid #dce2e7;background:#fafbfc;}
+.shared-confirm-actions button{height:34px;min-width:94px;padding:0 15px;border:1px solid #bfc8d0;border-radius:3px;background:#fff;color:#354451;font-size:11px;font-weight:700;white-space:nowrap;cursor:pointer;}
+.shared-confirm-actions .shared-confirm-primary{max-width:280px;overflow:hidden;border-color:#d94f08;background:#ea580c;color:#fff;text-overflow:ellipsis;}
+@media(max-width:760px){.shared-confirm-layer{padding:16px}.shared-confirm-dialog{width:calc(100vw - 32px);height:480px;grid-template-rows:112px minmax(0,1fr) 62px}.shared-confirm-body{padding:14px 16px}.shared-confirm-header,.shared-confirm-actions{padding-left:16px;padding-right:16px}.shared-confirm-summary{grid-template-columns:1fr}.shared-confirm-summary>div:nth-child(n+4){display:none}.shared-confirm-evidence b:nth-of-type(n+4){display:none}}
 '''
 
 

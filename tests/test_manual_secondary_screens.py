@@ -20,6 +20,7 @@ from backend.softcopyright.docgen import (
 from backend.softcopyright.screenshots import (
     UiScreenshot,
     _build_page_specs,
+    _interaction_semantics_error,
     _instant_interaction_text_hits,
     _mobile_canvas_width_ready,
     _runtime_layout_guard_style,
@@ -29,6 +30,7 @@ from backend.softcopyright.interaction_semantics import action_requires_confirma
 from backend.softcopyright.blueprint import FeatureModule, ProductBlueprint
 from backend.softcopyright.models import GenerationTask
 from backend.softcopyright.ui_blueprint import UiBlueprint, UiScreenBlueprint, complete_ui_blueprint_coverage
+from backend.softcopyright.validator import _findings
 
 
 class ManualSecondaryScreenTests(unittest.TestCase):
@@ -336,6 +338,64 @@ class ManualSecondaryScreenTests(unittest.TestCase):
         self.assertTrue(conflict)
         self.assertEqual(_instant_interaction_text_hits("播放后立即生效"), [])
         self.assertEqual(_instant_interaction_text_hits("确认播放并登记"), ["登记", "确认播放"])
+
+    def test_shared_confirmation_dialog_semantics_are_enforced(self):
+        confirmation = UiScreenshot(
+            "approve",
+            "计划审批",
+            "审批生产计划",
+            "approve.html",
+            page_kind="operation",
+            interaction_mode="workflow",
+            requires_confirmation=True,
+        )
+        common = {
+            "hits": [],
+            "visible_dialog_count": 1,
+            "shared_contract_enabled": True,
+        }
+
+        self.assertEqual(
+            _interaction_semantics_error(confirmation, shared_dialog_count=1, local_dialog_count=0, **common),
+            "",
+        )
+        self.assertIn(
+            "当前为 0 个",
+            _interaction_semantics_error(confirmation, shared_dialog_count=0, local_dialog_count=0, **common),
+        )
+        self.assertIn(
+            "当前为 2 个",
+            _interaction_semantics_error(confirmation, shared_dialog_count=2, local_dialog_count=0, **common),
+        )
+        self.assertIn(
+            "页面私有弹窗可见",
+            _interaction_semantics_error(confirmation, shared_dialog_count=1, local_dialog_count=1, **common),
+        )
+
+        instant = UiScreenshot(
+            "play",
+            "播放歌曲",
+            "播放歌曲",
+            "play.html",
+            page_kind="operation",
+            interaction_mode="instant",
+        )
+        self.assertIn(
+            "即时操作页出现不应存在",
+            _interaction_semantics_error(
+                instant,
+                hits=[],
+                visible_dialog_count=1,
+                shared_dialog_count=0,
+                local_dialog_count=1,
+                shared_contract_enabled=True,
+            ),
+        )
+        findings = _findings(
+            {"ui_ai_frontend_enabled": True, "ui_shared_confirmation_ready": False},
+            {},
+        )
+        self.assertIn("ui_shared_confirmation_not_ready", {item["code"] for item in findings})
 
     def test_old_mobile_blueprint_is_completed_for_all_modules(self):
         task = GenerationTask(software_name="测试音乐软件", product_type="APP", seed="seed")

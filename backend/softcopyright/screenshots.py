@@ -25,7 +25,7 @@ from .ui_blueprint import UiBlueprint, UiScreenBlueprint, build_ui_blueprint, is
 ADMIN_VIEWPORT = {"width": 1280, "height": 720}
 GAME_VIEWPORT = {"width": 720, "height": 1280}
 MOBILE_VIEWPORT = {"width": 720, "height": 1280}
-SCREENSHOT_CHECKPOINT_VERSION = 6
+SCREENSHOT_CHECKPOINT_VERSION = 7
 
 
 def _is_mobile_renderer(renderer: str) -> bool:
@@ -3816,16 +3816,51 @@ def _instant_interaction_text_hits(text: str) -> list[str]:
 
 
 def _assert_interaction_semantics(page, item: UiScreenshot) -> None:
-    if item.page_kind != "operation" or item.interaction_mode != "instant":
+    if item.page_kind != "operation":
         return
     visible_text = page.locator("body").inner_text()
     hits = _instant_interaction_text_hits(visible_text)
-    visible_dialog_count = page.locator(
-        '[role="dialog"], .confirm-drawer, .detail-drawer, .confirm-panel, [class*="modal"], [class*="dialog"]'
-    ).evaluate_all("elements => elements.filter(el => { const s=getComputedStyle(el); const r=el.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0; }).length")
-    if hits or visible_dialog_count:
+    visible_filter = "elements => elements.filter(el => { const s=getComputedStyle(el); const r=el.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0; }).length"
+    dialog_selector = '[role="dialog"], .confirm-drawer, .detail-drawer, .confirm-panel, [class*="modal"], [class*="dialog"]'
+    visible_dialog_count = page.locator(dialog_selector).evaluate_all(visible_filter)
+    shared_dialog_count = page.locator(
+        '[data-shared-confirm-dialog="true"][data-shared-confirm-ready="true"][role="dialog"]'
+    ).evaluate_all(visible_filter)
+    local_dialog_count = page.locator(
+        '.screen-root [role="dialog"], .screen-root .confirm-drawer, .screen-root .detail-drawer, .screen-root .confirm-panel, .screen-root [class*="modal"], .screen-root [class*="dialog"]'
+    ).evaluate_all(visible_filter)
+    error = _interaction_semantics_error(
+        item,
+        hits=hits,
+        visible_dialog_count=visible_dialog_count,
+        shared_dialog_count=shared_dialog_count,
+        local_dialog_count=local_dialog_count,
+        shared_contract_enabled=page.locator('[data-shared-confirmation-contract="v1"]').count() > 0,
+    )
+    if error:
+        raise RuntimeError(error)
+
+
+def _interaction_semantics_error(
+    item: UiScreenshot,
+    *,
+    hits: list[str],
+    visible_dialog_count: int,
+    shared_dialog_count: int = 0,
+    local_dialog_count: int = 0,
+    shared_contract_enabled: bool = False,
+) -> str:
+    if item.page_kind != "operation":
+        return ""
+    if item.interaction_mode == "instant" and (hits or visible_dialog_count):
         details = "、".join(hits) if hits else f"可见确认弹窗 {visible_dialog_count} 个"
-        raise RuntimeError(f"{item.key} 即时操作页出现不应存在的登记/确认流程：{details}")
+        return f"{item.key} 即时操作页出现不应存在的登记/确认流程：{details}"
+    if item.requires_confirmation and shared_contract_enabled:
+        if shared_dialog_count != 1:
+            return f"{item.key} 确认操作页必须且只能显示 1 个 SharedConfirmDialog，当前为 {shared_dialog_count} 个"
+        if local_dialog_count:
+            return f"{item.key} 已启用 SharedConfirmDialog，但仍有 {local_dialog_count} 个页面私有弹窗可见"
+    return ""
 
 
 def _body_attrs(html: str) -> str:

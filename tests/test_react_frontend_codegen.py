@@ -31,13 +31,25 @@ class _ReactProvider:
             f'<article className="work-card card-{index}"><strong>巡检任务 {index}</strong><span>设备状态正常</span><button>查看记录</button></article>'
             for index in range(1, 9)
         )
+        confirmation_source = (
+            '<section hidden data-shared-confirm-source="true">'
+            '<h2 data-confirm-title>确认下达巡检工单</h2>'
+            '<p data-confirm-description>下达后任务将进入待执行状态并通知责任班组。</p>'
+            '<div data-confirm-item data-label="工单编号" data-value="WO-20260717-018"></div>'
+            '<div data-confirm-item data-label="责任班组" data-value="东区设备巡检组"></div>'
+            '<p data-confirm-note>工单状态将由草稿变为待执行，并写入操作日志。</p>'
+            '<span data-confirm-action>确认下达</span></section>'
+            if '"requires_confirmation": true' in prompt
+            else ""
+        )
         jsx = (
             f'<div className="screen-root {scope}" data-page-structure="{creative_key}">'
             '<header className="mobile-header"><b>设备巡检移动端</b><button data-action="import">导入任务</button></header>'
             '<main className="mobile-workspace"><section className="runtime-record-panel"><span>EquipmentAssetRecord</span>'
             '<h1>今日现场任务</h1><p>按区域查看待执行、异常和已完成巡检。</p></section>'
             f'<section className="task-stream">{cards}</section></main>'
-            '<nav className="mobile-tabs"><button>首页</button><button>任务</button><button>我的</button></nav></div>'
+            '<nav className="mobile-tabs"><button>首页</button><button>任务</button><button>我的</button></nav>'
+            f'{confirmation_source}</div>'
         )
         css = (
             f'.{scope}{{height:100%;display:grid;grid-template-rows:72px 1fr 78px;background:#f3f7fa;color:#18324a;overflow:hidden;}}'
@@ -289,6 +301,24 @@ class ReactFrontendCodegenTests(unittest.TestCase):
             screenshots = [
                 UiScreenshot("home", "任务首页", "首页", str(root / "home.html"), page_kind="dashboard"),
                 UiScreenshot("field_task", "巡检任务", "任务", str(root / "field_task.html"), page_kind="module", module_key="field_task"),
+                UiScreenshot(
+                    "field_task_operation_1_1",
+                    "巡检工单下达",
+                    "下达巡检工单",
+                    str(root / "field_task_operation_1_1.html"),
+                    page_kind="operation",
+                    module_key="field_task",
+                    interaction_action="下达巡检工单",
+                    interaction_mode="workflow",
+                    interaction_surface="workflow_result",
+                    requires_confirmation=True,
+                    interaction_role="巡检主管",
+                    interaction_trigger="工单内容复核完成",
+                    interaction_input_fields=["责任班组", "计划时间"],
+                    interaction_pre_state="草稿",
+                    interaction_post_state="待执行",
+                    interaction_result_evidence="工单状态和操作日志",
+                ),
             ]
             provider = _ReactProvider()
             report = generate_ai_frontend_pages(
@@ -302,7 +332,7 @@ class ReactFrontendCodegenTests(unittest.TestCase):
                     "ready": True,
                     "mode": "style_reference",
                     "reference_count": 1,
-                    "page_count": 2,
+                    "page_count": 3,
                     "style_reference_ready": True,
                     "style_reference": {"ready": True},
                 },
@@ -336,14 +366,20 @@ class ReactFrontendCodegenTests(unittest.TestCase):
             )
             self.assertTrue(resumed_report["ready"])
             self.assertEqual(len(provider.messages), initial_request_count)
-            self.assertIn("复用全部 React 页面组件 2/2", resumed_messages)
+            self.assertIn("复用全部 React 页面组件 3/3", resumed_messages)
             self.assertFalse(any("生成 React 界面组件" in message for message in resumed_messages))
             self.assertTrue((root / "react-app" / "src" / "App.jsx").exists())
             self.assertTrue((root / "react-app" / "src" / "SharedAppShell.jsx").exists())
+            self.assertTrue((root / "react-app" / "src" / "SharedConfirmDialog.jsx").exists())
             app_source = (root / "react-app" / "src" / "App.jsx").read_text(encoding="utf-8")
             self.assertIn("SharedAppShell", app_source)
+            self.assertIn("SharedConfirmDialog", app_source)
+            self.assertIn('data-shared-confirmation-contract="v1"', app_source)
             self.assertIn("工作首页", app_source)
             self.assertIn("功能办理", app_source)
+            self.assertEqual(report["shared_confirmation_contract"], "shared-confirm-dialog-v1")
+            self.assertEqual(report["shared_confirmation_page_count"], 1)
+            self.assertTrue(report["shared_confirmation_ready"])
             self.assertTrue((root / "assets" / "app.js").exists())
             self.assertIn("soft-react-screen", (root / "home.html").read_text(encoding="utf-8"))
             self.assertIn('data-renderer="mobile_app"', (root / "home.html").read_text(encoding="utf-8"))
@@ -375,6 +411,15 @@ class ReactFrontendCodegenTests(unittest.TestCase):
                     self.assertFalse(page.locator(".mobile-header").is_visible())
                     self.assertIn("今日现场任务", page.locator("body").inner_text())
                     self.assertEqual(page.locator(".mobile-tabs").count(), 1)
+                    page.goto(
+                        f"http://127.0.0.1:{server.server_port}/field_task_operation_1_1.html",
+                        wait_until="networkidle",
+                    )
+                    self.assertEqual(page.locator('[data-shared-confirm-dialog="true"]:visible').count(), 1, page_errors)
+                    self.assertEqual(page.locator('.screen-root [role="dialog"]:visible').count(), 0, page_errors)
+                    self.assertIn("确认下达巡检工单", page.locator(".shared-confirm-dialog").inner_text())
+                    self.assertIn("东区设备巡检组", page.locator(".shared-confirm-dialog").inner_text())
+                    self.assertIn("确认下达", page.locator(".shared-confirm-primary").inner_text())
                     browser.close()
             finally:
                 server.shutdown()

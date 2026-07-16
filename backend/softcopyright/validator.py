@@ -156,6 +156,9 @@ def validate_materials(
         "ui_ai_frontend_ready": bool(checks.get("ui_ai_frontend_ready")),
         "ui_ai_frontend_source": str(checks.get("ui_ai_frontend_source") or ""),
         "ui_ai_frontend_page_count": int(checks.get("ui_ai_frontend_page_count") or 0),
+        "ui_shared_confirmation_contract": str(checks.get("ui_shared_confirmation_contract") or ""),
+        "ui_shared_confirmation_page_count": int(checks.get("ui_shared_confirmation_page_count") or 0),
+        "ui_shared_confirmation_ready": bool(checks.get("ui_shared_confirmation_ready")),
         "ui_visual_prompt_ready": bool(checks.get("ui_visual_prompt_ready")),
         "ui_visual_reference_ready": bool(checks.get("ui_visual_reference_ready")),
         "ui_visual_reference_mode": str(checks.get("ui_visual_reference_mode") or "per_page"),
@@ -218,6 +221,7 @@ def validate_materials(
             task.model_provider.lower() in {"local", "local-template", "template", ""}
             or (
                 bool(authenticity["ui_ai_frontend_ready"])
+                and bool(authenticity["ui_shared_confirmation_ready"])
                 and bool(authenticity["ui_visual_prompt_ready"])
                 and bool(authenticity["ui_visual_reference_ready"])
                 and bool(authenticity["ui_visual_reference_before_source_ready"])
@@ -413,6 +417,9 @@ def validation_checks(validation: dict) -> dict:
         "validation_ui_similarity_attempts": authenticity.get("ui_similarity_attempts", 0),
         "validation_ui_layout_role_count": authenticity.get("ui_layout_role_count", 0),
         "validation_ui_similarity_nearest_hash": authenticity.get("ui_similarity_nearest_hash", ""),
+        "validation_ui_shared_confirmation_contract": authenticity.get("ui_shared_confirmation_contract", ""),
+        "validation_ui_shared_confirmation_page_count": authenticity.get("ui_shared_confirmation_page_count", 0),
+        "validation_ui_shared_confirmation_ready": bool(authenticity.get("ui_shared_confirmation_ready")),
         "validation_ui_visual_prompt_ready": bool(authenticity.get("ui_visual_prompt_ready")),
         "validation_ui_visual_reference_ready": bool(authenticity.get("ui_visual_reference_ready")),
         "validation_ui_visual_reference_mode": authenticity.get("ui_visual_reference_mode", ""),
@@ -1017,6 +1024,8 @@ def _findings(auth: dict, norm: dict) -> list[dict]:
         findings.append({"level": "error", "code": code, "message": message})
     if auth.get("ui_ai_frontend_enabled") and not auth.get("ui_ai_frontend_ready"):
         findings.append({"level": "error", "code": "ui_ai_frontend_not_ready", "message": "AI 界面页面代码未完整生成，正式 GPT 流程不能使用模板截图兜底。"})
+    if auth.get("ui_ai_frontend_enabled") and not auth.get("ui_shared_confirmation_ready"):
+        findings.append({"level": "error", "code": "ui_shared_confirmation_not_ready", "message": "React 界面未接入统一确认弹窗契约，同一软件内可能混用不同弹窗结构，不能进入正式交付。"})
     if auth.get("ui_ai_frontend_enabled") and not auth.get("ui_visual_reference_ready"):
         findings.append({"level": "error", "code": "ui_visual_reference_missing", "message": "gpt-image-2 全局视觉风格参考图未生成，正式 GPT 流程不能无图生成界面截图。"})
     if auth.get("ui_ai_frontend_enabled") and (

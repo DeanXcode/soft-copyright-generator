@@ -548,6 +548,9 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     report["checks"]["ui_frontend_build_tool"] = str(ai_frontend_report.get("build_tool") or "")
     report["checks"]["ui_frontend_source_dir"] = str(source_info.get("ui_frontend_source_dir") or ai_frontend_report.get("source_dir") or "")
     report["checks"]["ui_ai_frontend_page_count"] = int(ai_frontend_report.get("page_count") or len(ai_frontend_report.get("pages") or []))
+    report["checks"]["ui_shared_confirmation_contract"] = str(ai_frontend_report.get("shared_confirmation_contract") or "")
+    report["checks"]["ui_shared_confirmation_page_count"] = int(ai_frontend_report.get("shared_confirmation_page_count") or 0)
+    report["checks"]["ui_shared_confirmation_ready"] = bool(ai_frontend_report.get("shared_confirmation_ready"))
     visual_reference_report = ai_frontend_report.get("visual_references") if isinstance(ai_frontend_report, dict) else {}
     if not isinstance(visual_reference_report, dict):
         visual_reference_report = {}
@@ -584,6 +587,8 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         )
     if require_llm_generation and not report["checks"]["ui_ai_frontend_ready"]:
         raise RuntimeError("GPT 界面页面代码未成功生成，已停止；正式流程不使用模板截图兜底。")
+    if require_llm_generation and not report["checks"]["ui_shared_confirmation_ready"]:
+        raise RuntimeError("React 公共确认弹窗组件未生成，已停止；同一软件不能混用多套确认弹窗。")
     if require_llm_generation and not report["checks"]["ui_visual_reference_to_code_ready"]:
         raise RuntimeError("gpt-image-2 视觉风格参考图未生成或未参与界面代码生成，已停止；正式流程不允许无图生成截图。")
     report["checks"]["ui_renderer"] = ui_blueprint.renderer
