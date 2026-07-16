@@ -2805,9 +2805,31 @@ def _visible_content_action_labels(item, limit: int = 4) -> list[str]:
     return actions[: max(1, int(limit or 0))]
 
 
+def _login_visible_labels(item, candidates: tuple[str, ...], limit: int = 6) -> list[str]:
+    visible_token = _manual_ui_token(str(_visible_content_summary(item).get("visible_text") or ""))
+    labels: list[str] = []
+    for candidate in candidates:
+        token = _manual_ui_token(candidate)
+        if not token or token not in visible_token:
+            continue
+        if any(token in _manual_ui_token(existing) or _manual_ui_token(existing) in token for existing in labels):
+            continue
+        labels.append(candidate)
+        if len(labels) >= limit:
+            break
+    return labels
+
+
 def _visible_content_caption(item, fallback: str = "") -> str:
     if not _visible_content_summary_ready(item):
         return fallback
+    if str(getattr(item, "page_kind", "") or "") == "login":
+        credentials = _login_visible_labels(
+            item,
+            ("生产运营账号", "登录账号", "用户账号", "用户名", "工号", "登录密码", "密码", "图形验证码", "验证码"),
+        )
+        contexts = _login_visible_labels(item, ("工厂运行环境", "运行环境", "岗位身份", "用户角色", "登录角色"))
+        return f"页面展示身份认证入口，并包含{_join_items([*credentials, *contexts]) or '账号、密码、验证码和身份选择'}等当前可见登录信息。"
     headings = _visible_content_values(item, "headings", 3)
     metrics = _visible_content_values(item, "metrics", 4)
     fields = _visible_content_values(item, "fields", 4)
@@ -2830,6 +2852,28 @@ def _visible_content_operation_notes(item, title: str, *, main_page: bool = Fals
     statuses = _visible_content_values(item, "statuses", 4)
     filters = _visible_content_values(item, "filters", 5)
     actions = _visible_content_action_labels(item)
+    if str(getattr(item, "page_kind", "") or "") == "login":
+        credentials = _login_visible_labels(
+            item,
+            ("生产运营账号", "登录账号", "用户账号", "用户名", "工号", "登录密码", "密码", "图形验证码", "验证码"),
+        )
+        contexts = _login_visible_labels(item, ("工厂运行环境", "运行环境", "岗位身份", "用户角色", "登录角色"))
+        primary = next((label for label in actions if label.startswith(("进入", "登录", "提交"))), "登录按钮")
+        notes = [
+            f"用户进入{title}后，先核对页面显示的终端环境和运行状态，确认当前访问条件正常。",
+            f"依次填写{_join_items(credentials) or '账号、密码和验证码'}"
+            + (f"，再选择{_join_items(contexts)}" if contexts else "")
+            + "。",
+        ]
+        auxiliary: list[str] = []
+        if "刷新验证码" in actions:
+            auxiliary.append("验证码不清晰时使用【刷新验证码】重新获取")
+        if "显示密码" in actions:
+            auxiliary.append("核对密码输入时使用【显示密码】")
+        if auxiliary:
+            notes.append("，".join(auxiliary) + "。")
+        notes.append(f"确认输入内容和身份选择无误后，点击【{primary}】完成登录校验；系统将按当前岗位加载授权功能。")
+        return notes[:4]
     notes: list[str] = []
     if filters:
         notes.append(f"用户进入{title}后，可使用{_join_items(filters)}调整当前查看范围，页面会同步刷新对应内容。")
@@ -2843,12 +2887,31 @@ def _visible_content_operation_notes(item, title: str, *, main_page: bool = Fals
     if statuses and len(notes) < 3:
         notes.append(f"状态区域显示{_join_items(statuses)}，用户可据此判断当前记录所处阶段。")
     if actions:
-        notes.append(
-            (title if re.search(r"(?:界面|页面)$", title) else f"{title}页面")
-            + "提供"
-            + "、".join(f"【{label}】" for label in actions)
-            + "等当前截图可见操作，点击后按页面反馈继续处理。"
-        )
+        page_subject = title if re.search(r"(?:界面|页面)$", title) else f"{title}页面"
+        if str(getattr(item, "page_kind", "") or "") == "login":
+            primary = next((label for label in actions if label.startswith(("进入", "登录", "提交"))), "")
+            guidance: list[str] = []
+            if "刷新验证码" in actions:
+                guidance.append("验证码不清晰时使用【刷新验证码】重新获取")
+            if "显示密码" in actions:
+                guidance.append("核对密码输入时使用【显示密码】")
+            other_actions = [label for label in actions if label not in {primary, "刷新验证码", "显示密码"}]
+            if other_actions:
+                guidance.append("按需使用" + "、".join(f"【{label}】" for label in other_actions))
+            if primary:
+                note = f"{page_subject}以【{primary}】作为主操作"
+                if guidance:
+                    note += "；" + "，".join(guidance)
+                notes.append(note + "。")
+            else:
+                notes.append(page_subject + "提供" + "、".join(f"【{label}】" for label in actions) + "等可见辅助操作。")
+        else:
+            notes.append(
+                page_subject
+                + "提供"
+                + "、".join(f"【{label}】" for label in actions)
+                + "等当前截图可见操作，点击后按页面反馈继续处理。"
+            )
     if len(notes) < 3 and fields and fields != detail_values:
         notes.append(f"页面还显示{_join_items(fields)}等字段，便于核对当前记录。")
     if len(notes) < 3:
@@ -2868,6 +2931,20 @@ def _visible_content_intro_paragraphs(item, title: str) -> list[str]:
     fields = _visible_content_values(item, "fields", 6)
     filters = _visible_content_values(item, "filters", 4)
     actions = _visible_content_action_labels(item)
+    if str(getattr(item, "page_kind", "") or "") == "login":
+        credential_fields = _login_visible_labels(
+            item,
+            ("生产运营账号", "登录账号", "用户账号", "用户名", "工号", "登录密码", "密码", "图形验证码", "验证码"),
+        )
+        contexts = _login_visible_labels(item, ("工厂运行环境", "运行环境", "岗位身份", "用户角色", "登录角色"))
+        primary = next((label for label in actions if label.startswith(("进入", "登录", "提交"))), "登录按钮")
+        paragraphs = [
+            f"{title}展示{_join_items(headings) or '身份认证、岗位选择和运行状态'}等区域，用于核对当前终端环境和登录条件。",
+            f"用户依次填写{_join_items(credential_fields) or '账号、密码和验证码'}"
+            + (f"，选择{_join_items(contexts)}" if contexts else "")
+            + f"后，通过【{primary}】完成登录校验。",
+        ]
+        return paragraphs
     paragraphs: list[str] = []
     if headings:
         paragraphs.append(f"{title}围绕{_join_items(headings)}组织页面内容，各区域共同呈现当前业务记录和处理结果。")
@@ -2885,10 +2962,23 @@ def _visible_content_intro_paragraphs(item, title: str) -> list[str]:
 
 def _actual_screenshot_action_labels(item, limit: int = 4) -> list[str]:
     crops = getattr(item, "action_crops", None) or {}
+    summary = _visible_content_summary(item)
     labels: list[str] = []
-    for raw_label in crops:
-        label = re.sub(r"\s+", "", str(raw_label or "")).strip()
+    raw_labels = [*(summary.get("actions") or []), *crops]
+    for raw_label in raw_labels:
+        label = re.sub(r"\s+", " ", str(raw_label or "")).strip()
+        label = re.sub(r"\s*[→←›»>]+\s*$", "", label).strip()
         if not label or re.fullmatch(r"[+\-]?\d+(?:\.\d+)?", label):
+            continue
+        if not re.search(r"[0-9A-Za-z\u4e00-\u9fff]", label):
+            continue
+        compact_label = re.sub(r"\s+", "", label)
+        if (
+            4 <= len(compact_label) <= 8
+            and re.fullmatch(r"[0-9A-Za-z]+", compact_label)
+            and re.search(r"[A-Za-z]", compact_label)
+            and re.search(r"\d", compact_label)
+        ):
             continue
         if re.fullmatch(r".+(?:记录|条目|数据)0?\d{1,3}", label):
             continue
@@ -2941,11 +3031,36 @@ def _actual_screenshot_action_labels(item, limit: int = 4) -> list[str]:
         "生成",
         "应用",
         "继续",
+        "进入",
+        "登录",
         "催办",
         "验收",
         "校验",
     )
-    compact.sort(key=lambda label: 0 if label.startswith(action_prefixes) else 1)
+    primary_action_prefixes = (
+        "提交",
+        "确认",
+        "保存",
+        "进入",
+        "登录",
+        "新增",
+        "添加",
+        "发布",
+        "下发",
+        "执行",
+        "应用",
+        "生成",
+        "发起",
+    )
+    compact.sort(
+        key=lambda label: (
+            0
+            if label.startswith(primary_action_prefixes)
+            else 1
+            if label.startswith(action_prefixes)
+            else 2
+        )
+    )
     return compact[: max(1, int(limit or 0))]
 
 

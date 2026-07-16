@@ -25,7 +25,7 @@ from .ui_blueprint import UiBlueprint, UiScreenBlueprint, build_ui_blueprint, is
 ADMIN_VIEWPORT = {"width": 1280, "height": 720}
 GAME_VIEWPORT = {"width": 720, "height": 1280}
 MOBILE_VIEWPORT = {"width": 720, "height": 1280}
-SCREENSHOT_CHECKPOINT_VERSION = 5
+SCREENSHOT_CHECKPOINT_VERSION = 6
 
 
 def _is_mobile_renderer(renderer: str) -> bool:
@@ -3621,6 +3621,22 @@ body[data-renderer="admin"][data-page-kind="operation"] :is(.confirm-drawer,.det
 """.strip()
 
 
+def _normalize_visible_action_label(value: Any) -> str:
+    label = re.sub(r"\s+", " ", str(value or "")).strip(" ·|｜:：-—")
+    label = re.sub(r"\s*[→←›»>]+\s*$", "", label).strip()
+    if not label or not re.search(r"[0-9A-Za-z\u4e00-\u9fff]", label):
+        return ""
+    compact = re.sub(r"\s+", "", label)
+    if (
+        4 <= len(compact) <= 8
+        and re.fullmatch(r"[0-9A-Za-z]+", compact)
+        and re.search(r"[A-Za-z]", compact)
+        and re.search(r"\d", compact)
+    ):
+        return ""
+    return label
+
+
 def _normalize_visible_content_summary(payload: dict[str, Any] | None, item: UiScreenshot | None = None) -> dict[str, Any]:
     raw = payload if isinstance(payload, dict) else {}
 
@@ -3636,6 +3652,8 @@ def _normalize_visible_content_summary(payload: dict[str, Any] | None, item: UiS
         result: list[str] = []
         for value in raw.get(name) or []:
             label = clean(value, max_length=max_length)
+            if name in {"actions", "filter_actions"}:
+                label = _normalize_visible_action_label(label)
             if not label:
                 continue
             if name == "filters" and not re.search(r"[\u4e00-\u9fff]", label):
@@ -3653,7 +3671,7 @@ def _normalize_visible_content_summary(payload: dict[str, Any] | None, item: UiS
     actions = values("actions", limit=12, max_length=24)
     if item is not None:
         for label in (item.action_crops or {}):
-            normalized = clean(label, max_length=24)
+            normalized = _normalize_visible_action_label(clean(label, max_length=24))
             if normalized and normalized not in actions:
                 actions.append(normalized)
             if len(actions) >= 12:
@@ -3710,7 +3728,19 @@ def _capture_visible_content_summary(page, item: UiScreenshot) -> dict[str, Any]
           const headings = texts('h1,h2,h3,h4,[role="heading"],legend,[class*="panel-title"],[class*="card-title"],[class*="section-title"],[class*="block-title"],[class*="widget-title"]', 36);
           const fields = texts('th,label,dt,[data-field-label],[class*="field-label"],[class*="form-label"],[class*="meta-label"],[class*="item-label"],[class*="table-head"]', 48);
           const statuses = texts('[class*="status"],[class*="badge"],[class*="tag"],[class*="pill"],[class*="chip"],[class*="state"]', 36);
-          const actions = texts('button,a,[role="button"],input[type="button"],input[type="submit"],[onclick]', 48);
+          const actions = unique(
+            Array.from(document.querySelectorAll('button,a,[role="button"],input[type="button"],input[type="submit"],[onclick]'))
+              .filter(visible)
+              .map((element) => clean(
+                element.getAttribute('aria-label')
+                || element.getAttribute('title')
+                || element.value
+                || element.innerText
+                || ''
+              ))
+              .filter((text) => text.length >= 2 && text.length <= 48),
+            48,
+          );
           const filterContainers = Array.from(document.querySelectorAll('[class~="filter-block"],[class*="filter-item"],[class*="filter-chip"],[class*="filter-option"],[class*="tab-item"],[class*="tab-button"],[class*="segment-item"],[class*="range-label"]')).filter(visible);
           const filters = unique(filterContainers.map((element) => clean(element.innerText)).filter((text) => text.length >= 2 && text.length <= 64), 36);
           const filterActions = unique(filterContainers.flatMap((element) => Array.from(element.querySelectorAll('button,[role="button"]')).filter(visible).map((button) => clean(button.innerText || button.getAttribute('aria-label') || ''))), 36);
@@ -3758,8 +3788,14 @@ def _capture_visible_action_crops(page, item: UiScreenshot, ui_dir: Path) -> dic
             try:
                 if not locator.is_visible():
                     continue
-                label = (locator.inner_text() or locator.get_attribute("value") or locator.get_attribute("aria-label") or "").strip()
-                label = re.sub(r"\s+", "", label)
+                label = (
+                    locator.get_attribute("aria-label")
+                    or locator.get_attribute("title")
+                    or locator.get_attribute("value")
+                    or locator.inner_text()
+                    or ""
+                )
+                label = _normalize_visible_action_label(label)
                 box = locator.bounding_box()
                 if not label or len(label) > 16 or label in result or not box:
                     continue

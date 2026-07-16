@@ -112,7 +112,7 @@ class ScreenshotCheckpointResumeTests(unittest.TestCase):
                 "fields": ["工程部位"],
                 "statuses": ["已完成"],
                 "filters": ["本月", "TJ04"],
-                "actions": ["导出质量月报"],
+                "actions": ["7 K 4 M", "导出质量月报 →", "◉"],
             },
             item,
         )
@@ -121,8 +121,30 @@ class ScreenshotCheckpointResumeTests(unittest.TestCase):
         self.assertEqual(summary["headings"], ["统计报表"])
         self.assertEqual(summary["metrics"], ["质量计划执行率"])
         self.assertIn("导出质量月报", summary["actions"])
+        self.assertNotIn("7 K 4 M", summary["actions"])
+        self.assertNotIn("◉", summary["actions"])
         self.assertIn("工程部位", summary["semantic_terms"])
         self.assertNotIn("TJ04", summary["filters"])
+
+    def test_visible_content_summary_keeps_semantic_icon_actions(self):
+        item = UiScreenshot(
+            "login",
+            "登录界面",
+            "",
+            "login.html",
+            action_crops={"刷新验证码": "captcha.png", "显示密码": "password.png"},
+        )
+
+        summary = _normalize_visible_content_summary(
+            {
+                "visible_text": "登录密码 图形验证码 进入生产指挥台",
+                "headings": ["生产运营安全登录"],
+                "actions": ["刷新验证码", "显示密码", "进入生产指挥台 →"],
+            },
+            item,
+        )
+
+        self.assertEqual(summary["actions"], ["刷新验证码", "显示密码", "进入生产指挥台"])
 
 
 if __name__ == "__main__":

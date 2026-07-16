@@ -10,6 +10,8 @@ from backend.softcopyright.docgen import (
     _actual_screenshot_action_labels,
     _actual_screenshot_operation_notes,
     _manual_ui_button_label_match,
+    _visible_content_caption,
+    _visible_content_intro_paragraphs,
     analyze_manual_ui_consistency,
 )
 from backend.softcopyright.screenshots import UiScreenshot
@@ -175,6 +177,99 @@ class ManualUiConsistencyTests(unittest.TestCase):
         labels = _actual_screenshot_action_labels(screenshot)
 
         self.assertEqual(labels, ["下发复测指令", "打开原始成果", "下载测量包", "追加复核说明"])
+
+    def test_login_notes_skip_captcha_codes_and_symbol_only_controls(self):
+        screenshot = UiScreenshot(
+            "login",
+            "登录界面",
+            "用户输入账号、密码和验证码后进入系统。",
+            "login.html",
+            page_kind="login",
+            action_crops={"7K4M": "captcha.png", "◉": "password.png"},
+            visible_content_summary={
+                "ready": True,
+                "visible_text": "生产运营安全登录 登录密码 图形验证码 7 K 4 M 进入生产指挥台",
+                "headings": ["生产运营安全登录"],
+                "metrics": [],
+                "fields": ["生产运营账号", "登录密码", "图形验证码"],
+                "statuses": [],
+                "filters": [],
+                "actions": ["7 K 4 M", "进入生产指挥台 →", "7K4M", "◉"],
+            },
+        )
+
+        labels = _actual_screenshot_action_labels(screenshot)
+        notes = _actual_screenshot_operation_notes(screenshot, self._blueprint().modules[0])
+        text = "\n".join(notes)
+
+        self.assertEqual(labels, ["进入生产指挥台"])
+        self.assertIn("【进入生产指挥台】", text)
+        self.assertNotIn("【7K4M】", text)
+        self.assertNotIn("【◉】", text)
+
+    def test_login_notes_explain_semantic_auxiliary_controls(self):
+        screenshot = UiScreenshot(
+            "login",
+            "登录界面",
+            "用户输入账号、密码和验证码后进入系统。",
+            "login.html",
+            page_kind="login",
+            action_crops={"刷新验证码": "captcha.png", "显示密码": "password.png"},
+            visible_content_summary={
+                "ready": True,
+                "visible_text": "生产运营安全登录 登录密码 图形验证码 进入生产指挥台",
+                "headings": ["生产运营安全登录"],
+                "metrics": [],
+                "fields": ["生产运营账号", "登录密码", "图形验证码"],
+                "statuses": [],
+                "filters": [],
+                "actions": ["刷新验证码", "进入生产指挥台", "显示密码"],
+            },
+        )
+
+        labels = _actual_screenshot_action_labels(screenshot)
+        notes = _actual_screenshot_operation_notes(screenshot, self._blueprint().modules[0])
+        text = "\n".join(notes)
+
+        self.assertEqual(labels, ["进入生产指挥台", "刷新验证码", "显示密码"])
+        self.assertIn("点击【进入生产指挥台】完成登录校验", text)
+        self.assertIn("验证码不清晰时使用【刷新验证码】重新获取", text)
+        self.assertIn("核对密码输入时使用【显示密码】", text)
+
+    def test_login_intro_does_not_treat_captcha_placeholder_as_filter(self):
+        screenshot = UiScreenshot(
+            "login",
+            "登录界面",
+            "",
+            "login.html",
+            page_kind="login",
+            visible_content_summary={
+                "ready": True,
+                "visible_text": "生产运营安全登录 生产运营账号 登录密码 图形验证码 输入右侧字符 工厂运行环境 岗位身份 进入生产指挥台",
+                "headings": ["生产运营安全登录", "岗位身份", "运行与访问状态"],
+                "metrics": ["当前工单"],
+                "fields": ["生产运营账号", "登录密码", "图形验证码"],
+                "statuses": [],
+                "filters": ["输入右侧字符", "华东二厂 · 生产环境"],
+                "actions": ["进入生产指挥台", "刷新验证码", "显示密码"],
+            },
+        )
+
+        paragraphs = _visible_content_intro_paragraphs(screenshot, "登录界面")
+        caption = _visible_content_caption(screenshot)
+        notes = _actual_screenshot_operation_notes(screenshot, self._blueprint().modules[0])
+        text = "\n".join(paragraphs)
+        note_text = "\n".join(notes)
+
+        self.assertIn("生产运营账号、登录密码、图形验证码", text)
+        self.assertIn("通过【进入生产指挥台】完成登录校验", text)
+        self.assertNotIn("调整查看范围", text)
+        self.assertNotIn("通过输入右侧字符", text)
+        self.assertIn("生产运营账号、登录密码、图形验证码、工厂运行环境、岗位身份", caption)
+        self.assertNotIn("当前工单", caption)
+        self.assertIn("依次填写生产运营账号、登录密码、图形验证码，再选择工厂运行环境、岗位身份", note_text)
+        self.assertNotIn("调整当前查看范围", note_text)
+        self.assertNotIn("当前可见的指标", note_text)
 
     def test_operation_notes_use_page_visible_content_instead_of_module_blueprint_fields(self):
         module = self._blueprint().modules[0]
