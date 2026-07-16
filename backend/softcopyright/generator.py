@@ -104,8 +104,16 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
 
     resume_stage_cache = find_resume_stage_cache_context(task) if resume_existing_output else None
     resume_cached_blueprint = load_cached_blueprint(resume_stage_cache) if resume_stage_cache else None
+    accepted_blueprint = _load_accepted_product_blueprint(task)
     confirmed_contract = _semantic_contract_from_confirmed_outline(task)
-    if resume_cached_blueprint and resume_stage and _stage_precedes("blueprint", resume_stage):
+    if accepted_blueprint:
+        send("prepare", 3, "读取已批准产品蓝图，跳过名称理解和产品蓝图请求", material_type="批准蓝图")
+        feature_hint_meta = _semantic_contract_from_cached_blueprint(accepted_blueprint)
+        feature_hint_meta["feature_hint_profile"] = "accepted-blueprint"
+        feature_hint_meta["feature_hint_source"] = "accepted-blueprint"
+        feature_hint_meta["feature_hint_reason"] = "使用已通过正式质量门禁的完整产品蓝图，跳过重复模型请求。"
+        feature_hint = task.feature_hint or str(feature_hint_meta.get("inferred_feature_hint") or "")
+    elif resume_cached_blueprint and resume_stage and _stage_precedes("blueprint", resume_stage):
         send("prepare", 3, "复用失败任务的本地产品蓝图，跳过名称理解请求", material_type="断点续跑")
         feature_hint_meta = _semantic_contract_from_cached_blueprint(resume_cached_blueprint)
         feature_hint = task.feature_hint or str(feature_hint_meta.get("inferred_feature_hint") or "")
@@ -148,17 +156,21 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     report["checks"]["stage_cache_enabled"] = bool(stage_cache.get("enabled"))
     report["checks"]["stage_cache_key"] = stage_cache.get("key", "")
     report["checks"]["stage_cache_hits"] = []
+    report["checks"]["accepted_blueprint_configured"] = bool(str(getattr(task, "accepted_blueprint_path", "") or "").strip())
+    report["checks"]["accepted_blueprint_ready"] = bool(accepted_blueprint)
 
     docx_available, docx_error = ensure_docx_available()
     if not docx_available:
         report["warnings"].append(f"python-docx 未安装，无法生成 Word 文档：{docx_error}")
 
     send("blueprint", 15, "生成产品蓝图")
-    blueprint_source = "local-template" if local_template_mode else "llm"
+    blueprint_source = "accepted-blueprint" if accepted_blueprint else "local-template" if local_template_mode else "llm"
     resume_blueprint = _load_resume_product_blueprint(output_dir) if resume_stage and _stage_precedes("blueprint", resume_stage) else None
-    cached_blueprint = resume_blueprint or resume_cached_blueprint or load_cached_blueprint(stage_cache)
+    cached_blueprint = accepted_blueprint or resume_blueprint or resume_cached_blueprint or load_cached_blueprint(stage_cache)
     cached_blueprint_issues = blueprint_contract_issues(task, cached_blueprint) if require_llm_generation and cached_blueprint else []
     if cached_blueprint_issues:
+        if accepted_blueprint:
+            raise RuntimeError("已批准产品蓝图未通过当前结构化操作与终端语义门禁：" + "；".join(cached_blueprint_issues[:5]))
         send(
             "blueprint",
             15,
@@ -169,10 +181,13 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         report["checks"]["blueprint_cache_invalidation_reasons"] = cached_blueprint_issues
         cached_blueprint = None
     if cached_blueprint:
-        send("blueprint", 15, "复用已缓存产品蓝图", material_type="阶段缓存")
+        if accepted_blueprint:
+            send("blueprint", 15, "使用已批准产品蓝图", material_type="批准蓝图")
+        else:
+            send("blueprint", 15, "复用已缓存产品蓝图", material_type="阶段缓存")
         blueprint = cached_blueprint
         save_cached_blueprint(stage_cache, blueprint)
-        report["checks"]["stage_cache_hits"].append("blueprint")
+        report["checks"]["stage_cache_hits"].append("accepted_blueprint" if accepted_blueprint else "blueprint")
     else:
         if require_llm_generation:
             try:
@@ -1787,6 +1802,34 @@ def _load_resume_product_blueprint(output_dir: Path):
     except Exception:
         return None
     return blueprint if len(getattr(blueprint, "modules", []) or []) >= 6 else None
+
+
+def _load_accepted_product_blueprint(task: GenerationTask):
+    raw_path = str(getattr(task, "accepted_blueprint_path", "") or "").strip()
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        blueprint = product_blueprint_from_dict(data)
+    except Exception as exc:
+        raise RuntimeError(f"已批准产品蓝图读取失败：{sanitize_error_message(exc)}") from exc
+    mismatches: list[str] = []
+    if str(getattr(blueprint, "software_name", "") or "") != str(task.software_name or ""):
+        mismatches.append("软件名称")
+    if str(getattr(blueprint, "version", "") or "") != str(task.version or ""):
+        mismatches.append("版本号")
+    if str(getattr(blueprint, "product_type", "") or "") != str(task.product_type or ""):
+        mismatches.append("产品类型")
+    if mismatches:
+        raise RuntimeError("已批准产品蓝图与当前任务不一致：" + "、".join(mismatches))
+    if len(getattr(blueprint, "modules", []) or []) < 6:
+        raise RuntimeError("已批准产品蓝图模块数量不足，至少需要 6 个业务模块。")
+    quality_score = int(getattr(blueprint, "quality_score", 0) or 0)
+    quality_target = _blueprint_quality_target()
+    if quality_score < quality_target:
+        raise RuntimeError(f"已批准产品蓝图质量分 {quality_score}，未达到当前阈值 {quality_target}。")
+    return blueprint
 
 
 def _resume_architecture_from_blueprint(blueprint):

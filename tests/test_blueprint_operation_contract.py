@@ -1,3 +1,5 @@
+import json
+from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -15,6 +17,7 @@ from backend.softcopyright.llm_blueprint import (
 )
 from backend.softcopyright.models import GenerationTask
 from backend.softcopyright.module_keys import is_placeholder_module_key, semantic_module_key
+from backend.softcopyright.generator import _load_accepted_product_blueprint
 from backend.softcopyright.validator import validate_materials
 
 
@@ -199,6 +202,38 @@ class BlueprintOperationContractTests(unittest.TestCase):
             _expected_plan_terminal(GenerationTask(software_name="个人待办清单", product_type="APP")),
             "mobile_app",
         )
+
+    def test_accepted_blueprint_loader_requires_matching_identity_and_quality(self):
+        blueprint = _valid_blueprint(self.task)
+        source_modules = list(blueprint.modules)
+        blueprint.modules = [deepcopy(source_modules[index % len(source_modules)]) for index in range(6)]
+        for index, module in enumerate(blueprint.modules, start=1):
+            module.key = f"accepted_module_{index}"
+            module.title = f"批准业务模块{index}"
+        blueprint.quality_score = 100
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "accepted-blueprint.json"
+            path.write_text(json.dumps(blueprint.to_dict(), ensure_ascii=False), encoding="utf-8")
+            task = GenerationTask(
+                software_name=self.task.software_name,
+                version=blueprint.version,
+                product_type=self.task.product_type,
+                accepted_blueprint_path=str(path),
+            )
+
+            loaded = _load_accepted_product_blueprint(task)
+            self.assertEqual(loaded.quality_score, 100)
+            self.assertEqual([module.key for module in loaded.modules], [module.key for module in blueprint.modules])
+
+            task.software_name = "其他软件"
+            with self.assertRaisesRegex(RuntimeError, "软件名称"):
+                _load_accepted_product_blueprint(task)
+
+            task.software_name = self.task.software_name
+            blueprint.quality_score = 82
+            path.write_text(json.dumps(blueprint.to_dict(), ensure_ascii=False), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "未达到当前阈值"):
+                _load_accepted_product_blueprint(task)
 
     def test_workflow_cleanup_preserves_complete_long_steps(self):
         step = "读取生产工单、工艺路线、设备负荷和物料齐套状态后生成可执行排程方案并记录冲突原因"

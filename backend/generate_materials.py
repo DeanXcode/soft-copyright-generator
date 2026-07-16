@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default="output", help="输出目录")
     parser.add_argument("--resume-output-dir", default="", help="从未完成输出目录继续生成")
     parser.add_argument("--confirmed-outline-json", default="", help="已确认蓝图 JSON 文件路径")
+    parser.add_argument("--accepted-blueprint-json", default="", help="已通过正式质量门禁的完整产品蓝图 JSON 文件路径")
     return parser.parse_args()
 
 
@@ -47,6 +48,7 @@ def main() -> int:
         model_name=args.model_name,
         randomness=args.randomness,
         output_root=Path(args.output_root),
+        accepted_blueprint_path=args.accepted_blueprint_json,
         resume_output_dir=args.resume_output_dir,
         resume_existing_output=bool(str(args.resume_output_dir or "").strip()),
     )
