@@ -41,7 +41,7 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
             _emit(emit, 15, f"生成产品蓝图 {_attempt + 1}/{attempt_count}")
             core_plan = _generate_core_plan(task, provider, rejection_reasons, emit=emit)
             module_plan = _generate_modules(task, provider, core_plan, rejection_reasons, emit=emit)
-            data = _merge_plan(core_plan, module_plan)
+            data = _normalize_plan_terminal_semantics(task, _merge_plan(core_plan, module_plan))
             blueprint = _blueprint_from_data(task, data)
             score, reasons = _quality_review(task, blueprint)
             blueprint.quality_score = score
@@ -49,7 +49,10 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
             if score < quality_floor:
                 try:
                     _emit(emit, 21, f"修复产品蓝图质量，当前评分 {score}/{quality_floor}")
-                    repaired_data = _repair_plan(task, provider, data, score, reasons)
+                    repaired_data = _normalize_plan_terminal_semantics(
+                        task,
+                        _repair_plan(task, provider, data, score, reasons),
+                    )
                     repaired_blueprint = _blueprint_from_data(task, repaired_data)
                     repaired_score, repaired_reasons = _quality_review(task, repaired_blueprint)
                     repaired_blueprint.quality_score = repaired_score
@@ -238,24 +241,29 @@ def _generate_module_batches(
         batch_modules = data.get("modules")
         if not isinstance(batch_modules, list):
             raise ValueError("LLM 分批模块方案不是 modules 数组")
-        modules = [item for item in batch_modules if isinstance(item, dict)]
-        if _authenticity_first(task):
-            reasons = _module_batch_quality_reasons(task, modules, expected_count=len(batch))
-            if reasons:
-                _emit(emit, 17 + batch_index, f"修复功能模块 {batch_index}/{batch_count}：{title}")
-                repair_data = _chat_json(
-                    provider,
-                    [
-                        {"role": "system", "content": _system_prompt()},
-                        {"role": "user", "content": _build_module_repair_prompt(task, core_plan, batch, modules, reasons)},
-                    ],
-                    temperature=min(_temperature(task.randomness) + 0.03, 0.85),
-                    max_tokens=1500,
-                    label=f"模块明细修复批次{batch_index}",
+        modules = _align_modules_to_outline(
+            [item for item in batch_modules if isinstance(item, dict)],
+            batch,
+        )
+        reasons = _module_batch_quality_reasons(task, modules, expected_count=len(batch))
+        if reasons:
+            _emit(emit, 17 + batch_index, f"修复功能模块 {batch_index}/{batch_count}：{title}")
+            repair_data = _chat_json(
+                provider,
+                [
+                    {"role": "system", "content": _system_prompt()},
+                    {"role": "user", "content": _build_module_repair_prompt(task, core_plan, batch, modules, reasons)},
+                ],
+                temperature=min(_temperature(task.randomness) + 0.03, 0.85),
+                max_tokens=1500,
+                label=f"模块明细修复批次{batch_index}",
+            )
+            repaired_modules = repair_data.get("modules")
+            if isinstance(repaired_modules, list):
+                modules = _align_modules_to_outline(
+                    [item for item in repaired_modules if isinstance(item, dict)],
+                    batch,
                 )
-                repaired_modules = repair_data.get("modules")
-                if isinstance(repaired_modules, list):
-                    modules = [item for item in repaired_modules if isinstance(item, dict)]
         reasons = _module_batch_quality_reasons(task, modules, expected_count=len(batch))
         if reasons:
             raise ValueError("模块明细质量不足：" + "；".join(reasons[:4]))
@@ -278,6 +286,21 @@ def _generate_module_batches(
     if len(modules) < 6:
         raise ValueError(f"LLM 分批模块方案数量不足：{len(modules)}")
     return modules[:8]
+
+
+def _align_modules_to_outline(modules: list[dict[str, Any]], outline_batch: list[Any]) -> list[dict[str, Any]]:
+    aligned: list[dict[str, Any]] = []
+    for index, module in enumerate(modules):
+        item = dict(module)
+        outline = outline_batch[index] if index < len(outline_batch) and isinstance(outline_batch[index], dict) else {}
+        outline_key = str(outline.get("key") or "").strip()
+        outline_title = str(outline.get("title") or "").strip()
+        if outline_key:
+            item["key"] = outline_key
+        if outline_title:
+            item["title"] = outline_title
+        aligned.append(item)
+    return aligned
 
 
 def _llm_batch_workers() -> int:
@@ -678,13 +701,15 @@ def _is_reading_audio_like_text(text: str) -> bool:
 def _is_consumer_app_text(text: str) -> bool:
     if "APP" in text.upper() and not any(term in text for term in ["后台", "管理系统", "OA", "ERP", "CRM"]):
         return True
-    return any(
+    if any(
         term in text
         for term in [
             "听歌", "音乐", "歌曲", "歌单", "阅读", "听书", "小说", "短视频", "相册", "拍照", "修图",
-            "健身", "打卡", "运动", "日记", "记账", "清单", "便签", "外卖", "商城", "购物",
+            "健身", "打卡", "运动", "日记", "记账", "便签", "外卖", "商城", "购物",
         ]
-    )
+    ):
+        return True
+    return any(term in text for term in ("待办清单", "购物清单", "生活清单", "个人清单"))
 
 
 def _consumer_app_forbidden_terms() -> list[str]:
@@ -929,6 +954,77 @@ def _merge_plan(core_plan: dict[str, Any], module_plan: dict[str, Any]) -> dict[
     return merged
 
 
+_ADMIN_TERMINAL_REPLACEMENTS = (
+    ("移动端人工智能应用", "浏览器端工业生产智能应用"),
+    ("移动端生产效率工作入口", "工业生产运营工作台"),
+    ("移动 App", "工业生产运营工作台"),
+    ("移动APP", "工业生产运营工作台"),
+    ("手机 App", "工业生产运营工作台"),
+    ("手机APP", "工业生产运营工作台"),
+    ("首页推荐", "首页预警"),
+    ("推荐提醒", "预警提醒"),
+    ("个人中心", "权限与审计中心"),
+    ("个人关注", "重点关注"),
+    ("收藏清单", "重点标记清单"),
+    ("离线缓存", "导出留存"),
+    ("缓存甘特图", "导出甘特图"),
+    ("缓存供现场离线查看", "导出供现场复核"),
+    ("离线查看", "导出复核"),
+    ("离线记录", "导出记录"),
+    ("使用记录", "操作记录"),
+    ("岗位偏好", "岗位权限"),
+    ("弱网环境", "受控网络环境"),
+    ("收藏", "重点标记"),
+    ("订阅", "配置预警"),
+)
+
+
+def _normalize_plan_terminal_semantics(task: GenerationTask, value: Any) -> Any:
+    if _expected_plan_terminal(task) != "admin":
+        return value
+    if isinstance(value, dict):
+        return {key: _normalize_plan_terminal_semantics(task, item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_plan_terminal_semantics(task, item) for item in value]
+    if not isinstance(value, str):
+        return value
+    text = value
+    for source, target in _ADMIN_TERMINAL_REPLACEMENTS:
+        text = text.replace(source, target)
+    return text
+
+
+def _expected_plan_terminal(task: GenerationTask) -> str:
+    text = " ".join(
+        str(item or "")
+        for item in (
+            task.software_name,
+            task.product_type,
+            task.feature_hint,
+            _semantic_contract(task).get("feature_hint_domain"),
+            _semantic_contract(task).get("feature_hint_profile"),
+        )
+    )
+    if task.product_type == "游戏软件" or "游戏" in text:
+        return "game"
+    if _is_music_like_text(text) or _is_consumer_app_text(text):
+        return "mobile_app"
+    return "admin"
+
+
+def _terminal_guidance(task: GenerationTask) -> str:
+    terminal = _expected_plan_terminal(task)
+    if terminal == "game":
+        return "- 当前软件是游戏终端，页面与流程必须使用玩家、关卡、对局或游戏配置语义。"
+    if terminal == "mobile_app":
+        return "- 当前软件是移动应用，可以使用手机 App、收藏、离线缓存和个人中心等真实用户端语义。"
+    return (
+        "- 当前软件是浏览器端/工业工作台，不是消费级移动 App。"
+        "禁止写移动 App、手机 App、个人中心、收藏、离线缓存、会员权益或底部导航；"
+        "对应能力应写成岗位权限、重点标记、导出留存、操作审计和工业生产运营工作台。"
+    )
+
+
 def _build_core_prompt(task: GenerationTask, rejection_reasons: list[str] | None = None) -> str:
     retry_note = ""
     if rejection_reasons:
@@ -950,8 +1046,11 @@ def _build_core_prompt(task: GenerationTask, rejection_reasons: list[str] | None
 本次生成的差异化产品策略：
 {variation_strategy}
 
-领域边界要求：
-{domain_guidance}
+    领域边界要求：
+    {domain_guidance}
+
+    终端边界要求：
+    {_terminal_guidance(task)}
 
 返回 JSON 字段必须包含：
 - industry: 面向领域/行业，中文短语
@@ -1008,6 +1107,9 @@ def _build_business_detail_prompt(
 领域边界要求：
 {domain_guidance}
 
+终端边界要求：
+{_terminal_guidance(task)}
+
 软件身份定位：
 {_compact_identity_plan(identity_plan)}
 
@@ -1054,6 +1156,9 @@ def _build_module_prompt(
 
 领域边界要求：
 {domain_guidance}
+
+终端边界要求：
+{_terminal_guidance(task)}
 
 modules 必须包含 6-8 个功能模块，每个对象包含：
 - key: 小写英文或英文下划线，适合作为源码目录/类名前缀
@@ -1106,11 +1211,15 @@ def _build_module_batch_prompt(
 领域边界要求：
 {domain_guidance}
 
+终端边界要求：
+{_terminal_guidance(task)}
+
 本批模块轮廓：
 {json.dumps(outline_batch, ensure_ascii=False)}
 
 每个模块必须包含 key/title/description/entities/operations/operation_specs/data_fields/pages/rules。
 description 90-180字；operations 4-7个；operation_specs 3-5个；data_fields 6-10个；rules 3-5条。
+- modules 数量、顺序、key 和 title 必须与“本批模块轮廓”逐项一致，不得改成 module_1 等泛化 key，也不得把首页、搜索、个人中心等导航入口改造成业务模块。
 - 模块边界、操作名、字段名和规则必须符合差异化产品策略，不要复用“新增、编辑、删除、导出”四件套作为主要内容。
 - operation_specs 的 label 必须是领域动作；role、trigger、input_fields、post_state、result_evidence 不得为空。查询动作必须给出真实筛选字段和结果证据，业务动作必须给出状态变化；只有删除、失效、覆盖、正式发布等高风险动作 requires_confirmation=true。
 只返回 JSON。
@@ -1139,6 +1248,9 @@ def _build_module_repair_prompt(
 
 领域边界要求：
 {domain_guidance}
+
+终端边界要求：
+{_terminal_guidance(task)}
 
 本批模块轮廓：
 {json.dumps(batch, ensure_ascii=False, indent=2)}
@@ -1863,7 +1975,10 @@ def blueprint_contract_issues(task: GenerationTask, blueprint: ProductBlueprint)
     )
     if renderer == "admin":
         mobile_conflicts = [
-            term for term in ("移动 App", "手机 App", "会员状态", "会员权益", "个人中心", "底部导航", "收藏清单")
+            term for term in (
+                "移动 App", "移动端", "手机 App", "会员状态", "会员权益", "个人中心", "底部导航",
+                "收藏清单", "个人关注", "离线缓存", "离线查看", "弱网环境",
+            )
             if term in blueprint_text
         ]
         if len(mobile_conflicts) >= 2:

@@ -1,15 +1,20 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 import unittest
 
 from backend.softcopyright.blueprint import FeatureModule, ProductBlueprint
 from backend.softcopyright.llm_blueprint import (
     _clean_workflows,
+    _generate_module_batches,
+    _expected_plan_terminal,
+    _normalize_plan_terminal_semantics,
     _quality_review,
     _select_contract_modules,
     blueprint_contract_issues,
 )
 from backend.softcopyright.models import GenerationTask
+from backend.softcopyright.module_keys import is_placeholder_module_key, semantic_module_key
 from backend.softcopyright.validator import validate_materials
 
 
@@ -135,6 +140,66 @@ class BlueprintOperationContractTests(unittest.TestCase):
         self.assertIn("审计追溯", titles)
         self.assertEqual(len(selected), 8)
 
+    def test_legacy_domain_hash_keys_are_replaced_with_manufacturing_semantics(self):
+        cases = {
+            "产线智能排程": "smart_scheduling",
+            "工序节拍监控": "process_takt",
+            "设备停机响应": "equipment_downtime",
+            "产能预测与瓶颈识别": "capacity_forecast_bottleneck_detection",
+            "良率改善闭环": "yield_improvement",
+            "交付达成监控": "delivery_performance",
+        }
+
+        self.assertTrue(is_placeholder_module_key("domain_03_10723"))
+        for index, (title, expected) in enumerate(cases.items(), start=1):
+            key = semantic_module_key(title, index, raw_key=f"domain_{index:02d}_10723")
+            self.assertEqual(key, expected)
+            self.assertFalse(is_placeholder_module_key(key))
+
+    def test_admin_blueprint_terminal_semantics_are_normalized_without_touching_mobile_apps(self):
+        polluted = {
+            "summary": "生产主管登录移动 App，在个人中心收藏计划并离线缓存甘特图。",
+            "workflows": [
+                {
+                    "name": "首页推荐",
+                    "steps": ["接收推荐提醒", "订阅设备并在弱网环境离线查看"],
+                }
+            ],
+            "modules": [
+                {
+                    "operation_specs": [
+                        {"label": "收藏与离线查看", "result_evidence": "个人关注和使用记录"}
+                    ]
+                }
+            ],
+        }
+
+        normalized = _normalize_plan_terminal_semantics(self.task, polluted)
+        normalized_text = str(normalized)
+
+        self.assertNotIn("移动 App", normalized_text)
+        self.assertNotIn("个人中心", normalized_text)
+        self.assertNotIn("离线查看", normalized_text)
+        self.assertIn("工业生产运营工作台", normalized_text)
+        self.assertIn("重点标记", normalized_text)
+        self.assertIn("权限与审计中心", normalized_text)
+
+        mobile_task = GenerationTask(software_name="小艾听歌软件", product_type="APP", feature_hint="音乐搜索和歌曲播放")
+        self.assertEqual(_normalize_plan_terminal_semantics(mobile_task, polluted), polluted)
+
+    def test_industrial_risk_list_does_not_turn_the_product_into_a_consumer_app(self):
+        task = GenerationTask(
+            software_name="智能生产效率提升平台",
+            product_type="人工智能软件",
+            feature_hint="生产计划、生产工单、设备停机响应和延期风险清单",
+        )
+
+        self.assertEqual(_expected_plan_terminal(task), "admin")
+        self.assertEqual(
+            _expected_plan_terminal(GenerationTask(software_name="个人待办清单", product_type="APP")),
+            "mobile_app",
+        )
+
     def test_workflow_cleanup_preserves_complete_long_steps(self):
         step = "读取生产工单、工艺路线、设备负荷和物料齐套状态后生成可执行排程方案并记录冲突原因"
 
@@ -185,6 +250,59 @@ class BlueprintOperationContractTests(unittest.TestCase):
         self.assertFalse(local_validation["authenticity"]["blueprint_operation_contract_required"])
         self.assertTrue(local_validation["authenticity"]["blueprint_operation_contract_ready"])
         self.assertNotIn("blueprint_operation_contract_not_ready", local_codes)
+
+    def test_balanced_module_batches_repair_only_the_failed_batch(self):
+        outline = [
+            {"key": f"manufacturing_module_{index}", "title": f"生产执行模块{index}", "focus": "制造现场业务"}
+            for index in range(1, 7)
+        ]
+        call_labels = []
+
+        def valid_module(index):
+            title = f"模型漂移标题{index}"
+            return {
+                "key": f"module_{index}",
+                "title": title,
+                "description": "围绕生产计划、生产工单、产线资源和制造现场状态组织业务处理，校验责任岗位、执行条件和状态流转，完成后输出可核验的任务轨迹、统计结果和审计记录。",
+                "entities": ["ProductionRecord", "ProductionTrace"],
+                "operations": ["筛选生产任务", "下达生产工单", "暂停异常任务", "分析执行偏差", "追踪处理结果"],
+                "operation_specs": [
+                    _operation("filter_production_tasks", "筛选生产任务", "lookup", "计划员", "需要定位待执行任务", ["任务编号", "目标产线"], "全部任务", "显示匹配任务", "筛选条件和结果数量"),
+                    _operation("release_production_order", "下达生产工单", "workflow", "车间主管", "物料和工艺校验通过", ["工单编号", "计划数量"], "待下达", "已下达", "工单状态和下达日志"),
+                    _operation("analyze_execution_gap", "分析执行偏差", "analysis", "生产主管", "实际进度偏离计划", ["计划版本", "统计周期"], "待分析", "已形成偏差结论", "偏差指标和影响范围"),
+                ],
+                "data_fields": ["生产任务编号", "目标产线", "计划数量", "实际数量", "责任岗位", "执行状态", "偏差原因"],
+                "pages": ["生产任务工作台", "执行结果详情"],
+                "rules": ["仅授权岗位可下达任务", "工单状态必须按顺序流转", "关键动作必须写入审计日志"],
+            }
+
+        def chat_json(_provider, _messages, *, temperature, max_tokens, label):
+            call_labels.append(label)
+            batch_index = int(label[-1])
+            if "修复" not in label:
+                invalid = valid_module(batch_index * 2 - 1)
+                invalid["operation_specs"] = []
+                return {"modules": [invalid, invalid]}
+            return {"modules": [valid_module(batch_index * 2 - 1), valid_module(batch_index * 2)]}
+
+        with patch.dict("os.environ", {"SOFT_GENERATION_PROFILE": "balanced", "SOFT_LLM_BATCH_WORKERS": "1"}), patch(
+            "backend.softcopyright.llm_blueprint._chat_json",
+            side_effect=chat_json,
+        ):
+            modules = _generate_module_batches(
+                self.task,
+                object(),
+                {"module_outline": outline},
+                [],
+                "",
+            )
+
+        self.assertEqual(len(modules), 6)
+        self.assertEqual(call_labels.count("模块明细修复批次1"), 1)
+        self.assertEqual(call_labels.count("模块明细修复批次2"), 1)
+        self.assertEqual(call_labels.count("模块明细修复批次3"), 1)
+        self.assertEqual([item["key"] for item in modules], [item["key"] for item in outline])
+        self.assertEqual([item["title"] for item in modules], [item["title"] for item in outline])
 
 
 if __name__ == "__main__":

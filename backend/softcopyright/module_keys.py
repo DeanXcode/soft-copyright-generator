@@ -194,6 +194,17 @@ KEY_PHRASES: tuple[tuple[str, str], ...] = (
     ("数据目录", "data_catalog"),
     ("数据质量", "data_quality"),
     ("主数据", "master_data"),
+    ("生产计划", "production_plan"),
+    ("生产工单", "production_work_order"),
+    ("智能排程", "smart_scheduling"),
+    ("换线调度", "changeover_scheduling"),
+    ("工序节拍", "process_takt"),
+    ("在制品流转", "work_in_process_flow"),
+    ("设备停机", "equipment_downtime"),
+    ("产能预测", "capacity_forecast"),
+    ("瓶颈识别", "bottleneck_detection"),
+    ("良率改善", "yield_improvement"),
+    ("交付达成", "delivery_performance"),
     ("智能排产", "smart_scheduling"),
     ("排产调度", "production_scheduling"),
     ("设备运维", "equipment_maintenance"),
@@ -238,6 +249,7 @@ def is_placeholder_module_key(value: str) -> bool:
         return True
     return bool(
         re.fullmatch(r"(?:confirmed|semantic|module)(?:_\d+.*|\d*)", key)
+        or re.fullmatch(r"domain_(?:\d+_)?[0-9a-f]{4,}", key)
         or re.fullmatch(r"(?:business|data|system|common)_module(?:_\d+)?", key)
         or re.fullmatch(r"business_process(?:_\d+|\d+)?", key)
         or re.fullmatch(r"(?:route|maintenance|checklist)(?:_\d+|\d{2,})", key)
