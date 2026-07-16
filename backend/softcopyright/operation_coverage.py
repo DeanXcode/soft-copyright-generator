@@ -13,6 +13,13 @@ class OperationCoverageSpec:
     mode: str
     requires_confirmation: bool = False
     source: str = "module"
+    action_key: str = ""
+    role: str = ""
+    trigger: str = ""
+    input_fields: tuple[str, ...] = ()
+    pre_state: str = ""
+    post_state: str = ""
+    result_evidence: str = ""
 
 
 _ACTION_SUFFIXES = (
@@ -136,6 +143,41 @@ def operation_spec(action: str, *, source: str = "module") -> OperationCoverageS
     )
 
 
+def operation_spec_from_mapping(value: dict[str, Any], *, source: str = "blueprint-structured") -> OperationCoverageSpec | None:
+    label = str(value.get("label") or value.get("action") or value.get("name") or "").strip()
+    if not label:
+        return None
+    inferred = operation_spec(label, source=source)
+    category = str(value.get("category") or "").strip().lower()
+    if category not in {"lookup", "mutation", "import", "export", "destructive", "analysis", "workflow", "result", "instant"}:
+        category = inferred.category
+    input_fields = value.get("input_fields") or value.get("inputFields") or []
+    if not isinstance(input_fields, list):
+        input_fields = []
+    explicit_confirmation = value.get("requires_confirmation")
+    if explicit_confirmation is None:
+        explicit_confirmation = value.get("requiresConfirmation")
+    return OperationCoverageSpec(
+        action=label,
+        category=category,
+        surface=str(value.get("surface") or inferred.surface).strip() or inferred.surface,
+        mode=str(value.get("mode") or inferred.mode).strip() or inferred.mode,
+        requires_confirmation=(
+            bool(explicit_confirmation)
+            if explicit_confirmation is not None
+            else inferred.requires_confirmation
+        ),
+        source=source,
+        action_key=str(value.get("action_key") or value.get("actionKey") or "").strip(),
+        role=str(value.get("role") or "").strip(),
+        trigger=str(value.get("trigger") or "").strip(),
+        input_fields=tuple(str(item).strip() for item in input_fields if str(item).strip()),
+        pre_state=str(value.get("pre_state") or value.get("preState") or "").strip(),
+        post_state=str(value.get("post_state") or value.get("postState") or "").strip(),
+        result_evidence=str(value.get("result_evidence") or value.get("resultEvidence") or "").strip(),
+    )
+
+
 def configured_operation_screen_count(renderer: str = "admin") -> int:
     default = 3 if renderer == "admin" else 2 if renderer == "mobile_app" else 0
     raw = os.getenv("SOFT_MODULE_OPERATION_SCREEN_COUNT", str(default)).strip()
@@ -157,8 +199,21 @@ def module_operation_coverage(
     target = configured_operation_screen_count(renderer) if limit is None else max(0, int(limit))
     if target <= 0:
         return []
+    structured_values = getattr(module, "operation_specs", None) or []
+    structured_specs = [
+        spec
+        for item in structured_values
+        if isinstance(item, dict)
+        for spec in [operation_spec_from_mapping(item)]
+        if spec is not None
+    ]
     raw_operations = [str(item).strip() for item in (getattr(module, "operations", None) or []) if str(item).strip()]
-    actual_specs = _unique_specs(operation_spec(value) for value in raw_operations)
+    actual_specs = _unique_specs(structured_specs)
+    if len(actual_specs) < target:
+        actual_specs = _unique_specs([
+            *actual_specs,
+            *(operation_spec(value) for value in raw_operations),
+        ])
     if renderer == "mobile_app":
         return _mobile_coverage(module, actual_specs, module_index=module_index, target=target)
     return _admin_coverage(module, actual_specs, module_index=module_index, target=target)
@@ -170,6 +225,8 @@ def operation_coverage_categories(specs: Iterable[OperationCoverageSpec]) -> lis
 
 def operation_caption(module_title: str, spec: OperationCoverageSpec) -> str:
     subject = f"{module_title}{spec.action}"
+    role_note = f"由{spec.role}在{spec.trigger}时发起，" if spec.role and spec.trigger else ""
+    evidence_note = f"，完成后形成{spec.result_evidence}" if spec.result_evidence else ""
     templates = {
         "lookup": f"{subject}页面展示查询条件、结果列表、筛选状态和可用操作。",
         "mutation": f"{subject}页面展示待维护字段、校验提示、保存入口和处理结果。",
@@ -181,7 +238,8 @@ def operation_caption(module_title: str, spec: OperationCoverageSpec) -> str:
         "result": f"{subject}页面展示当前记录详情、状态轨迹和关联处理结果。",
         "instant": f"{subject}页面直接展示操作结果和可继续使用的入口。",
     }
-    return templates.get(spec.category, f"{subject}页面展示当前业务信息和处理结果。")
+    caption = templates.get(spec.category, f"{subject}页面展示当前业务信息和处理结果。")
+    return f"{role_note}{caption.rstrip('。')}{evidence_note}。"
 
 
 def _admin_coverage(
@@ -262,15 +320,25 @@ def _mobile_coverage(
         if term in text and action not in detected:
             detected.append(action)
     inferred_specs = [operation_spec(action, source="coverage-inferred") for action in detected]
-    allowed_actual = [
+    structured_specs = [
         spec
         for spec in actual_specs
-        if spec.category in {"lookup", "instant", "export"} and spec.action in text
+        if spec.source == "blueprint-structured"
     ]
-    candidates = _unique_specs([*inferred_specs, *allowed_actual])
+    allowed_legacy = [
+        spec
+        for spec in actual_specs
+        if spec.source != "blueprint-structured"
+        and spec.category in {"lookup", "instant", "export"}
+        and spec.action in text
+    ]
+    candidates = _unique_specs([*structured_specs, *inferred_specs, *allowed_legacy])
     if not candidates:
         candidates = [operation_spec("查看详情", source="coverage-fallback")]
-    selected = candidates[module_index % len(candidates) :] + candidates[: module_index % len(candidates)]
+    if structured_specs:
+        selected = list(candidates)
+    else:
+        selected = candidates[module_index % len(candidates) :] + candidates[: module_index % len(candidates)]
     if len(selected) < target and not any(spec.category == "lookup" for spec in selected):
         selected.append(operation_spec("搜索与筛选", source="coverage-fallback"))
     if len(selected) < target:

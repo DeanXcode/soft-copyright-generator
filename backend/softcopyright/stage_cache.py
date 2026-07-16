@@ -14,7 +14,7 @@ from .module_keys import is_placeholder_module_key, normalize_entity_names, sema
 from .ui_blueprint import UiBlueprint, UiScreenBlueprint
 
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 MANUAL_SECTION_KEYS = ("overview", "login_main", "statistics", "security", "faq")
 
 
@@ -341,6 +341,7 @@ def _feature_module_from_cached_item(
         data_fields=data_fields,
         pages=_string_list(item.get("pages")),
         rules=_string_list(item.get("rules")),
+        operation_specs=_mapping_list(item.get("operation_specs") or item.get("operationSpecs")),
     )
 
 
@@ -526,6 +527,12 @@ def _string_dict(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
     return {str(key): str(item) for key, item in value.items() if str(key).strip() and item is not None}
+
+
+def _mapping_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
 
 
 def _expected_module_titles(feature_hint_meta: dict[str, Any]) -> list[str]:

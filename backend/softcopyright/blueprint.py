@@ -18,6 +18,7 @@ class FeatureModule:
     data_fields: list[str] = field(default_factory=list)
     pages: list[str] = field(default_factory=list)
     rules: list[str] = field(default_factory=list)
+    operation_specs: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass

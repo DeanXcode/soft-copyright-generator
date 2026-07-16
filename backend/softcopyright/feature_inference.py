@@ -360,7 +360,8 @@ def _build_llm_prompt(software_name: str, product_type: str, provided: str, deta
 5. description 80-140 个中文字符，写清对象、动作、状态、校验点或输出。
 6. 禁止泛型模块：数据管理、业务处理、统计分析、系统设置、权限管理、核心模块。
 7. 如果名称包含“监测、建议、平台、系统”，要拆出对象/项目建档、采集接入、过程监测、阈值预警、建议生成、处置闭环、记录追溯、报表分析等环节。
-8. 每个模块需要直接给出后续软著材料可用的 key、entities、operations、data_fields、pages、rules，避免后续再次请求模型补模块明细。
+8. 每个模块需要直接给出后续软著材料可用的 key、entities、operations、operation_specs、data_fields、pages、rules，避免后续再次请求模型补模块明细。
+9. operation_specs 至少 3 个，必须覆盖查询和业务处理/结果类动作；动作需要写明角色、触发条件、输入字段、前后状态和结果证据，不能只把模块名拼接“登记/校验/分析/确认/归档”。
 
 返回 JSON 结构：
 {{
@@ -378,6 +379,20 @@ def _build_llm_prompt(software_name: str, product_type: str, provided: str, deta
       "description": "80-140字真实业务说明，说明对象、动作、流转、校验点和输出。",
       "entities": ["EnglishEntityRecord", "EnglishEntityTrace"],
       "operations": ["具体操作1", "具体操作2", "具体操作3", "具体操作4", "具体操作5"],
+      "operation_specs": [
+        {{
+          "action_key": "domain_action_key",
+          "label": "领域动作名称",
+          "category": "lookup|mutation|import|export|analysis|workflow|result|instant|destructive",
+          "role": "执行角色",
+          "trigger": "触发条件",
+          "input_fields": ["输入字段1", "输入字段2"],
+          "pre_state": "操作前状态",
+          "post_state": "操作后状态",
+          "result_evidence": "页面可见的结果、日志或状态证据",
+          "requires_confirmation": false
+        }}
+      ],
       "data_fields": ["业务字段1", "业务字段2", "业务字段3", "业务字段4", "业务字段5", "业务字段6"],
       "data_objects": ["关键数据对象1", "关键数据对象2"],
       "user_flow": ["用户步骤1", "用户步骤2", "用户步骤3"],
@@ -609,6 +624,9 @@ def _normalize_blueprint_modules(value: Any) -> list[dict[str, Any]]:
                 "description": description,
                 "entities": _clean_entities(item.get("entities"), 4),
                 "operations": _clean_list(item.get("operations") or item.get("actions"), 7, 28),
+                "operation_specs": _normalize_operation_specs(
+                    item.get("operation_specs") or item.get("operationSpecs")
+                ),
                 "data_fields": _clean_list(
                     item.get("data_fields") or item.get("dataFields") or item.get("fields"),
                     10,
@@ -634,6 +652,43 @@ def _normalize_blueprint_modules(value: Any) -> list[dict[str, Any]]:
         if len(modules) >= 12:
             break
     return modules
+
+
+def _normalize_operation_specs(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        label = _clean_hint(str(item.get("label") or item.get("action") or item.get("name") or ""))[:28]
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        result.append(
+            {
+                "action_key": _safe_id(str(item.get("action_key") or item.get("actionKey") or label)),
+                "label": label,
+                "category": _clean_hint(str(item.get("category") or ""))[:20],
+                "role": _clean_hint(str(item.get("role") or ""))[:24],
+                "trigger": _clean_hint(str(item.get("trigger") or ""))[:80],
+                "input_fields": _clean_list(item.get("input_fields") or item.get("inputFields"), 8, 24),
+                "pre_state": _clean_hint(str(item.get("pre_state") or item.get("preState") or ""))[:32],
+                "post_state": _clean_hint(str(item.get("post_state") or item.get("postState") or ""))[:32],
+                "result_evidence": _clean_hint(
+                    str(item.get("result_evidence") or item.get("resultEvidence") or "")
+                )[:90],
+                "requires_confirmation": bool(
+                    item.get("requires_confirmation")
+                    if item.get("requires_confirmation") is not None
+                    else item.get("requiresConfirmation", False)
+                ),
+            }
+        )
+        if len(result) >= 7:
+            break
+    return result
 
 
 def _llm_result_meets_blueprint_floor(result: dict[str, Any], software_name: str, min_count: int) -> bool:
@@ -672,12 +727,26 @@ def _llm_result_meets_blueprint_floor(result: dict[str, Any], software_name: str
         weak_detail_count = 0
         for module in modules:
             operations = module.get("operations") if isinstance(module, dict) else []
+            operation_specs = module.get("operation_specs") if isinstance(module, dict) else []
             data_fields = module.get("data_fields") if isinstance(module, dict) else []
             pages = module.get("pages") if isinstance(module, dict) else []
             rules = module.get("rules") if isinstance(module, dict) else []
             if (
                 not isinstance(operations, list)
                 or len(operations) < 4
+                or not isinstance(operation_specs, list)
+                or len(operation_specs) < 3
+                or any(
+                    not isinstance(spec, dict)
+                    or not str(spec.get("label") or "").strip()
+                    or not str(spec.get("role") or "").strip()
+                    or not str(spec.get("trigger") or "").strip()
+                    or not isinstance(spec.get("input_fields"), list)
+                    or not spec.get("input_fields")
+                    or not str(spec.get("post_state") or "").strip()
+                    or not str(spec.get("result_evidence") or "").strip()
+                    for spec in operation_specs
+                )
                 or not isinstance(data_fields, list)
                 or len(data_fields) < 5
                 or not isinstance(pages, list)

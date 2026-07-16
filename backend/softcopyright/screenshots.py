@@ -17,7 +17,6 @@ import urllib.request
 from .ai_frontend_codegen import generate_ai_frontend_pages, generate_style_reference_assets
 from .blueprint import FeatureModule, ProductBlueprint
 from .llm.provider import LLMProvider
-from .interaction_semantics import mobile_secondary_interaction
 from .models import GenerationTask
 from .operation_coverage import module_operation_coverage, operation_caption
 from .packager import write_json
@@ -26,7 +25,7 @@ from .ui_blueprint import UiBlueprint, UiScreenBlueprint, build_ui_blueprint, is
 ADMIN_VIEWPORT = {"width": 1280, "height": 720}
 GAME_VIEWPORT = {"width": 720, "height": 1280}
 MOBILE_VIEWPORT = {"width": 720, "height": 1280}
-SCREENSHOT_CHECKPOINT_VERSION = 4
+SCREENSHOT_CHECKPOINT_VERSION = 5
 
 
 def _is_mobile_renderer(renderer: str) -> bool:
@@ -52,7 +51,10 @@ def _screenshot_input_fingerprint(item: "UiScreenshot", renderer: str, viewport:
             f"v{SCREENSHOT_CHECKPOINT_VERSION}|{renderer}|"
             f"{viewport.get('width')}x{viewport.get('height')}|{item.key}|"
             f"{item.interaction_action}|{item.interaction_mode}|"
-            f"{item.interaction_surface}|{int(bool(item.requires_confirmation))}"
+            f"{item.interaction_surface}|{int(bool(item.requires_confirmation))}|"
+            f"{item.interaction_action_key}|{item.interaction_role}|{item.interaction_trigger}|"
+            f"{'/'.join(item.interaction_input_fields or [])}|{item.interaction_pre_state}|"
+            f"{item.interaction_post_state}|{item.interaction_result_evidence}"
         ).encode("utf-8")
     )
     try:
@@ -153,6 +155,13 @@ class UiScreenshot:
     interaction_mode: str = ""
     interaction_surface: str = ""
     requires_confirmation: bool = False
+    interaction_action_key: str = ""
+    interaction_role: str = ""
+    interaction_trigger: str = ""
+    interaction_input_fields: list[str] | None = None
+    interaction_pre_state: str = ""
+    interaction_post_state: str = ""
+    interaction_result_evidence: str = ""
 
 
 def generate_ui_screenshots(
@@ -1867,6 +1876,13 @@ def _build_pages(task: GenerationTask, blueprint: ProductBlueprint, ui_dir: Path
                     interaction_mode=operation.mode,
                     interaction_surface=operation.surface,
                     requires_confirmation=operation.requires_confirmation,
+                    interaction_action_key=operation.action_key,
+                    interaction_role=operation.role,
+                    interaction_trigger=operation.trigger,
+                    interaction_input_fields=list(operation.input_fields),
+                    interaction_pre_state=operation.pre_state,
+                    interaction_post_state=operation.post_state,
+                    interaction_result_evidence=operation.result_evidence,
                 )
             )
     pages.append(
@@ -1907,42 +1923,31 @@ def _build_page_specs(task: GenerationTask, blueprint: ProductBlueprint, ui_dir:
             for module_index, module in enumerate(blueprint.modules):
                 if module.key not in screen_module_keys:
                     continue
-                interaction = mobile_secondary_interaction(module)
-                candidates: list[tuple[str, str, str, str, bool]] = [
-                    (
-                        interaction.action,
-                        interaction.caption,
-                        interaction.mode,
-                        interaction.surface,
-                        interaction.requires_confirmation,
-                    )
-                ]
-                for spec in module_operation_coverage(module, renderer="mobile_app", module_index=module_index):
-                    if any(spec.action == item[0] for item in candidates):
-                        continue
-                    candidates.append(
-                        (
-                            spec.action,
-                            operation_caption(module.title, spec),
-                            spec.mode,
-                            spec.surface,
-                            spec.requires_confirmation,
-                        )
-                    )
-                for operation_index, (action, caption, mode, surface, requires_confirmation) in enumerate(candidates[:2], start=2):
+                for operation_index, operation in enumerate(
+                    module_operation_coverage(module, renderer="mobile_app", module_index=module_index),
+                    start=2,
+                ):
+                    action = operation.action
                     pages.append(
                         _page_spec(
                             ui_dir,
                             _module_operation_page_key(module.key, action, operation_index),
                             f"{module.title}-{action}",
-                            caption,
+                            operation_caption(module.title, operation),
                             renderer=renderer,
                             page_kind="operation",
                             module_key=module.key,
                             interaction_action=action,
-                            interaction_mode=mode,
-                            interaction_surface=surface,
-                            requires_confirmation=requires_confirmation,
+                            interaction_mode=operation.mode,
+                            interaction_surface=operation.surface,
+                            requires_confirmation=operation.requires_confirmation,
+                            interaction_action_key=operation.action_key,
+                            interaction_role=operation.role,
+                            interaction_trigger=operation.trigger,
+                            interaction_input_fields=list(operation.input_fields),
+                            interaction_pre_state=operation.pre_state,
+                            interaction_post_state=operation.post_state,
+                            interaction_result_evidence=operation.result_evidence,
                         )
                     )
         return pages
@@ -2001,6 +2006,13 @@ def _build_page_specs(task: GenerationTask, blueprint: ProductBlueprint, ui_dir:
                     interaction_mode=operation.mode,
                     interaction_surface=operation.surface,
                     requires_confirmation=operation.requires_confirmation,
+                    interaction_action_key=operation.action_key,
+                    interaction_role=operation.role,
+                    interaction_trigger=operation.trigger,
+                    interaction_input_fields=list(operation.input_fields),
+                    interaction_pre_state=operation.pre_state,
+                    interaction_post_state=operation.post_state,
+                    interaction_result_evidence=operation.result_evidence,
                 )
             )
     pages.append(
@@ -2588,44 +2600,34 @@ def _build_mobile_app_pages(task: GenerationTask, blueprint: ProductBlueprint, u
     for module_index, module in enumerate(blueprint.modules):
         if module.key not in screen_module_keys:
             continue
-        interaction = mobile_secondary_interaction(module)
-        candidates: list[tuple[str, str, str, str, bool]] = [
-            (
-                interaction.action,
-                interaction.caption,
-                interaction.mode,
-                interaction.surface,
-                interaction.requires_confirmation,
-            )
-        ]
-        for spec in module_operation_coverage(module, renderer="mobile_app", module_index=module_index):
-            if any(spec.action == item[0] for item in candidates):
-                continue
-            candidates.append(
-                (
-                    spec.action,
-                    operation_caption(module.title, spec),
-                    spec.mode,
-                    spec.surface,
-                    spec.requires_confirmation,
-                )
-            )
-        for operation_index, (action, caption, mode, surface, requires_confirmation) in enumerate(candidates[:2], start=2):
+        for operation_index, operation in enumerate(
+            module_operation_coverage(module, renderer="mobile_app", module_index=module_index),
+            start=2,
+        ):
+            action = operation.action
+            caption = operation_caption(module.title, operation)
             pages.append(
                 _write_page(
                     ui_dir,
                     _module_operation_page_key(module.key, action, operation_index),
                     f"{module.title}-{action}",
                     caption,
-                    _mobile_operation_body(task, blueprint, module, action, caption, mode, design_brief),
+                    _mobile_operation_body(task, blueprint, module, action, caption, operation.mode, design_brief),
                     renderer="mobile_app",
                     page_kind="operation",
                     module_key=module.key,
                     design_brief=design_brief,
                     interaction_action=action,
-                    interaction_mode=mode,
-                    interaction_surface=surface,
-                    requires_confirmation=requires_confirmation,
+                    interaction_mode=operation.mode,
+                    interaction_surface=operation.surface,
+                    requires_confirmation=operation.requires_confirmation,
+                    interaction_action_key=operation.action_key,
+                    interaction_role=operation.role,
+                    interaction_trigger=operation.trigger,
+                    interaction_input_fields=list(operation.input_fields),
+                    interaction_pre_state=operation.pre_state,
+                    interaction_post_state=operation.post_state,
+                    interaction_result_evidence=operation.result_evidence,
                 )
             )
     return pages
@@ -2849,6 +2851,13 @@ def _write_page(
     interaction_mode: str = "",
     interaction_surface: str = "",
     requires_confirmation: bool = False,
+    interaction_action_key: str = "",
+    interaction_role: str = "",
+    interaction_trigger: str = "",
+    interaction_input_fields: list[str] | None = None,
+    interaction_pre_state: str = "",
+    interaction_post_state: str = "",
+    interaction_result_evidence: str = "",
 ) -> UiScreenshot:
     html_path = ui_dir / f"{key}.html"
     html_path.write_text(
@@ -2866,6 +2875,13 @@ def _write_page(
         interaction_mode=interaction_mode,
         interaction_surface=interaction_surface,
         requires_confirmation=requires_confirmation,
+        interaction_action_key=interaction_action_key,
+        interaction_role=interaction_role,
+        interaction_trigger=interaction_trigger,
+        interaction_input_fields=list(interaction_input_fields or []),
+        interaction_pre_state=interaction_pre_state,
+        interaction_post_state=interaction_post_state,
+        interaction_result_evidence=interaction_result_evidence,
     )
 
 
@@ -2881,6 +2897,13 @@ def _page_spec(
     interaction_mode: str = "",
     interaction_surface: str = "",
     requires_confirmation: bool = False,
+    interaction_action_key: str = "",
+    interaction_role: str = "",
+    interaction_trigger: str = "",
+    interaction_input_fields: list[str] | None = None,
+    interaction_pre_state: str = "",
+    interaction_post_state: str = "",
+    interaction_result_evidence: str = "",
 ) -> UiScreenshot:
     html_path = ui_dir / f"{key}.html"
     return UiScreenshot(
@@ -2894,6 +2917,13 @@ def _page_spec(
         interaction_mode=interaction_mode,
         interaction_surface=interaction_surface,
         requires_confirmation=requires_confirmation,
+        interaction_action_key=interaction_action_key,
+        interaction_role=interaction_role,
+        interaction_trigger=interaction_trigger,
+        interaction_input_fields=list(interaction_input_fields or []),
+        interaction_pre_state=interaction_pre_state,
+        interaction_post_state=interaction_post_state,
+        interaction_result_evidence=interaction_result_evidence,
     )
 
 

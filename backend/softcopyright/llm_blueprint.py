@@ -13,6 +13,7 @@ from .llm.provider import LLMProvider, LocalTemplateProvider
 from .llm.trace import trace_event
 from .models import GenerationTask
 from .module_keys import normalize_entity_names, semantic_module_key
+from .operation_coverage import operation_category
 
 
 def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | None, emit=None) -> ProductBlueprint | None:
@@ -403,7 +404,7 @@ def _contract_blueprint_modules(task: GenerationTask) -> list[dict[str, Any]]:
 
 def _outline_from_contract_modules(modules: list[dict[str, Any]]) -> list[dict[str, str]]:
     outline: list[dict[str, str]] = []
-    for index, item in enumerate(modules[:8], start=1):
+    for index, item in enumerate(_select_contract_modules(modules, limit=8), start=1):
         title = _clean_text(str(item.get("title") or ""), 28)
         if not title:
             continue
@@ -419,12 +420,39 @@ def _outline_from_contract_modules(modules: list[dict[str, Any]]) -> list[dict[s
     return outline
 
 
+def _select_contract_modules(modules: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    candidates = [item for item in modules if isinstance(item, dict) and str(item.get("title") or "").strip()]
+    if len(candidates) <= limit:
+        return candidates
+    selected_indexes: list[int] = []
+    selected_categories: set[str] = set()
+    remaining = set(range(len(candidates)))
+    while remaining and len(selected_indexes) < limit:
+        def score(index: int) -> tuple[int, int]:
+            item = candidates[index]
+            category = str(item.get("category") or "").strip()
+            diversity = 20 if category and category not in selected_categories else 0
+            detail = min(6, len(item.get("data_objects") or [])) + min(5, len(item.get("screens") or []))
+            structured = 6 if len(item.get("operation_specs") or item.get("operationSpecs") or []) >= 3 else 0
+            return diversity + detail + structured, -index
+
+        chosen = max(remaining, key=score)
+        selected_indexes.append(chosen)
+        category = str(candidates[chosen].get("category") or "").strip()
+        if category:
+            selected_categories.add(category)
+        remaining.remove(chosen)
+    return [candidates[index] for index in sorted(selected_indexes)]
+
+
 def _modules_from_contract(task: GenerationTask, core_plan: dict[str, Any]) -> list[dict[str, Any]]:
-    contract_modules = _contract_blueprint_modules(task)
+    contract_modules = _select_contract_modules(_contract_blueprint_modules(task), limit=8)
     if len(contract_modules) < 6:
         return []
+    if any(len(_clean_operation_specs(item.get("operation_specs") or item.get("operationSpecs"))) < 3 for item in contract_modules):
+        return []
     modules: list[dict[str, Any]] = []
-    for index, item in enumerate(contract_modules[:8], start=1):
+    for index, item in enumerate(contract_modules, start=1):
         title = _clean_text(str(item.get("title") or ""), 28)
         if not title:
             continue
@@ -436,6 +464,13 @@ def _modules_from_contract(task: GenerationTask, core_plan: dict[str, Any]) -> l
         operations = _ensure_min_strings(
             _clean_list(item.get("operations") or item.get("actions"), 7, 28),
             _contract_operations(title, category, user_flow),
+            minimum=5,
+            limit=7,
+        )
+        operation_specs = _clean_operation_specs(item.get("operation_specs") or item.get("operationSpecs"))
+        operations = _ensure_min_strings(
+            [str(spec.get("label") or "") for spec in operation_specs],
+            operations,
             minimum=5,
             limit=7,
         )
@@ -470,6 +505,7 @@ def _modules_from_contract(task: GenerationTask, core_plan: dict[str, Any]) -> l
                 "description": _contract_description(item, title, category, data_objects, operations, pages, core_plan),
                 "entities": entities,
                 "operations": operations,
+                "operation_specs": operation_specs,
                 "data_fields": data_fields,
                 "pages": pages,
                 "rules": rules,
@@ -810,10 +846,11 @@ def _module_batch_quality_reasons(task: GenerationTask, modules: list[dict[str, 
         key = str(module.get("key") or "").strip()
         description = str(module.get("description") or "").strip()
         operations = [str(item).strip() for item in module.get("operations") or [] if str(item).strip()]
+        operation_specs = _clean_operation_specs(module.get("operation_specs") or module.get("operationSpecs"))
         fields = [str(item).strip() for item in module.get("data_fields") or [] if str(item).strip()]
         rules = [str(item).strip() for item in module.get("rules") or [] if str(item).strip()]
         module_text = " ".join([title, key, description, " ".join(operations), " ".join(fields), " ".join(rules)])
-        if not key or re.fullmatch(r"module_\d+|module|business|data|manage|management", key):
+        if not key or re.fullmatch(r"module_\d+|module|business|data|manage|management|domain_(?:\d+_)?[0-9a-f]{4,}", key):
             reasons.append(f"第 {index} 个模块 key 过于泛化")
         if not title or title in generic_titles:
             reasons.append(f"第 {index} 个模块标题过于泛化")
@@ -826,6 +863,25 @@ def _module_batch_quality_reasons(task: GenerationTask, modules: list[dict[str, 
             reasons.append(f"{title or key or index} 描述不足 70 字")
         if len(set(operations) - generic_ops) < 3:
             reasons.append(f"{title or key or index} 业务操作不够具体")
+        if task.product_type != "游戏软件":
+            if len(operation_specs) < 3:
+                reasons.append(f"{title or key or index} 缺少结构化操作契约")
+            else:
+                categories = {str(spec.get("category") or "") for spec in operation_specs}
+                if "lookup" not in categories or len(categories - {"lookup"}) < 1:
+                    reasons.append(f"{title or key or index} 操作契约未覆盖查询和业务处理/结果动作")
+                for spec in operation_specs:
+                    if (
+                        not str(spec.get("action_key") or "").strip()
+                        or str(spec.get("action_key") or "") in {"business", "module", "action"}
+                        or not str(spec.get("role") or "").strip()
+                        or not str(spec.get("trigger") or "").strip()
+                        or not list(spec.get("input_fields") or [])
+                        or not str(spec.get("post_state") or "").strip()
+                        or not str(spec.get("result_evidence") or "").strip()
+                    ):
+                        reasons.append(f"{title or key or index} 存在不完整的结构化操作")
+                        break
         if len(set(fields) - generic_fields) < 4:
             reasons.append(f"{title or key or index} 业务字段不够具体")
         if len(rules) < 3:
@@ -1005,6 +1061,7 @@ modules 必须包含 6-8 个功能模块，每个对象包含：
 - description: 90-180字，具体写出业务对象、业务动作、状态流转、权限/校验点和输出结果
 - entities: 2-4个英文实体名，必须能用于源码类名
 - operations: 4-7个中文操作名称，必须来自当前软件领域；阅读听书类可使用“打开章节”“加入书架”“播放音频”“同步进度”
+- operation_specs: 至少3个结构化操作，覆盖查询和业务处理/结果动作；每项包含 action_key/label/category/role/trigger/input_fields/pre_state/post_state/result_evidence/requires_confirmation
 - data_fields: 6-10个中文业务字段，必须来自当前软件领域；阅读听书类可使用“书籍名称”“章节标题”“播放进度”“收藏状态”
 - pages: 2-4个当前模块相关页面名
 - rules: 3-5条当前模块业务规则，包含校验、权限、状态流转或审计要求
@@ -1052,9 +1109,10 @@ def _build_module_batch_prompt(
 本批模块轮廓：
 {json.dumps(outline_batch, ensure_ascii=False)}
 
-每个模块必须包含 key/title/description/entities/operations/data_fields/pages/rules。
-description 90-180字；operations 4-7个；data_fields 6-10个；rules 3-5条。
+每个模块必须包含 key/title/description/entities/operations/operation_specs/data_fields/pages/rules。
+description 90-180字；operations 4-7个；operation_specs 3-5个；data_fields 6-10个；rules 3-5条。
 - 模块边界、操作名、字段名和规则必须符合差异化产品策略，不要复用“新增、编辑、删除、导出”四件套作为主要内容。
+- operation_specs 的 label 必须是领域动作；role、trigger、input_fields、post_state、result_evidence 不得为空。查询动作必须给出真实筛选字段和结果证据，业务动作必须给出状态变化；只有删除、失效、覆盖、正式发布等高风险动作 requires_confirmation=true。
 只返回 JSON。
 """.strip()
 
@@ -1097,11 +1155,12 @@ def _build_module_repair_prompt(
 - title、description、operations、data_fields、rules 必须呼应软件名称、业务补充、业务对象、流程和指标。
 - description 至少 90 字，写清业务对象、用户动作、状态流转、校验点、输出结果。
 - operations 至少 5 个，不能只写新增、编辑、删除、查询、导出。
+- operation_specs 至少 3 个，必须覆盖查询和业务处理/结果类动作，并写清角色、触发条件、输入字段、前后状态和结果证据。
 - data_fields 至少 7 个，不能只写名称、编号、状态、备注、创建时间。
 - rules 至少 3 条，必须包含校验、权限、状态流转或审计要求。
 
 返回 JSON 示例：
-{{"modules":[{{"key":"domain_task_trace","title":"业务任务追踪","description":"...","entities":["TaskRecord","TaskTrace"],"operations":["..."],"data_fields":["..."],"pages":["..."],"rules":["..."]}}]}}
+{{"modules":[{{"key":"domain_task_trace","title":"业务任务追踪","description":"...","entities":["TaskRecord","TaskTrace"],"operations":["筛选待办任务","下发处理任务","确认处理结果"],"operation_specs":[{{"action_key":"filter_pending_tasks","label":"筛选待办任务","category":"lookup","role":"调度员","trigger":"需要定位待处理任务","input_fields":["任务编号","处理状态"],"pre_state":"任务列表未筛选","post_state":"显示匹配任务","result_evidence":"筛选条件和结果数量","requires_confirmation":false}}],"data_fields":["..."],"pages":["..."],"rules":["..."]}}]}}
 """.strip()
 
 
@@ -1370,6 +1429,14 @@ def _blueprint_from_data(task: GenerationTask, data: dict[str, Any]) -> ProductB
         title = _clean_text(str(item.get("title") or f"业务模块{index}"), 24)
         description = _clean_text(str(item.get("description") or f"{title}用于业务数据维护和流程处理。"), 220)
         operations = _clean_list(item.get("operations"), 7, 28)
+        operation_specs = _clean_operation_specs(item.get("operation_specs") or item.get("operationSpecs"))
+        if operation_specs:
+            operations = _ensure_min_strings(
+                [str(spec.get("label") or "") for spec in operation_specs],
+                operations,
+                minimum=5,
+                limit=7,
+            )
         data_fields = _clean_list(item.get("data_fields"), 10, 24)
         key = semantic_module_key(
             title,
@@ -1397,6 +1464,7 @@ def _blueprint_from_data(task: GenerationTask, data: dict[str, Any]) -> ProductB
                 data_fields=data_fields,
                 pages=_clean_list(item.get("pages"), 4, 28),
                 rules=_clean_list(item.get("rules"), 5, 80),
+                operation_specs=operation_specs,
             )
         )
 
@@ -1640,7 +1708,7 @@ def _clean_workflows(value: Any) -> list[dict[str, list[str] | str]]:
     for index, item in enumerate(value[:5], start=1):
         if not isinstance(item, dict):
             continue
-        steps = _clean_list(item.get("steps"), 7, 32)
+        steps = _clean_list(item.get("steps"), 7, 80)
         if len(steps) < 3:
             steps = ["创建记录", "字段校验", "提交处理", "生成结果"]
         workflows.append(
@@ -1654,6 +1722,52 @@ def _clean_workflows(value: Any) -> list[dict[str, list[str] | str]]:
     return workflows
 
 
+def _clean_operation_specs(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, Any]] = []
+    seen_labels: set[str] = set()
+    allowed_categories = {
+        "lookup", "mutation", "import", "export", "destructive",
+        "analysis", "workflow", "result", "instant",
+    }
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        label = _clean_text(str(item.get("label") or item.get("action") or item.get("name") or ""), 28)
+        if not label or label in seen_labels:
+            continue
+        seen_labels.add(label)
+        category = _clean_text(str(item.get("category") or ""), 20).lower()
+        if category not in allowed_categories:
+            category = operation_category(label)
+        action_key = _safe_key(str(item.get("action_key") or item.get("actionKey") or ""))
+        input_fields = _clean_list(item.get("input_fields") or item.get("inputFields"), 8, 24)
+        result.append(
+            {
+                "action_key": action_key,
+                "label": label,
+                "category": category,
+                "role": _clean_text(str(item.get("role") or ""), 24),
+                "trigger": _clean_text(str(item.get("trigger") or ""), 80),
+                "input_fields": input_fields,
+                "pre_state": _clean_text(str(item.get("pre_state") or item.get("preState") or ""), 32),
+                "post_state": _clean_text(str(item.get("post_state") or item.get("postState") or ""), 32),
+                "result_evidence": _clean_text(
+                    str(item.get("result_evidence") or item.get("resultEvidence") or ""), 90
+                ),
+                "requires_confirmation": bool(
+                    item.get("requires_confirmation")
+                    if item.get("requires_confirmation") is not None
+                    else item.get("requiresConfirmation", False)
+                ),
+            }
+        )
+        if len(result) >= 7:
+            break
+    return result
+
+
 def _clean_text(value: str, limit: int) -> str:
     value = re.sub(r"\s+", " ", value).strip()
     return value[:limit]
@@ -1662,6 +1776,105 @@ def _clean_text(value: str, limit: int) -> str:
 def _fallback_summary(task: GenerationTask, industry: str, modules: list[FeatureModule]) -> str:
     titles = "、".join(module.title for module in modules[:4])
     return f"{task.software_name}是一套面向{industry}的{task.product_type}，围绕{titles}等模块提供业务管理、流程协同、统计分析和权限审计能力。"
+
+
+def blueprint_contract_issues(task: GenerationTask, blueprint: ProductBlueprint) -> list[str]:
+    from .product_experience import build_product_experience_spec, expected_renderer_for_experience
+
+    issues: list[str] = []
+    renderer = expected_renderer_for_experience(build_product_experience_spec(task, blueprint))
+    repeated_actions: dict[str, set[str]] = {}
+    generic_actions = {
+        "查询", "搜索", "筛选", "查看", "详情", "新增", "登记", "录入", "编辑", "修改",
+        "校验", "验证", "分析", "确认", "归档", "统计", "导入", "导出", "处理",
+    }
+    for module in blueprint.modules:
+        key = str(module.key or "")
+        if re.fullmatch(r"domain_(?:\d+_)?[0-9a-f]{4,}", key):
+            issues.append(f"{module.title} 使用弱语义模块 key：{key}")
+        if renderer == "game":
+            continue
+        specs = _clean_operation_specs(getattr(module, "operation_specs", None))
+        if len(specs) < 3:
+            issues.append(f"{module.title} 缺少至少 3 个结构化操作契约")
+            continue
+        categories = {str(spec.get("category") or "") for spec in specs}
+        if "lookup" not in categories or not (categories - {"lookup"}):
+            issues.append(f"{module.title} 未同时覆盖查询和业务处理/结果动作")
+        incomplete = [
+            str(spec.get("label") or "")
+            for spec in specs
+            if (
+                not str(spec.get("action_key") or "").strip()
+                or str(spec.get("action_key") or "") in {"business", "module", "action"}
+                or not str(spec.get("role") or "").strip()
+                or not str(spec.get("trigger") or "").strip()
+                or not list(spec.get("input_fields") or [])
+                or not str(spec.get("post_state") or "").strip()
+                or not str(spec.get("result_evidence") or "").strip()
+            )
+        ]
+        if incomplete:
+            issues.append(f"{module.title} 的结构化操作信息不完整：{'、'.join(incomplete[:3])}")
+        domain_action_count = 0
+        for spec in specs:
+            label = _normalized_action_label(str(spec.get("label") or ""), module.title)
+            if not label:
+                continue
+            repeated_actions.setdefault(label, set()).add(module.key)
+            if label not in generic_actions and len(label) >= 3:
+                domain_action_count += 1
+        if domain_action_count < 2:
+            issues.append(f"{module.title} 缺少至少 2 个独有领域动作")
+
+    repeated_floor = max(3, (len(blueprint.modules) + 1) // 2)
+    repeated = [
+        label
+        for label, module_keys in repeated_actions.items()
+        if label not in {"查询", "搜索", "筛选", "查看详情"} and len(module_keys) >= repeated_floor
+    ]
+    if repeated:
+        issues.append(f"跨模块操作重复度过高：{'、'.join(sorted(repeated)[:6])}")
+
+    workflow_steps = [
+        str(step or "").strip()
+        for workflow in blueprint.workflows
+        if isinstance(workflow, dict)
+        for step in (workflow.get("steps") or [])
+    ]
+    if any(len(step) < 6 for step in workflow_steps):
+        issues.append("业务工作流包含过短或不完整步骤")
+    truncated_steps = [
+        step for step in workflow_steps if len(step) == 32 and not re.search(r"[。；：!?！？]$", step)
+    ]
+    if len(truncated_steps) >= 2:
+        issues.append("业务工作流步骤疑似被固定长度截断")
+
+    blueprint_text = json.dumps(
+        {
+            "summary": blueprint.summary,
+            "scenario": blueprint.scenario,
+            "positioning": blueprint.positioning,
+            "workflows": blueprint.workflows,
+            "uniqueness_notes": blueprint.uniqueness_notes,
+            "deployment_topology": blueprint.deployment_topology,
+        },
+        ensure_ascii=False,
+    )
+    if renderer == "admin":
+        mobile_conflicts = [
+            term for term in ("移动 App", "手机 App", "会员状态", "会员权益", "个人中心", "底部导航", "收藏清单")
+            if term in blueprint_text
+        ]
+        if len(mobile_conflicts) >= 2:
+            issues.append(f"后台/工业软件蓝图混入移动消费端语义：{'、'.join(mobile_conflicts)}")
+    return list(dict.fromkeys(issues))
+
+
+def _normalized_action_label(label: str, module_title: str) -> str:
+    text = re.sub(re.escape(str(module_title or "")), "", str(label or "")).strip()
+    text = re.sub(r"^(?:执行|进行|发起|完成)", "", text)
+    return re.sub(r"\s+", "", text)
 
 
 def _quality_review(task: GenerationTask, blueprint: ProductBlueprint) -> tuple[int, list[str]]:
@@ -1813,5 +2026,10 @@ def _quality_review(task: GenerationTask, blueprint: ProductBlueprint) -> tuple[
     if not blueprint.deployment_topology:
         score -= 5
         reasons.append("缺少部署拓扑说明")
+
+    contract_issues = blueprint_contract_issues(task, blueprint)
+    if contract_issues:
+        score -= min(70, max(18, len(contract_issues) * 10))
+        reasons.extend(contract_issues)
 
     return max(score, 0), reasons

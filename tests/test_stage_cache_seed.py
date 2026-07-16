@@ -22,6 +22,20 @@ def _blueprint(task: GenerationTask) -> ProductBlueprint:
             entities=[f"Record{index}"],
             operations=["登记", "核验", "处理", "归档"],
             data_fields=["业务编号", "状态", "责任人", "更新时间"],
+            operation_specs=[
+                {
+                    "action_key": f"query_module_{index}",
+                    "label": f"查询业务模块{index}",
+                    "category": "lookup",
+                    "role": "业务人员",
+                    "trigger": "需要定位业务记录",
+                    "input_fields": ["业务编号"],
+                    "pre_state": "全部记录",
+                    "post_state": "显示匹配记录",
+                    "result_evidence": "查询条件和结果数量",
+                    "requires_confirmation": False,
+                }
+            ],
         )
         for index in range(1, 7)
     ]
@@ -56,7 +70,9 @@ class StageCacheSeedTests(unittest.TestCase):
             self.assertNotEqual(first_context["key"], second_context["key"])
             self.assertEqual(first_context["key"], repeated_context["key"])
             save_cached_blueprint(first_context, _blueprint(first))
-            self.assertIsNotNone(load_cached_blueprint(first_context))
+            cached = load_cached_blueprint(first_context)
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached.modules[0].operation_specs[0]["action_key"], "query_module_1")
             self.assertIsNone(load_cached_blueprint(second_context))
 
     def test_resume_finds_same_seed_cache_without_repeating_feature_inference(self):

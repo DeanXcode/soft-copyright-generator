@@ -1,4 +1,6 @@
 from types import SimpleNamespace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
 from backend.softcopyright.operation_coverage import (
@@ -7,6 +9,8 @@ from backend.softcopyright.operation_coverage import (
     operation_spec,
 )
 from backend.softcopyright.ai_frontend_codegen import _visual_reference_cache_key
+from backend.softcopyright.screenshots import _build_page_specs
+from backend.softcopyright.ui_blueprint import UiBlueprint, UiScreenBlueprint
 
 
 class OperationCoverageTests(unittest.TestCase):
@@ -62,6 +66,57 @@ class OperationCoverageTests(unittest.TestCase):
         self.assertIn("\u67e5\u770b\u8be6\u60c5", {item.action for item in specs})
         self.assertFalse({"\u65b0\u589e", "\u7f16\u8f91", "\u5220\u9664"} & {item.action for item in specs})
 
+    def test_structured_operations_drive_page_contract(self):
+        module = SimpleNamespace(
+            title="生产工单管控",
+            description="下达生产工单并跟踪现场执行状态。",
+            pages=[],
+            operations=["登记", "确认", "统计"],
+            operation_specs=[
+                {
+                    "action_key": "filter_work_orders",
+                    "label": "筛选待下达工单",
+                    "category": "lookup",
+                    "role": "车间主管",
+                    "trigger": "需要定位待执行工单",
+                    "input_fields": ["工单编号", "目标产线"],
+                    "pre_state": "全部工单",
+                    "post_state": "显示匹配工单",
+                    "result_evidence": "筛选条件、结果数量和工单列表",
+                },
+                {
+                    "action_key": "release_work_order",
+                    "label": "下达生产工单",
+                    "category": "workflow",
+                    "role": "车间主管",
+                    "trigger": "物料与工艺路线校验通过",
+                    "input_fields": ["工单编号", "计划数量"],
+                    "pre_state": "待下达",
+                    "post_state": "已下达",
+                    "result_evidence": "状态轨迹和下达日志",
+                },
+                {
+                    "action_key": "pause_work_order",
+                    "label": "暂停异常工单",
+                    "category": "workflow",
+                    "role": "车间主管",
+                    "trigger": "设备停机或物料短缺",
+                    "input_fields": ["暂停原因", "预计恢复时间"],
+                    "pre_state": "生产中",
+                    "post_state": "已暂停",
+                    "result_evidence": "暂停原因和影响范围",
+                },
+            ],
+        )
+
+        specs = module_operation_coverage(module, renderer="admin", module_index=0)
+
+        self.assertEqual(specs[0].action, "筛选待下达工单")
+        self.assertEqual(specs[0].source, "blueprint-structured")
+        self.assertEqual(specs[0].role, "车间主管")
+        self.assertIn("工单编号", specs[0].input_fields)
+        self.assertTrue(any(spec.action == "下达生产工单" for spec in specs))
+
     def test_only_destructive_operations_require_confirmation(self):
         delete_spec = operation_spec("\u5220\u9664")
         query_spec = operation_spec("\u67e5\u8be2")
@@ -86,6 +141,71 @@ class OperationCoverageTests(unittest.TestCase):
         self.assertEqual(len(specs), configured_operation_screen_count("mobile_app"))
         self.assertNotIn("\u767b\u8bb0", {item.action for item in specs})
         self.assertTrue({"\u641c\u7d22\u4e0e\u7b5b\u9009", "\u67e5\u770b\u6b4c\u8bcd"} & {item.action for item in specs})
+
+    def test_mobile_structured_operations_lead_and_reach_page_metadata(self):
+        module = SimpleNamespace(
+            key="mobile_inspection",
+            title="移动巡检",
+            description="巡检员在现场上报设备异常并复核处置结果。",
+            pages=["巡检任务", "异常详情"],
+            operations=["上报设备异常", "复核处置结果"],
+            operation_specs=[
+                {
+                    "action_key": "report_device_fault",
+                    "label": "上报设备异常",
+                    "category": "workflow",
+                    "role": "巡检员",
+                    "trigger": "现场发现设备异常",
+                    "input_fields": ["设备编号", "异常现象"],
+                    "pre_state": "待巡检",
+                    "post_state": "异常待处置",
+                    "result_evidence": "异常单号和上报时间",
+                },
+                {
+                    "action_key": "review_fault_resolution",
+                    "label": "复核处置结果",
+                    "category": "result",
+                    "role": "巡检员",
+                    "trigger": "维修人员提交处置结果",
+                    "input_fields": ["复核结论"],
+                    "pre_state": "待复核",
+                    "post_state": "已闭环",
+                    "result_evidence": "复核结论和状态轨迹",
+                },
+            ],
+        )
+
+        specs = module_operation_coverage(module, renderer="mobile_app", module_index=1)
+
+        self.assertEqual([item.action for item in specs[:2]], ["上报设备异常", "复核处置结果"])
+        self.assertTrue(all(item.source == "blueprint-structured" for item in specs[:2]))
+
+        ui_blueprint = UiBlueprint(
+            renderer="mobile_app",
+            visual_style="mobile",
+            screens=[
+                UiScreenBlueprint(
+                    key="mobile_inspection",
+                    title="移动巡检",
+                    caption="查看现场巡检任务。",
+                    view_type="module",
+                    module_key="mobile_inspection",
+                )
+            ],
+        )
+        with TemporaryDirectory() as temp_dir:
+            pages = _build_page_specs(
+                SimpleNamespace(),
+                SimpleNamespace(modules=[module]),
+                Path(temp_dir),
+                ui_blueprint,
+            )
+
+        operation_page = next(item for item in pages if item.page_kind == "operation")
+        self.assertEqual(operation_page.interaction_action_key, "report_device_fault")
+        self.assertEqual(operation_page.interaction_role, "巡检员")
+        self.assertEqual(operation_page.interaction_pre_state, "待巡检")
+        self.assertIn("设备编号", operation_page.interaction_input_fields)
 
 
 if __name__ == "__main__":

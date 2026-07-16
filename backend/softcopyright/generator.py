@@ -24,7 +24,7 @@ from .docgen import (
 from .errors import sanitize_error_message
 from .feature_inference import harmonize_feature_hint
 from .llm_architecture import select_technical_architecture_with_llm
-from .llm_blueprint import generate_blueprint_with_llm
+from .llm_blueprint import blueprint_contract_issues, generate_blueprint_with_llm
 from .llm.provider import LocalTemplateProvider
 from .llm_manual import generate_manual_content_with_llm
 from .models import GenerationTask
@@ -157,6 +157,17 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     blueprint_source = "local-template" if local_template_mode else "llm"
     resume_blueprint = _load_resume_product_blueprint(output_dir) if resume_stage and _stage_precedes("blueprint", resume_stage) else None
     cached_blueprint = resume_blueprint or resume_cached_blueprint or load_cached_blueprint(stage_cache)
+    cached_blueprint_issues = blueprint_contract_issues(task, cached_blueprint) if require_llm_generation and cached_blueprint else []
+    if cached_blueprint_issues:
+        send(
+            "blueprint",
+            15,
+            "已有产品蓝图缺少新版结构化操作契约，保留模块边界并重建蓝图明细",
+            material_type="蓝图升级",
+        )
+        report["checks"]["blueprint_cache_invalidated"] = True
+        report["checks"]["blueprint_cache_invalidation_reasons"] = cached_blueprint_issues
+        cached_blueprint = None
     if cached_blueprint:
         send("blueprint", 15, "复用已缓存产品蓝图", material_type="阶段缓存")
         blueprint = cached_blueprint
@@ -184,6 +195,14 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
             save_cached_blueprint(stage_cache, blueprint)
         else:
             raise RuntimeError("GPT 产品蓝图未返回有效结果，请重试。")
+    contract_issues = blueprint_contract_issues(task, blueprint)
+    report["checks"]["blueprint_operation_contract_ready"] = not contract_issues
+    report["checks"]["blueprint_operation_contract_issues"] = contract_issues
+    report["checks"]["blueprint_structured_operation_count"] = sum(
+        len(getattr(module, "operation_specs", None) or []) for module in blueprint.modules
+    )
+    if require_llm_generation and contract_issues:
+        raise RuntimeError("GPT 产品蓝图未通过结构化操作与终端语义门禁：" + "；".join(contract_issues[:5]))
     resume_architecture = _resume_architecture_from_blueprint(blueprint) if resume_stage and _stage_precedes("blueprint", resume_stage) else None
     cached_architecture = resume_architecture or load_cached_architecture(stage_cache)
     if cached_architecture:
@@ -235,7 +254,10 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     report["checks"]["blueprint_workflow_count"] = len(blueprint.workflows)
     report["checks"]["blueprint_metric_count"] = len(blueprint.report_metrics)
     report["checks"]["blueprint_module_detail_ready"] = all(
-        bool(module.operations) and bool(module.data_fields) and bool(module.rules)
+        bool(module.operations)
+        and bool(module.data_fields)
+        and bool(module.rules)
+        and (not require_llm_generation or len(getattr(module, "operation_specs", None) or []) >= 3)
         for module in blueprint.modules
     )
 
@@ -469,6 +491,13 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
             "interaction_mode": item.interaction_mode,
             "interaction_surface": item.interaction_surface,
             "requires_confirmation": item.requires_confirmation,
+            "interaction_action_key": item.interaction_action_key,
+            "interaction_role": item.interaction_role,
+            "interaction_trigger": item.interaction_trigger,
+            "interaction_input_fields": item.interaction_input_fields or [],
+            "interaction_pre_state": item.interaction_pre_state,
+            "interaction_post_state": item.interaction_post_state,
+            "interaction_result_evidence": item.interaction_result_evidence,
         }
         for key, item in ui_screenshots.items()
     }
@@ -1008,6 +1037,9 @@ def _semantic_contract_from_confirmed_outline(task: GenerationTask) -> dict:
         screens = _contract_list(item.get("screens") or item.get("pages"), 5, 28)
         user_flow = _contract_list(item.get("userFlow") or item.get("user_flow"), 6, 42)
         operations = _contract_list(item.get("operations") or item.get("actions"), 7, 28)
+        operation_specs = _contract_operation_specs(
+            item.get("operation_specs") or item.get("operationSpecs")
+        )
         data_fields = _contract_list(item.get("data_fields") or item.get("dataFields") or item.get("fields"), 10, 24)
         rules = _contract_list(item.get("rules") or item.get("quality_rules") or item.get("qualityRules"), 5, 80)
         entities = _contract_list(item.get("entities"), 4, 40)
@@ -1023,6 +1055,7 @@ def _semantic_contract_from_confirmed_outline(task: GenerationTask) -> dict:
                 "pages": screens,
                 "user_flow": user_flow,
                 "operations": operations or _outline_operations(title, category, user_flow),
+                "operation_specs": operation_specs,
                 "data_fields": data_fields or _outline_fields(title, data_objects),
                 "rules": rules or _outline_rules(title, category),
                 "entities": entities,
@@ -1072,6 +1105,7 @@ def _semantic_contract_from_cached_blueprint(blueprint) -> dict:
                 "pages": _contract_list(getattr(module, "pages", []), 6, 28),
                 "user_flow": [],
                 "operations": _contract_list(getattr(module, "operations", []), 8, 28),
+                "operation_specs": _contract_operation_specs(getattr(module, "operation_specs", [])),
                 "data_fields": _contract_list(getattr(module, "data_fields", []), 12, 24),
                 "rules": _contract_list(getattr(module, "rules", []), 6, 80),
                 "entities": _contract_list(getattr(module, "entities", []), 6, 40),
@@ -1115,6 +1149,44 @@ def _contract_list(value, limit: int, item_limit: int) -> list[str]:
         if text and text not in result:
             result.append(text)
         if len(result) >= limit:
+            break
+    return result
+
+
+def _contract_operation_specs(value) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        label = _clean_contract_text(item.get("label") or item.get("action") or item.get("name"), 28)
+        if not label:
+            continue
+        input_fields = _contract_list(item.get("input_fields") or item.get("inputFields"), 8, 24)
+        result.append(
+            {
+                "action_key": _safe_module_key(
+                    _clean_contract_text(item.get("action_key") or item.get("actionKey") or label, 48)
+                ),
+                "label": label,
+                "category": _clean_contract_text(item.get("category"), 20),
+                "role": _clean_contract_text(item.get("role"), 24),
+                "trigger": _clean_contract_text(item.get("trigger"), 80),
+                "input_fields": input_fields,
+                "pre_state": _clean_contract_text(item.get("pre_state") or item.get("preState"), 32),
+                "post_state": _clean_contract_text(item.get("post_state") or item.get("postState"), 32),
+                "result_evidence": _clean_contract_text(
+                    item.get("result_evidence") or item.get("resultEvidence"), 90
+                ),
+                "requires_confirmation": bool(
+                    item.get("requires_confirmation")
+                    if item.get("requires_confirmation") is not None
+                    else item.get("requiresConfirmation", False)
+                ),
+            }
+        )
+        if len(result) >= 7:
             break
     return result
 

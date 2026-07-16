@@ -456,43 +456,53 @@ def _operation_prompt_rule(screenshot: Any) -> str:
     action = str(getattr(screenshot, "interaction_action", "") or "当前操作")
     surface = str(getattr(screenshot, "interaction_surface", "") or "detail")
     mode = str(getattr(screenshot, "interaction_mode", "") or "instant")
+    role = str(getattr(screenshot, "interaction_role", "") or "当前岗位")
+    trigger = str(getattr(screenshot, "interaction_trigger", "") or "进入当前业务场景")
+    fields = [str(item) for item in (getattr(screenshot, "interaction_input_fields", None) or []) if str(item).strip()]
+    pre_state = str(getattr(screenshot, "interaction_pre_state", "") or "当前状态")
+    post_state = str(getattr(screenshot, "interaction_post_state", "") or "处理后状态")
+    evidence = str(getattr(screenshot, "interaction_result_evidence", "") or "可见状态和操作日志")
+    contract = (
+        f"执行角色：{role}；触发条件：{trigger}；输入字段：{'、'.join(fields) or '按模块业务字段'}；"
+        f"状态变化：{pre_state} -> {post_state}；结果证据：{evidence}。"
+    )
     if bool(getattr(screenshot, "requires_confirmation", False)):
         return (
-            f"当前动作是“{action}”，目标界面类型为 {surface}。该动作确需确认：使用接近屏幕宽度的居中弹窗，"
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}该动作确需确认：使用接近屏幕宽度的居中弹窗，"
             "说明影响范围并提供取消与确认；禁止贴底窄抽屉，禁止使用‘登记’替代真实动作名称。"
         )
     if mode == "query":
         return (
-            f"当前动作是“{action}”，目标界面类型为 {surface}。页面应展示真实查询条件、已选范围、"
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}页面应展示真实查询条件、已选范围、"
             "查询结果列表和结果数量；查询后直接刷新结果，不要生成确认弹窗。"
         )
     if mode == "form":
         return (
-            f"当前动作是“{action}”，目标界面类型为 {surface}。页面应展示与当前模块对应的字段表单、"
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}页面应展示与当前模块对应的字段表单、"
             "必填标识、校验提示、保存/取消入口和保存后的状态反馈；普通保存不需要二次确认。"
         )
     if mode == "import":
         return (
-            f"当前动作是“{action}”，目标界面类型为 {surface}。页面应展示文件选择、文件信息、字段映射、"
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}页面应展示文件选择、文件信息、字段映射、"
             "格式校验、错误明细和导入结果；不得只放一个上传按钮。"
         )
     if mode == "export":
         return (
-            f"当前动作是“{action}”，目标界面类型为 {surface}。页面应展示导出范围、文件格式、字段选择、"
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}页面应展示导出范围、文件格式、字段选择、"
             "生成进度和下载结果；普通导出不需要确认弹窗。"
         )
     if mode == "analysis":
         return (
-            f"当前动作是“{action}”，目标界面类型为 {surface}。页面应展示统计范围、关键指标、趋势或分组结果、"
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}页面应展示统计范围、关键指标、趋势或分组结果、"
             "异常提示和导出入口，所有图表必须有名称、日期或单位。"
         )
     if mode in {"workflow", "detail"}:
         return (
-            f"当前动作是“{action}”，目标界面类型为 {surface}。页面应展示当前记录、处理条件、流程轨迹、"
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}页面应展示当前记录、处理条件、流程轨迹、"
             "责任人和执行后的状态结果；只有确实高风险的动作才允许确认弹窗。"
         )
     return (
-        f"当前动作是“{action}”，目标界面类型为 {surface}，属于即时或可随时撤销的低风险操作。"
+        f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}该动作属于即时或可随时撤销的低风险操作。"
         "必须直接展示详情、播放器、歌词、搜索结果、下载选项、队列编辑或状态反馈；"
         "禁止确认弹窗、确认登记、登记表单、取消/确认按钮对，也不要把浏览和播放写成提交办理流程。"
     )
@@ -538,6 +548,13 @@ def _generate_react_component(
             "interaction_mode": str(getattr(screenshot, "interaction_mode", "") or ""),
             "interaction_surface": str(getattr(screenshot, "interaction_surface", "") or ""),
             "requires_confirmation": bool(getattr(screenshot, "requires_confirmation", False)),
+            "interaction_action_key": str(getattr(screenshot, "interaction_action_key", "") or ""),
+            "interaction_role": str(getattr(screenshot, "interaction_role", "") or ""),
+            "interaction_trigger": str(getattr(screenshot, "interaction_trigger", "") or ""),
+            "interaction_input_fields": list(getattr(screenshot, "interaction_input_fields", None) or []),
+            "interaction_pre_state": str(getattr(screenshot, "interaction_pre_state", "") or ""),
+            "interaction_post_state": str(getattr(screenshot, "interaction_post_state", "") or ""),
+            "interaction_result_evidence": str(getattr(screenshot, "interaction_result_evidence", "") or ""),
         },
         "module": _module_payload(module),
         "visual_identity": design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {},
@@ -1416,6 +1433,13 @@ def _page_creative_key(task: GenerationTask, design_brief: dict[str, Any], scree
                 "interaction_mode": str(getattr(screenshot, "interaction_mode", "") or ""),
                 "interaction_surface": str(getattr(screenshot, "interaction_surface", "") or ""),
                 "requires_confirmation": bool(getattr(screenshot, "requires_confirmation", False)),
+                "interaction_action_key": str(getattr(screenshot, "interaction_action_key", "") or ""),
+                "interaction_role": str(getattr(screenshot, "interaction_role", "") or ""),
+                "interaction_trigger": str(getattr(screenshot, "interaction_trigger", "") or ""),
+                "interaction_input_fields": list(getattr(screenshot, "interaction_input_fields", None) or []),
+                "interaction_pre_state": str(getattr(screenshot, "interaction_pre_state", "") or ""),
+                "interaction_post_state": str(getattr(screenshot, "interaction_post_state", "") or ""),
+                "interaction_result_evidence": str(getattr(screenshot, "interaction_result_evidence", "") or ""),
             }
         )
     return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:20]
@@ -1629,6 +1653,13 @@ def _page_prompt(
         "interaction_mode": str(getattr(screenshot, "interaction_mode", "") or ""),
         "interaction_surface": str(getattr(screenshot, "interaction_surface", "") or ""),
         "requires_confirmation": bool(getattr(screenshot, "requires_confirmation", False)),
+        "interaction_action_key": str(getattr(screenshot, "interaction_action_key", "") or ""),
+        "interaction_role": str(getattr(screenshot, "interaction_role", "") or ""),
+        "interaction_trigger": str(getattr(screenshot, "interaction_trigger", "") or ""),
+        "interaction_input_fields": list(getattr(screenshot, "interaction_input_fields", None) or []),
+        "interaction_pre_state": str(getattr(screenshot, "interaction_pre_state", "") or ""),
+        "interaction_post_state": str(getattr(screenshot, "interaction_post_state", "") or ""),
+        "interaction_result_evidence": str(getattr(screenshot, "interaction_result_evidence", "") or ""),
     }
     visual_identity = design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {}
     product_experience = design_brief.get("product_experience_spec") if isinstance(design_brief, dict) else {}
@@ -2556,6 +2587,7 @@ def _module_payload(module: FeatureModule | None) -> dict[str, Any]:
         "title": module.title,
         "description": module.description,
         "operations": module.operations[:8],
+        "operation_specs": list(getattr(module, "operation_specs", []) or [])[:7],
         "data_fields": module.data_fields[:10],
         "pages": module.pages[:6],
         "rules": module.rules[:6],

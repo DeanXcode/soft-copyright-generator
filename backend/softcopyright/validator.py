@@ -84,6 +84,13 @@ def validate_materials(
     checks: dict | None = None,
 ) -> dict:
     checks = checks or {}
+    local_template_mode = task.model_provider.lower() in {"local", "local-template", "template", ""}
+    blueprint_operation_contract_required = not local_template_mode
+    blueprint_operation_contract_ready = (
+        bool(checks.get("blueprint_operation_contract_ready"))
+        if blueprint_operation_contract_required
+        else True
+    )
     source_dir = Path(source_info.get("source_dir") or output_dir / "generated_source")
     file_manifest = _source_file_manifest(source_dir)
     deliverables = _deliverable_manifest(task, deliverable_files)
@@ -104,6 +111,10 @@ def validate_materials(
         "source_file_count": len(file_manifest),
         "source_hash": _hash_many(file_manifest),
         "blueprint_hash": _hash_text(json.dumps(blueprint.to_dict(), ensure_ascii=False, sort_keys=True)),
+        "blueprint_operation_contract_required": blueprint_operation_contract_required,
+        "blueprint_operation_contract_ready": blueprint_operation_contract_ready,
+        "blueprint_operation_contract_issues": checks.get("blueprint_operation_contract_issues") or [],
+        "blueprint_structured_operation_count": int(checks.get("blueprint_structured_operation_count") or 0),
         "ui_screenshot_render_mode": str(checks.get("ui_screenshot_render_mode") or ""),
         "ui_screenshot_base_url": str(checks.get("ui_screenshot_base_url") or ""),
         "ui_project_server_started": bool(checks.get("ui_project_server_started")),
@@ -184,6 +195,7 @@ def validate_materials(
     )
     authenticity["ready"] = (
         authenticity["score"] >= 80
+        and bool(authenticity["blueprint_operation_contract_ready"])
         and authenticity["ui_screenshot_render_mode"] == "project-server"
         and bool(authenticity["ui_project_server_started"])
         and bool(authenticity["ui_runtime_probe_ready"])
@@ -347,7 +359,7 @@ def validate_materials(
 
     findings = _findings(authenticity, normative)
     return {
-        "version": "2026-06-09",
+        "version": "2026-07-16",
         "task_id": task.task_id,
         "software_name": task.software_name,
         "version_name": task.version,
@@ -375,6 +387,10 @@ def validation_checks(validation: dict) -> dict:
         "validation_finding_count": len(validation.get("findings") or []),
         "validation_source_file_count": authenticity.get("source_file_count", 0),
         "validation_source_hash": authenticity.get("source_hash", ""),
+        "validation_blueprint_operation_contract_required": bool(authenticity.get("blueprint_operation_contract_required")),
+        "validation_blueprint_operation_contract_ready": bool(authenticity.get("blueprint_operation_contract_ready")),
+        "validation_blueprint_operation_contract_issues": authenticity.get("blueprint_operation_contract_issues", []),
+        "validation_blueprint_structured_operation_count": authenticity.get("blueprint_structured_operation_count", 0),
         "validation_zip_entries_match_deliverables": bool(normative.get("zip_entries_match_deliverables")),
         "validation_placeholder_hit_count": len(normative.get("placeholder_hits") or []),
         "validation_ui_project_server_started": bool(authenticity.get("ui_project_server_started")),
@@ -939,6 +955,14 @@ def _normative_score(norm: dict) -> int:
 
 def _findings(auth: dict, norm: dict) -> list[dict]:
     findings: list[dict] = []
+    if auth.get("blueprint_operation_contract_required") and not auth.get("blueprint_operation_contract_ready"):
+        issues = [str(item) for item in (auth.get("blueprint_operation_contract_issues") or []) if str(item).strip()]
+        detail = f" 主要问题：{'；'.join(issues[:3])}" if issues else ""
+        findings.append({
+            "level": "error",
+            "code": "blueprint_operation_contract_not_ready",
+            "message": "GPT 产品蓝图缺少可核验的结构化操作契约，不能进入正式材料交付。" + detail,
+        })
     if auth.get("source_persistence_required") and not auth.get("source_persistence_ready"):
         findings.append({
             "level": "error",
@@ -1049,6 +1073,7 @@ def _findings(auth: dict, norm: dict) -> list[dict]:
 
 def _finding_suggestion(code: str) -> str:
     suggestions = {
+        "blueprint_operation_contract_not_ready": "重新执行 GPT 产品蓝图阶段；每个业务模块至少提供 3 个包含角色、触发条件、输入字段、前后状态和结果证据的结构化操作，并清除 coverage-fallback、弱模块键及终端语义冲突后再生成 React 页面。",
         "source_persistence_not_ready": "检查 generated_source 中的数据库初始化、migrations、repositories 和 tests；运行生成项目测试并确认重启 Repository 后数据仍可读取，再重新生成材料。",
         "authenticity_score_low": "优先使用 GPT 模式重新生成产品蓝图，或补充更具体的业务提示；确认模块标题、业务对象和统计指标能同时出现在说明书、源码实体/注释和截图文本中。",
         "ui_screenshot_not_project_server": "重新生成材料；正式截图必须启动 generated_source 项目服务，并从 http://127.0.0.1:{port}/ui-prototype 页面截图，不允许使用本地文件或静态图片兜底。",
