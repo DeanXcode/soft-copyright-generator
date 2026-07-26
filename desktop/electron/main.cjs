@@ -9,6 +9,38 @@ const sourceRoot = path.resolve(__dirname, "..", "..");
 const appRoot = app.isPackaged ? app.getAppPath() : sourceRoot;
 const resourceRoot = app.isPackaged ? process.resourcesPath : sourceRoot;
 const rootDir = resourceRoot;
+const TEXT_PROVIDER_PRESETS = {
+  custom: {
+    label: "现有兼容 API",
+    provider: "custom",
+    defaultBaseUrl: "",
+    defaultModel: "gpt-5.5"
+  },
+  grok: {
+    label: "Grok (xAI)",
+    provider: "grok",
+    defaultBaseUrl: "https://api.x.ai/v1",
+    defaultModel: "grok-3-mini"
+  },
+  claude: {
+    label: "Claude (Anthropic)",
+    provider: "claude",
+    defaultBaseUrl: "https://api.anthropic.com/v1",
+    defaultModel: "claude-sonnet-4-20250514"
+  },
+  gemini: {
+    label: "Gemini (Google)",
+    provider: "gemini",
+    defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+    defaultModel: "gemini-2.5-flash"
+  },
+  deepseek: {
+    label: "DeepSeek",
+    provider: "deepseek",
+    defaultBaseUrl: "https://api.deepseek.com",
+    defaultModel: "deepseek-chat"
+  }
+};
 loadDesktopConfig();
 
 const isDev = process.env.VITE_DEV_SERVER_URL || process.env.NODE_ENV === "development";
@@ -19,10 +51,16 @@ let lastGenerationResult = null;
 const RECOVERY_DISMISSED_FILE = "generation-recovery-dismissed.json";
 
 const modelPlans = {
+  template: {
+    provider: "local-template",
+    modelName: "template-v1",
+    apiBaseUrl: "",
+    apiKey: ""
+  },
   gpt: {
-    provider: "custom",
-    modelName: process.env.SOFT_MODEL_GPT_NAME || process.env.SOFT_MODEL_GATEWAY_MODEL || "gpt-5.5",
-    apiBaseUrl: process.env.SOFT_MODEL_GPT_BASE_URL || process.env.SOFT_MODEL_GATEWAY_BASE_URL || "",
+    provider: process.env.SOFT_MODEL_PROVIDER || TEXT_PROVIDER_PRESETS[normalizeTextProvider(process.env.SOFT_TEXT_PROVIDER)]?.provider || "custom",
+    modelName: process.env.SOFT_MODEL_GPT_NAME || process.env.SOFT_MODEL_GATEWAY_MODEL || activeTextProviderPreset().defaultModel,
+    apiBaseUrl: process.env.SOFT_MODEL_GPT_BASE_URL || process.env.SOFT_MODEL_GATEWAY_BASE_URL || activeTextProviderPreset().defaultBaseUrl,
     apiKey: process.env.SOFT_MODEL_GPT_API_KEY || process.env.SOFT_MODEL_GATEWAY_API_KEY || ""
   }
 };
@@ -36,11 +74,15 @@ function accountAuthToken() {
 }
 
 function accountBalanceUrl() {
+  const accountProvider = (process.env.SOFT_ACCOUNT_PROVIDER || "").toLowerCase();
+  if (["grok", "claude", "gemini", "deepseek"].includes(accountProvider)) {
+    return "";
+  }
   const explicitUrl = process.env.SOFT_ACCOUNT_BALANCE_URL || "";
   if (explicitUrl) {
     return explicitUrl;
   }
-  if ((process.env.SOFT_ACCOUNT_PROVIDER || "").toLowerCase() === "newapi") {
+  if (accountProvider === "newapi") {
     const gatewayRoot = rootUrlFromGateway(modelPlans.gpt.apiBaseUrl);
     return gatewayRoot ? `${gatewayRoot}/api/usage/token/` : "";
   }
@@ -261,9 +303,14 @@ function recoverTaskFromOutputDir(outputDir, mtimeMs = 0) {
   if (!fs.existsSync(blueprintPath) || !fs.existsSync(tracePath)) return null;
   const generationState = readJsonConfig(path.join(outputDir, "generation-state.json"));
   const generationFailure = readJsonConfig(path.join(outputDir, "generation-failure.json"));
+  const generationReport = readJsonConfig(path.join(outputDir, "generation_report.json"));
   const validationReport = readJsonConfig(path.join(outputDir, "validation_report.json"));
   const stateStatus = String(generationState.status || generationFailure.status || "").toLowerCase();
-  if (stateStatus === "success" || validationReport.ready_for_delivery === true) return null;
+  const reportedZipPath = String(
+    generationReport.zip_path || generationState.extra?.zip_path || `${outputDir}--材料包.zip`
+  ).trim();
+  const completedZipReady = Boolean(reportedZipPath && fs.existsSync(reportedZipPath) && fs.statSync(reportedZipPath).isFile());
+  if ((stateStatus === "success" || validationReport.ready_for_delivery === true) && completedZipReady) return null;
   const blueprint = readJsonConfig(blueprintPath);
   const businessPlan = businessPlanFromProductBlueprint(blueprint);
   if (!businessPlan.modules.length) return null;
@@ -273,9 +320,14 @@ function recoverTaskFromOutputDir(outputDir, mtimeMs = 0) {
   const validationFinding = Array.isArray(validationReport.findings)
     ? validationReport.findings.find((item) => item && item.level === "error")
     : null;
-  const failedStage = String(generationFailure.stage || generationState.stage || trace.stage || trace.label || "");
+  const failedStage = String(
+    generationFailure.stage || (stateStatus === "success" && !completedZipReady ? "package" : generationState.stage) || trace.stage || trace.label || ""
+  );
   const errorSummary = sanitizeErrorMessage(
     generationFailure.message ||
+      (stateStatus === "success" && !completedZipReady
+        ? "上次任务标记完成，但材料包文件不存在，可从已确认蓝图重新生成。"
+        : "") ||
       validationFinding?.message ||
       generationState.message ||
       trace.error ||
@@ -377,7 +429,74 @@ function latestTraceFailure(tracePath) {
 }
 
 function currentModelMode() {
-  return "gpt";
+  return String(process.env.SOFT_MODEL_MODE || "gpt").toLowerCase() === "template" ? "template" : "gpt";
+}
+
+function normalizeTextProvider(value) {
+  const normalized = String(value || "custom").trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(TEXT_PROVIDER_PRESETS, normalized) ? normalized : "custom";
+}
+
+function activeTextProviderId() {
+  return normalizeTextProvider(process.env.SOFT_TEXT_PROVIDER || "custom");
+}
+
+function activeTextProviderPreset() {
+  return TEXT_PROVIDER_PRESETS[activeTextProviderId()] || TEXT_PROVIDER_PRESETS.custom;
+}
+
+function providerEnvPrefix(providerId) {
+  return normalizeTextProvider(providerId).toUpperCase();
+}
+
+function providerProfile(providerId) {
+  const id = normalizeTextProvider(providerId);
+  const preset = TEXT_PROVIDER_PRESETS[id];
+  const prefix = providerEnvPrefix(id);
+  const isCustom = id === "custom";
+  const activeProvider = activeTextProviderId();
+  const baseUrl = isCustom
+    ? process.env.SOFT_PROVIDER_CUSTOM_BASE_URL || (activeProvider === "custom" ? process.env.SOFT_MODEL_GPT_BASE_URL || process.env.SOFT_MODEL_GATEWAY_BASE_URL || "" : "")
+    : process.env[`SOFT_PROVIDER_${prefix}_BASE_URL`] || preset.defaultBaseUrl;
+  const apiKey = isCustom
+    ? process.env.SOFT_PROVIDER_CUSTOM_API_KEY || (activeProvider === "custom" ? process.env.SOFT_MODEL_GPT_API_KEY || process.env.SOFT_MODEL_GATEWAY_API_KEY || "" : "")
+    : process.env[`SOFT_PROVIDER_${prefix}_API_KEY`] || "";
+  const modelName = isCustom
+    ? process.env.SOFT_PROVIDER_CUSTOM_MODEL || (activeProvider === "custom" ? process.env.SOFT_MODEL_GPT_NAME || process.env.SOFT_MODEL_GATEWAY_MODEL : "") || preset.defaultModel
+    : process.env[`SOFT_PROVIDER_${prefix}_MODEL`] || preset.defaultModel;
+  const outlineModelName = isCustom
+    ? process.env.SOFT_PROVIDER_CUSTOM_OUTLINE_MODEL || (activeProvider === "custom" ? process.env.SOFT_MODEL_GPT_OUTLINE_NAME : "") || modelName
+    : process.env[`SOFT_PROVIDER_${prefix}_OUTLINE_MODEL`] || modelName;
+  const frontendModelName = isCustom
+    ? process.env.SOFT_PROVIDER_CUSTOM_FRONTEND_MODEL || (activeProvider === "custom" ? process.env.SOFT_MODEL_GPT_FRONTEND_NAME : "") || modelName
+    : process.env[`SOFT_PROVIDER_${prefix}_FRONTEND_MODEL`] || modelName;
+  return {
+    id,
+    label: preset.label,
+    provider: preset.provider,
+    baseUrl,
+    apiKey,
+    modelName,
+    outlineModelName,
+    frontendModelName,
+    baseUrlConfigured: Boolean(baseUrl),
+    apiKeyConfigured: Boolean(apiKey)
+  };
+}
+
+function providerProfilesForUi() {
+  return Object.keys(TEXT_PROVIDER_PRESETS).reduce((result, id) => {
+    const profile = providerProfile(id);
+    result[id] = {
+      label: profile.label,
+      modelName: profile.modelName,
+      outlineModelName: profile.outlineModelName,
+      frontendModelName: profile.frontendModelName,
+      baseUrlConfigured: profile.baseUrlConfigured,
+      apiKeyConfigured: profile.apiKeyConfigured
+    };
+    return result;
+  }, {});
 }
 
 function hiddenConfigStatus(value, configuredLabel = "已配置（内容已隐藏）") {
@@ -386,10 +505,10 @@ function hiddenConfigStatus(value, configuredLabel = "已配置（内容已隐�
 
 function gptConfigError() {
   if (!String(modelPlans.gpt.apiBaseUrl || "").trim()) {
-    return "GPT 请求地址未配置";
+    return "文本模型服务未配置";
   }
   if (!String(modelPlans.gpt.apiKey || "").trim()) {
-    return "GPT 模式需要填写 API Key";
+    return `${activeTextProviderPreset().label} 需要填写 API Key`;
   }
   return "";
 }
@@ -428,8 +547,10 @@ function compactGenerationResult(result) {
     stderr: sanitizeErrorMessage(result.stderr || ""),
     zipPath: result.zipPath || "",
     outputDir: result.outputDir || "",
+    files: Array.isArray(result.files) ? result.files : [],
     warnings: Array.isArray(result.warnings) ? result.warnings.map((item) => sanitizeErrorMessage(item)) : [],
     checks: result.checks || {},
+    validation: result.validation && typeof result.validation === "object" ? result.validation : {},
     seed: result.seed || "",
     randomness: result.randomness || "",
     finishedAt: Date.now()
@@ -456,6 +577,24 @@ function frontendModelName() {
   );
 }
 
+function imageModelName() {
+  return (
+    process.env.SOFT_MODEL_GPT_IMAGE_NAME ||
+    process.env.SOFT_MODEL_IMAGE_NAME ||
+    process.env.SOFT_MODEL_GPT_IMAGE_MODEL ||
+    process.env.SOFT_MODEL_IMAGE_MODEL ||
+    "gpt-image-2"
+  );
+}
+
+function configuredImageApiBaseUrl() {
+  return process.env.SOFT_MODEL_GPT_IMAGE_BASE_URL || process.env.SOFT_MODEL_IMAGE_BASE_URL || "";
+}
+
+function configuredImageApiKey() {
+  return process.env.SOFT_MODEL_GPT_IMAGE_API_KEY || process.env.SOFT_MODEL_IMAGE_API_KEY || "";
+}
+
 function outlineTimeoutSeconds() {
   const raw =
     process.env.SOFT_MODEL_GPT_OUTLINE_TIMEOUT_SECONDS ||
@@ -464,6 +603,12 @@ function outlineTimeoutSeconds() {
   const value = Number.parseInt(raw, 10);
   if (!Number.isFinite(value)) return 60;
   return Math.min(120, Math.max(10, value));
+}
+
+function frontendWorkerCount() {
+  const value = Number.parseInt(process.env.SOFT_LLM_AI_FRONTEND_WORKERS || "1", 10);
+  if (!Number.isFinite(value)) return 1;
+  return Math.min(3, Math.max(1, value));
 }
 
 function normalizeReasoningEffort(value) {
@@ -479,6 +624,8 @@ function sanitizeErrorMessage(value) {
   return String(value || "")
     .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[已隐藏]")
     .replace(/\b(api[_-]?key|token|secret|authorization)(\s*[:=]\s*['"]?)[^'"\s,;，；)）\]}]+/gi, "$1$2[已隐藏]")
+    .replace(/(?:HTTPS?|HTTP)ConnectionPool\(host=['"][^'"]+['"],\s*port=\d+\)/gi, "模型网关连接")
+    .replace(/(\b(?:for|with)\s+url:\s*)\/(?:v\d+\/)?(?:chat\/completions|messages|images\/generations)\b[^\s"'<>，。；;、)）\]}]*/gi, "$1[模型接口]")
     .replace(/(for url:\s*)https?:\/\/[^\s"'<>，。；;、)）\]}]+/gi, "$1[模型网关]")
     .replace(/https?:\/\/[^\s"'<>，。；;、)）\]}]+/gi, "[模型网关]")
     .replace(/\s+/g, " ")
@@ -486,6 +633,11 @@ function sanitizeErrorMessage(value) {
 }
 
 function applyModelConfig(config) {
+  for (const [key, value] of Object.entries(config || {})) {
+    if (key.startsWith("SOFT_PROVIDER_") && typeof value === "string") {
+      process.env[key] = value;
+    }
+  }
   if (typeof config.SOFT_MODEL_MODE === "string") {
     process.env.SOFT_MODEL_MODE = config.SOFT_MODEL_MODE;
   }
@@ -501,6 +653,13 @@ function applyModelConfig(config) {
     process.env.SOFT_MODEL_GPT_BASE_URL = config.SOFT_MODEL_GPT_BASE_URL;
     modelPlans.gpt.apiBaseUrl = config.SOFT_MODEL_GPT_BASE_URL;
   }
+  if (typeof config.SOFT_TEXT_PROVIDER === "string") {
+    process.env.SOFT_TEXT_PROVIDER = normalizeTextProvider(config.SOFT_TEXT_PROVIDER);
+  }
+  if (typeof config.SOFT_MODEL_PROVIDER === "string") {
+    process.env.SOFT_MODEL_PROVIDER = config.SOFT_MODEL_PROVIDER;
+    modelPlans.gpt.provider = config.SOFT_MODEL_PROVIDER || "custom";
+  }
   if (typeof config.SOFT_MODEL_GPT_OUTLINE_NAME === "string") {
     process.env.SOFT_MODEL_GPT_OUTLINE_NAME = config.SOFT_MODEL_GPT_OUTLINE_NAME;
   }
@@ -512,6 +671,9 @@ function applyModelConfig(config) {
   }
   if (typeof config.SOFT_MODEL_GPT_REASONING_EFFORT === "string") {
     process.env.SOFT_MODEL_GPT_REASONING_EFFORT = normalizeReasoningEffort(config.SOFT_MODEL_GPT_REASONING_EFFORT);
+  }
+  if (typeof config.SOFT_LLM_AI_FRONTEND_WORKERS === "string" || typeof config.SOFT_LLM_AI_FRONTEND_WORKERS === "number") {
+    process.env.SOFT_LLM_AI_FRONTEND_WORKERS = String(config.SOFT_LLM_AI_FRONTEND_WORKERS);
   }
   if (typeof config.SOFT_MODEL_GPT_IMAGE_NAME === "string") {
     process.env.SOFT_MODEL_GPT_IMAGE_NAME = config.SOFT_MODEL_GPT_IMAGE_NAME;
@@ -843,7 +1005,7 @@ function normalizeModelCatalog(data) {
 async function fetchAvailableModels(baseUrl, apiKey) {
   const urls = modelCatalogUrls(baseUrl);
   if (!urls.length || !String(apiKey || "").trim()) {
-    throw new Error("请求地址或 API Key 未配置");
+    throw new Error("文本模型服务或 API Key 未配置");
   }
   const authProfiles = [
     { Authorization: `Bearer ${apiKey}` },
@@ -924,6 +1086,8 @@ ipcMain.handle("get-generation-status", async (_event) => {
 });
 
 ipcMain.handle("generate-materials", async (_event, payload) => {
+  const requestedMode = payload?.modelPlan === "template" ? "template" : "gpt";
+  const templateMode = requestedMode === "template";
   if (activeGenerationTask && !activeGenerationTask.settled) {
     return {
       ok: false,
@@ -936,12 +1100,12 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
       warnings: [],
       checks: {},
       files: [],
-      blueprintSource: "gpt",
-      manualSource: "gpt",
+      blueprintSource: templateMode ? "local-template" : "gpt",
+      manualSource: templateMode ? "local-template" : "gpt",
       activeStatus: activeGenerationStatus()
     };
   }
-  const configError = gptConfigError();
+  const configError = templateMode ? "" : gptConfigError();
   if (configError) {
     return {
       ok: false,
@@ -952,11 +1116,11 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
       stdout: "",
       stderr: configError,
       files: [],
-      blueprintSource: "gpt",
-      manualSource: "gpt"
+      blueprintSource: templateMode ? "local-template" : "gpt",
+      manualSource: templateMode ? "local-template" : "gpt"
     };
   }
-  const modelPlan = modelPlans.gpt;
+  const modelPlan = modelPlans[requestedMode];
   const args = [
     path.join(rootDir, "backend", "generate_materials.py"),
     "--name",
@@ -1002,14 +1166,14 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
         ...process.env,
         ...(packagedPlaywrightBrowsersPath() ? { PLAYWRIGHT_BROWSERS_PATH: packagedPlaywrightBrowsersPath() } : {}),
         ...(packagedLibreOfficePath() ? { SOFT_LIBREOFFICE_PATH: packagedLibreOfficePath() } : {}),
-        SOFT_MODEL_GPT_BASE_URL: modelPlan.apiBaseUrl || process.env.SOFT_MODEL_GPT_BASE_URL || "",
-        SOFT_MODEL_GPT_API_KEY: modelPlan.apiKey || process.env.SOFT_MODEL_GPT_API_KEY || "",
+        SOFT_MODEL_GPT_BASE_URL: templateMode ? "" : modelPlan.apiBaseUrl || process.env.SOFT_MODEL_GPT_BASE_URL || "",
+        SOFT_MODEL_GPT_API_KEY: templateMode ? "" : modelPlan.apiKey || process.env.SOFT_MODEL_GPT_API_KEY || "",
         SOFT_MODEL_GPT_FRONTEND_NAME: frontendModelName(),
-        SOFT_MODEL_GPT_IMAGE_BASE_URL: process.env.SOFT_MODEL_GPT_IMAGE_BASE_URL || process.env.SOFT_MODEL_IMAGE_BASE_URL || "",
-        SOFT_MODEL_GPT_IMAGE_API_KEY: process.env.SOFT_MODEL_GPT_IMAGE_API_KEY || process.env.SOFT_MODEL_IMAGE_API_KEY || "",
+        SOFT_MODEL_GPT_IMAGE_BASE_URL: templateMode ? "" : process.env.SOFT_MODEL_GPT_IMAGE_BASE_URL || process.env.SOFT_MODEL_IMAGE_BASE_URL || "",
+        SOFT_MODEL_GPT_IMAGE_API_KEY: templateMode ? "" : process.env.SOFT_MODEL_GPT_IMAGE_API_KEY || process.env.SOFT_MODEL_IMAGE_API_KEY || "",
         SOFT_MODEL_GPT_IMAGE_NAME: process.env.SOFT_MODEL_GPT_IMAGE_NAME || process.env.SOFT_MODEL_IMAGE_NAME || "gpt-image-2",
-        SOFT_MODEL_IMAGE_BASE_URL: process.env.SOFT_MODEL_IMAGE_BASE_URL || process.env.SOFT_MODEL_GPT_IMAGE_BASE_URL || "",
-        SOFT_MODEL_IMAGE_API_KEY: process.env.SOFT_MODEL_IMAGE_API_KEY || process.env.SOFT_MODEL_GPT_IMAGE_API_KEY || "",
+        SOFT_MODEL_IMAGE_BASE_URL: templateMode ? "" : process.env.SOFT_MODEL_IMAGE_BASE_URL || process.env.SOFT_MODEL_GPT_IMAGE_BASE_URL || "",
+        SOFT_MODEL_IMAGE_API_KEY: templateMode ? "" : process.env.SOFT_MODEL_IMAGE_API_KEY || process.env.SOFT_MODEL_GPT_IMAGE_API_KEY || "",
         SOFT_MODEL_IMAGE_NAME: process.env.SOFT_MODEL_IMAGE_NAME || process.env.SOFT_MODEL_GPT_IMAGE_NAME || "gpt-image-2",
         SOFT_GENERATION_PROFILE: process.env.SOFT_GENERATION_PROFILE || "balanced",
         SOFT_LLM_BATCH_WORKERS: process.env.SOFT_LLM_BATCH_WORKERS || "2",
@@ -1087,8 +1251,8 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
         warnings: [],
         checks: {},
         files: [],
-        blueprintSource: "gpt",
-        manualSource: "gpt"
+        blueprintSource: templateMode ? "local-template" : "gpt",
+        manualSource: templateMode ? "local-template" : "gpt"
       });
       sendGenerateEvent(task.sender, {
         stage: "error",
@@ -1117,8 +1281,8 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
           warnings: [],
           checks: {},
           files: [],
-          blueprintSource: "gpt",
-          manualSource: "gpt",
+          blueprintSource: templateMode ? "local-template" : "gpt",
+          manualSource: templateMode ? "local-template" : "gpt",
           featureHint: payload.featureHint || "",
           featureHintMeta: { cancelled: true },
           seed: "",
@@ -1154,19 +1318,27 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
       if (validation.manifest_path) {
         validation.manifest_path = path.resolve(rootDir, validation.manifest_path);
       }
+      const resultJsonReady = Boolean(resultMatch);
+      const zipReady = Boolean(zipPath && fs.existsSync(zipPath) && fs.statSync(zipPath).isFile());
+      const completionError =
+        code === 0 && !resultJsonReady
+          ? "生成进程已结束，但未返回最终结果，未确认材料包完成。"
+          : code === 0 && !zipReady
+            ? "生成进程已结束，但未返回可用材料包文件。"
+            : "";
       const result = rememberGenerationResult({
-        ok: code === 0,
+        ok: code === 0 && resultJsonReady && zipReady,
         code,
         stdout,
-        stderr: sanitizeErrorMessage(parsed.message || stderr),
+        stderr: sanitizeErrorMessage(parsed.message || stderr || completionError || (code === 0 ? "" : "材料生成失败")),
         zipPath,
         outputDir: outputDir || task.outputDir || payload.resumeOutputDir || (zipPath ? path.dirname(zipPath) : ""),
         warnings: parsed.warnings || [],
         checks: parsed.checks || {},
         validation,
         files,
-        blueprintSource: parsed.blueprint_source || "gpt",
-        manualSource: parsed.manual_source || "gpt",
+        blueprintSource: parsed.blueprint_source || (templateMode ? "local-template" : "gpt"),
+        manualSource: parsed.manual_source || (templateMode ? "local-template" : "gpt"),
         technicalArchitecture: parsed.technical_architecture || {},
         featureHint: parsed.feature_hint || payload.featureHint || "",
         featureHintMeta: parsed.feature_hint_meta || {},
@@ -1387,11 +1559,17 @@ ipcMain.handle("infer-feature-hint", async (_event, payload) => {
 });
 
 ipcMain.handle("get-model-config", async () => {
+  const imageApiBaseUrl = configuredImageApiBaseUrl();
+  const imageApiKey = configuredImageApiKey();
+  const textProvider = activeTextProviderId();
   return {
     mode: currentModelMode(),
+    textProvider,
+    providerProfiles: providerProfilesForUi(),
     modelName: modelPlans.gpt.modelName || "gpt-5.5",
     outlineModelName: outlineModelName(),
     frontendModelName: frontendModelName(),
+    frontendWorkers: frontendWorkerCount(),
     outlineTimeoutSeconds: outlineTimeoutSeconds(),
     reasoningEffort: normalizeReasoningEffort(process.env.SOFT_MODEL_GPT_REASONING_EFFORT),
     apiBaseUrl: "",
@@ -1399,6 +1577,13 @@ ipcMain.handle("get-model-config", async () => {
     apiBaseUrlConfigured: Boolean(modelPlans.gpt.apiBaseUrl),
     apiKey: "",
     apiKeyConfigured: Boolean(modelPlans.gpt.apiKey),
+    imageModelName: imageModelName(),
+    imageUseTextApi: !imageApiBaseUrl && !imageApiKey,
+    imageApiBaseUrl: "",
+    imageApiBaseUrlMasked: hiddenConfigStatus(imageApiBaseUrl, "已单独配置（地址已隐藏）"),
+    imageApiBaseUrlConfigured: Boolean(imageApiBaseUrl),
+    imageApiKey: "",
+    imageApiKeyConfigured: Boolean(imageApiKey),
     provider: process.env.SOFT_ACCOUNT_PROVIDER || "newapi",
     preset: envFlagEnabled(process.env.SOFT_CUSTOMER_PRESET_CONFIG)
   };
@@ -1411,7 +1596,7 @@ ipcMain.handle("list-available-models", async () => {
   }
   try {
     const models = await fetchAvailableModels(modelPlans.gpt.apiBaseUrl, modelPlans.gpt.apiKey);
-    writeRuntimeLog("model_catalog_loaded", { count: models.length });
+    writeRuntimeLog("model_catalog_loaded", { count: models.length, provider: activeTextProviderId() });
     return { ok: true, models, count: models.length };
   } catch (error) {
     writeRuntimeLog("model_catalog_error", { message: sanitizeErrorMessage(error?.message || "") });
@@ -1442,52 +1627,115 @@ ipcMain.handle("delete-recoverable-task", async (_event, payload) => {
 });
 
 ipcMain.handle("save-model-config", async (_event, payload) => {
-  const mode = "gpt";
-  const modelName = String(payload?.modelName || modelPlans.gpt.modelName || "gpt-5.5").trim();
+  const mode = payload?.mode === "template" ? "template" : "gpt";
+  const previousTextProvider = activeTextProviderId();
+  const previousProviderProfile = providerProfile(previousTextProvider);
+  const textProvider = normalizeTextProvider(payload?.textProvider || activeTextProviderId());
+  const preset = TEXT_PROVIDER_PRESETS[textProvider];
+  const existingProvider = providerProfile(textProvider);
+  const modelName = String(payload?.modelName || existingProvider.modelName || preset.defaultModel).trim();
   const outlineModel = String(payload?.outlineModelName || payload?.outlineModel || "").trim();
   const frontendModel = String(payload?.frontendModelName || payload?.frontendModel || "").trim();
+  const frontendWorkers = Math.min(3, Math.max(1, Number.parseInt(payload?.frontendWorkers || "1", 10) || 1));
   const outlineTimeout = Math.min(120, Math.max(10, Number.parseInt(payload?.outlineTimeoutSeconds || "60", 10) || 60));
   const reasoningEffort = normalizeReasoningEffort(payload?.reasoningEffort);
-  const apiBaseUrl = String(payload?.apiBaseUrl || modelPlans.gpt.apiBaseUrl || "").trim();
-  const apiKey = String(payload?.apiKey || modelPlans.gpt.apiKey || "").trim();
-  if (!apiBaseUrl) {
-    return { ok: false, message: "GPT 请求地址未配置" };
+  const apiBaseUrl = String(
+    textProvider === "custom"
+      ? payload?.apiBaseUrl || existingProvider.baseUrl || ""
+      : existingProvider.baseUrl || preset.defaultBaseUrl
+  ).trim();
+  const apiKey = String(payload?.apiKey || existingProvider.apiKey || "").trim();
+  const existingImageApiBaseUrl = configuredImageApiBaseUrl();
+  const existingImageApiKey = configuredImageApiKey();
+  const imageModel = String(payload?.imageModelName || imageModelName() || "gpt-image-2").trim();
+  const imageUseTextApi =
+    typeof payload?.imageUseTextApi === "boolean"
+      ? payload.imageUseTextApi
+      : !existingImageApiBaseUrl && !existingImageApiKey;
+  const imageApiBaseUrl = imageUseTextApi
+    ? ""
+    : String(payload?.imageApiBaseUrl || existingImageApiBaseUrl || "").trim();
+  const imageApiKey = imageUseTextApi
+    ? ""
+    : String(payload?.imageApiKey || existingImageApiKey || "").trim();
+  if (mode === "gpt" && !apiBaseUrl) {
+    return { ok: false, message: "文本模型服务未配置" };
   }
-  if (!apiKey) {
-    return { ok: false, message: "GPT 模式需要填写 API Key" };
+  if (mode === "gpt" && !apiKey) {
+    return { ok: false, message: `${preset.label} 需要填写 API Key` };
+  }
+  if (mode === "gpt" && textProvider !== "custom" && imageUseTextApi) {
+    return { ok: false, message: `${preset.label} 不提供本流程要求的 gpt-image-2，请使用独立图片 API` };
+  }
+  if (mode === "gpt" && !imageUseTextApi && !imageApiBaseUrl) {
+    return { ok: false, message: "独立图片模型需要填写图片 API 请求地址" };
+  }
+  if (mode === "gpt" && !imageUseTextApi && !imageApiKey) {
+    return { ok: false, message: "独立图片模型需要填写图片 API Key" };
   }
 
   const configPath = defaultConfigPath();
+  const providerPrefix = providerEnvPrefix(textProvider);
   const config = {
     ...readJsonConfig(configPath),
-    SOFT_ACCOUNT_PROVIDER: "newapi",
+    SOFT_ACCOUNT_PROVIDER: textProvider === "custom" ? "newapi" : textProvider,
     SOFT_MODEL_MODE: mode,
+    SOFT_TEXT_PROVIDER: textProvider,
+    SOFT_MODEL_PROVIDER: preset.provider,
     SOFT_MODEL_GPT_BASE_URL: apiBaseUrl,
     SOFT_MODEL_GPT_NAME: modelName || "gpt-5.5",
     SOFT_MODEL_GPT_OUTLINE_NAME: outlineModel || modelName || "gpt-5.5",
     SOFT_MODEL_GPT_FRONTEND_NAME: frontendModel || modelName || "gpt-5.5",
+    SOFT_LLM_AI_FRONTEND_WORKERS: String(frontendWorkers),
     SOFT_MODEL_GPT_OUTLINE_TIMEOUT_SECONDS: String(outlineTimeout),
     SOFT_MODEL_GPT_REASONING_EFFORT: reasoningEffort,
+    SOFT_MODEL_GPT_IMAGE_NAME: imageModel || "gpt-image-2",
+    SOFT_MODEL_GPT_IMAGE_BASE_URL: imageApiBaseUrl,
+    SOFT_MODEL_GPT_IMAGE_API_KEY: imageApiKey,
+    SOFT_MODEL_IMAGE_NAME: imageModel || "gpt-image-2",
+    SOFT_MODEL_IMAGE_BASE_URL: imageApiBaseUrl,
+    SOFT_MODEL_IMAGE_API_KEY: imageApiKey,
     SOFT_MODEL_CONFIG_LOCKED: "false",
     SOFT_USER_SAVED_CONFIG: "true",
     SOFT_USER_SAVED_AT: new Date().toISOString()
   };
-  config.SOFT_MODEL_GPT_API_KEY = apiKey;
+  const previousProviderPrefix = providerEnvPrefix(previousTextProvider);
+  config[`SOFT_PROVIDER_${previousProviderPrefix}_BASE_URL`] = previousProviderProfile.baseUrl;
+  config[`SOFT_PROVIDER_${previousProviderPrefix}_MODEL`] = previousProviderProfile.modelName;
+  config[`SOFT_PROVIDER_${previousProviderPrefix}_OUTLINE_MODEL`] = previousProviderProfile.outlineModelName;
+  config[`SOFT_PROVIDER_${previousProviderPrefix}_FRONTEND_MODEL`] = previousProviderProfile.frontendModelName;
+  if (previousProviderProfile.apiKey) config[`SOFT_PROVIDER_${previousProviderPrefix}_API_KEY`] = previousProviderProfile.apiKey;
+  config[`SOFT_PROVIDER_${providerPrefix}_BASE_URL`] = apiBaseUrl;
+  config[`SOFT_PROVIDER_${providerPrefix}_MODEL`] = modelName || preset.defaultModel;
+  config[`SOFT_PROVIDER_${providerPrefix}_OUTLINE_MODEL`] = outlineModel || modelName || preset.defaultModel;
+  config[`SOFT_PROVIDER_${providerPrefix}_FRONTEND_MODEL`] = frontendModel || modelName || preset.defaultModel;
+  if (apiKey) config[`SOFT_PROVIDER_${providerPrefix}_API_KEY`] = apiKey;
+  if (apiKey) config.SOFT_MODEL_GPT_API_KEY = apiKey;
   writeJsonConfig(configPath, config);
   applyModelConfig(config);
   return {
     ok: true,
     mode,
+    textProvider,
+    providerProfiles: providerProfilesForUi(),
     modelName: config.SOFT_MODEL_GPT_NAME,
     outlineModelName: config.SOFT_MODEL_GPT_OUTLINE_NAME,
     frontendModelName: config.SOFT_MODEL_GPT_FRONTEND_NAME,
+    frontendWorkers,
     outlineTimeoutSeconds: outlineTimeout,
     reasoningEffort,
     apiBaseUrl: "",
     apiBaseUrlMasked: hiddenConfigStatus(config.SOFT_MODEL_GPT_BASE_URL, "已配置（地址已隐藏）"),
     apiBaseUrlConfigured: Boolean(config.SOFT_MODEL_GPT_BASE_URL),
     apiKey: "",
-    apiKeyConfigured: Boolean(config.SOFT_MODEL_GPT_API_KEY)
+    apiKeyConfigured: Boolean(config.SOFT_MODEL_GPT_API_KEY),
+    imageModelName: config.SOFT_MODEL_GPT_IMAGE_NAME,
+    imageUseTextApi,
+    imageApiBaseUrl: "",
+    imageApiBaseUrlMasked: hiddenConfigStatus(config.SOFT_MODEL_GPT_IMAGE_BASE_URL, "已单独配置（地址已隐藏）"),
+    imageApiBaseUrlConfigured: Boolean(config.SOFT_MODEL_GPT_IMAGE_BASE_URL),
+    imageApiKey: "",
+    imageApiKeyConfigured: Boolean(config.SOFT_MODEL_GPT_IMAGE_API_KEY)
   };
 });
 
@@ -1501,10 +1749,11 @@ ipcMain.handle("open-path", async (_event, targetPath) => {
 
 ipcMain.handle("get-model-account", async () => {
   const configError = gptConfigError();
+  const providerLabel = activeTextProviderPreset().label;
   if (configError) {
     return {
       status: "unconfigured",
-      accountName: "GPT 未配置",
+      accountName: `${providerLabel} 未配置`,
       balanceLabel: "需要配置 API",
       updatedAt: "",
       message: configError
@@ -1535,8 +1784,8 @@ ipcMain.handle("get-model-account", async () => {
   }
   return {
     status: "unknown",
-    accountName: "GPT 中转站",
-    balanceLabel: "待配置",
+    accountName: providerLabel,
+    balanceLabel: activeTextProviderId() === "custom" ? "待配置" : "余额请查看供应商控制台",
     updatedAt: ""
   };
 });

@@ -30,6 +30,29 @@ SOURCE_MATERIAL_SUFFIXES = {
 }
 
 
+def repair_generated_business_record_labels(source_dir: Path) -> int:
+    """Migrate old generated service defaults that could leak generic labels into UI data."""
+    changed = 0
+    pattern = re.compile(
+        r"(name:\s*payload\.name\s*\|\|\s*[\"'])([^\"']*?)业务记录([\"'])"
+    )
+    seeded_pattern = re.compile(r"([\"'])([^\"'\r\n]*?)记录(\d{2,})([\"'])")
+    for path in source_dir.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in {".js", ".ts", ".py"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        updated, count = pattern.subn(r"\1\2对象\3", text)
+        updated, seeded_count = seeded_pattern.subn(r"\1\2对象\3\4", updated)
+        count += seeded_count
+        if count:
+            path.write_text(updated, encoding="utf-8")
+            changed += count
+    return changed
+
+
 def generate_source_project(
     task: GenerationTask,
     blueprint: ProductBlueprint,
@@ -112,6 +135,22 @@ def generate_source_project(
         "source_migration_file_count": len(migration_files),
         "source_test_file_count": len(test_files),
     }
+
+
+def refresh_generated_source_metadata(task: GenerationTask, blueprint: ProductBlueprint, source_info: dict) -> None:
+    source_dir = Path(str(source_info.get("source_dir") or ""))
+    if not source_dir.is_dir():
+        return
+    blueprint_path = _write(
+        source_dir / "product-blueprint.json",
+        json.dumps(blueprint.to_dict(), ensure_ascii=False, indent=2),
+    )
+    _write(source_dir / "README.md", _readme(task, blueprint))
+    architecture = getattr(blueprint, "technical_architecture", {}) or {}
+    source_info["blueprint_path"] = str(blueprint_path)
+    source_info["technical_architecture"] = architecture
+    source_info["source_language"] = architecture.get("source_language") or task.language
+    source_info["source_strategy"] = architecture.get("source_strategy") or source_info.get("source_strategy") or "language-single"
 
 
 def read_source_line_entries(source_dir: Path) -> list[dict]:
@@ -1470,7 +1509,7 @@ class {class_name}Service:
             raise ValueError("业务编号和名称不能为空")
         if self.repository.find_by_code(code.strip()):
             raise ValueError("业务编号已存在")
-        return self.repository.create(code.strip(), name.strip(), owner_role.strip() or "business_operator", description.strip())
+        return self.repository.create(code.strip(), name.strip(), owner_role.strip() or "业务操作员", description.strip())
 
     def update_status(self, record_id: int, status: str) -> {class_name}Record:
         allowed = {{"PENDING", "ENABLED", "PROCESSING", "COMPLETED", "ARCHIVED"}}
@@ -2082,7 +2121,7 @@ class {_pascal(token)}Service {{
       ...payload,
       id: this.records.length + 1,
       code: payload.code || this.createCode(),
-      name: payload.name || {_json_literal(module.title + "业务记录")},
+      name: payload.name || {_json_literal((module.title or "业务") + "对象")},
       status: payload.status || "PENDING",
       moduleTitle: {_json_literal(module.title)},
       ownerRole: payload.ownerRole || {_json_literal(_javascript_owner_role(module))},
@@ -2234,12 +2273,13 @@ def _business_field_value(module: FeatureModule, field: str, index: int, code: s
         return code
     if re.search(r"名称|标题|线路|路径", text):
         return name
-    if re.search(r"途经|节点序列|站点序列", text):
+    transport = _is_transport_module(module)
+    if transport and re.search(r"途经|节点序列|站点序列", text):
         return _transport_node_sequence(index)
-    if re.search(r"方向|通行", text):
+    if transport and re.search(r"方向|通行", text):
         return ["北向", "南向", "双向", "东向"][(index - 1) % 4]
     if re.search(r"范围|服务|覆盖|片区|区域", text):
-        return _transport_service_scope(index)
+        return _transport_service_scope(index) if transport else f"{title}服务区域{index}"
     if re.search(r"状态|进度", text):
         return ["已启用", "待复核", "处理中", "已完成"][(index - 1) % 4]
     if re.search(r"时间|日期|更新|创建|生效", text):
@@ -2250,7 +2290,7 @@ def _business_field_value(module: FeatureModule, field: str, index: int, code: s
         return _javascript_owner_role(module)
     if re.search(r"结果|结论|说明|备注", text):
         return f"{title}已完成{['建档', '复核', '匹配', '归档'][(index - 1) % 4]}"
-    return [code, name, _transport_node_sequence(index), _transport_service_scope(index)][(index - 1) % 4]
+    return [code, name, f"{title}业务对象{index}", f"{title}处理结果{index}"][(index - 1) % 4]
 
 
 def _transport_node_sequence(index: int) -> str:
@@ -2270,7 +2310,18 @@ def _transport_service_scope(index: int) -> str:
 
 def _javascript_owner_role(module: FeatureModule) -> str:
     roles = [str(item) for item in (getattr(module, "roles", []) or []) if str(item).strip()]
-    return roles[0] if roles else "business_operator"
+    return roles[0] if roles else "业务操作员"
+
+
+def _is_transport_module(module: FeatureModule) -> bool:
+    text = " ".join(
+        [
+            str(getattr(module, "title", "") or ""),
+            str(getattr(module, "description", "") or ""),
+            " ".join(str(item) for item in (getattr(module, "data_fields", []) or [])),
+        ]
+    )
+    return bool(re.search(r"交通|运输|线路|干线|支线|接驳|换乘|站点|车站|枢纽|班次|运力", text))
 
 
 def _business_code_prefix(module: FeatureModule, fallback_token: str) -> str:
@@ -2307,20 +2358,20 @@ def _business_record_names(module: FeatureModule) -> list[str]:
         return ["干支线接驳时效评估", "覆盖盲区匹配复核", "节点容量冲突评估", "跨区线路组合测算"]
     if "规则" in title:
         return ["接驳距离阈值规则", "等待时长上限规则", "节点容量窗口规则", "服务范围重叠规则"]
-    if "问题" in title:
+    if "问题" in title and _is_transport_module(module):
         return ["支线覆盖缺口工单", "节点容量冲突工单", "方向不一致处置单", "服务范围越界工单"]
     if "发布" in title or "方案" in title:
         return ["临港干支线适配方案", "机场枢纽接驳发布单", "港区集疏运生效方案", "城际线路换乘方案"]
     if "统计" in title or "报表" in title:
         return ["日运行适配汇总", "区域衔接效率报表", "规则命中趋势分析", "问题闭环统计清单"]
-    return [f"{title}记录{index:02d}" for index in range(1, 5)]
+    return [f"{title}待办", f"{title}复核单", f"{title}处理单", f"{title}归档单"]
 
 
 def _business_record_regions(module: FeatureModule, fields: list[str]) -> list[str]:
     title = str(getattr(module, "title", "") or "")
-    if "干线" in title or "支线" in title or "节点" in title or "匹配" in title or "规则" in title or "问题" in title or "发布" in title or "统计" in title:
+    if _is_transport_module(module):
         return ["浦东东区", "临港新片区", "虹桥枢纽片区", "外高桥港区"]
-    return fields or [title]
+    return [f"{title}服务区域{index}" for index in range(1, 5)]
 
 
 def _generate_generic_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path) -> list[Path]:

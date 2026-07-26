@@ -8,6 +8,14 @@ MAIN_JSX = ROOT / "desktop" / "src" / "main.jsx"
 
 
 class DesktopModelConfigSecretTests(unittest.TestCase):
+    def test_desktop_error_sanitizer_hides_connection_pool_host_and_model_path(self):
+        source = MAIN_CJS.read_text(encoding="utf-8")
+
+        self.assertIn("ConnectionPool\\(host=", source)
+        self.assertIn("chat\\/completions", source)
+        self.assertIn("模型网关连接", source)
+        self.assertIn("[模型接口]", source)
+
     def test_ipc_model_config_responses_do_not_echo_secrets(self):
         source = MAIN_CJS.read_text(encoding="utf-8")
         get_block = source.split('ipcMain.handle("get-model-config"', 1)[1].split('ipcMain.handle("list-recoverable-tasks"', 1)[0]
@@ -15,11 +23,15 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
 
         self.assertIn('apiBaseUrl: ""', get_block)
         self.assertIn('apiKey: ""', get_block)
+        self.assertIn('imageApiBaseUrl: ""', get_block)
+        self.assertIn('imageApiKey: ""', get_block)
         self.assertNotIn('apiBaseUrl: modelPlans.gpt.apiBaseUrl', get_block)
         self.assertNotIn('apiKey: modelPlans.gpt.apiKey', get_block)
 
         self.assertIn('apiBaseUrl: ""', save_block)
         self.assertIn('apiKey: ""', save_block)
+        self.assertIn('imageApiBaseUrl: ""', save_block)
+        self.assertIn('imageApiKey: ""', save_block)
         self.assertNotIn('apiBaseUrl: config.SOFT_MODEL_GPT_BASE_URL', save_block)
         self.assertNotIn('apiKey: config.SOFT_MODEL_GPT_API_KEY', save_block)
 
@@ -27,10 +39,81 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         source = MAIN_JSX.read_text(encoding="utf-8")
 
         self.assertIn("更换请求地址（留空则保持不变）", source)
+        self.assertIn("请求地址状态", source)
+        self.assertIn("OpenAI 兼容请求地址", source)
         self.assertIn("更换 API Key（留空则保持不变）", source)
         self.assertIn('type="password"', source)
         self.assertIn('apiBaseUrl: ""', source)
         self.assertIn('apiKey: ""', source)
+        self.assertIn("图片模型 API", source)
+        self.assertIn("使用独立图片 API", source)
+        self.assertIn("更换图片请求地址（留空则保持不变）", source)
+        self.assertIn("更换图片 API Key（留空则保持不变）", source)
+        self.assertIn('imageApiBaseUrl: ""', source)
+        self.assertIn('imageApiKey: ""', source)
+
+    def test_separate_image_api_config_is_saved_without_echoing_secrets(self):
+        main_source = MAIN_CJS.read_text(encoding="utf-8")
+        save_block = main_source.split('ipcMain.handle("save-model-config"', 1)[1].split('ipcMain.handle("open-path"', 1)[0]
+
+        self.assertIn("SOFT_MODEL_GPT_IMAGE_NAME: imageModel", save_block)
+        self.assertIn("SOFT_MODEL_GPT_IMAGE_BASE_URL: imageApiBaseUrl", save_block)
+        self.assertIn("SOFT_MODEL_GPT_IMAGE_API_KEY: imageApiKey", save_block)
+        self.assertIn('imageApiBaseUrl: ""', save_block)
+        self.assertIn('imageApiKey: ""', save_block)
+
+    def test_multiple_text_providers_have_separate_secret_slots_and_hidden_presets(self):
+        main_source = MAIN_CJS.read_text(encoding="utf-8")
+        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        save_block = main_source.split('ipcMain.handle("save-model-config"', 1)[1].split('ipcMain.handle("open-path"', 1)[0]
+
+        for provider in ("grok", "claude", "gemini", "deepseek"):
+            self.assertIn(f'{provider}: {{', main_source)
+            self.assertIn(f'value: "{provider}"', renderer_source)
+        self.assertIn('SOFT_TEXT_PROVIDER: textProvider', save_block)
+        self.assertIn('SOFT_MODEL_PROVIDER: preset.provider', save_block)
+        self.assertIn('config[`SOFT_PROVIDER_${providerPrefix}_API_KEY`] = apiKey', save_block)
+        self.assertIn('providerProfiles: providerProfilesForUi()', save_block)
+        self.assertIn('官方预设（地址已隐藏）', renderer_source)
+        self.assertIn('各文本供应商的 API Key 独立保存且不回显', renderer_source)
+        self.assertIn('SOFT_LLM_AI_FRONTEND_WORKERS: String(frontendWorkers)', save_block)
+        self.assertIn('界面并发数', renderer_source)
+        self.assertIn('2（推荐，更快）', renderer_source)
+        self.assertIn('["grok", "claude", "gemini", "deepseek"].includes(accountProvider)', main_source)
+
+    def test_default_name_only_flow_auto_confirms_blueprint_and_keeps_review_option(self):
+        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+
+        self.assertIn('blueprintReviewBeforeGeneration: false', renderer_source)
+        self.assertIn('enqueueQuickTask(currentPromptText)', renderer_source)
+        self.assertIn('autoPlan: true', renderer_source)
+        self.assertIn('自动确认并直接生成（推荐）', renderer_source)
+        self.assertIn('生成后先人工审阅', renderer_source)
+        self.assertIn('return blueprintReviewBeforeGeneration ? "生成蓝图" : "开始生成"', renderer_source)
+        self.assertNotIn('"确认模块"', renderer_source)
+
+    def test_name_inference_operation_contract_is_preserved_for_backend_reuse(self):
+        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+
+        self.assertIn('operationSpecs: normalizeOperationSpecs', renderer_source)
+        self.assertIn('operationSpecs: module.operationSpecs', renderer_source)
+        self.assertIn('resultEvidence:', renderer_source)
+
+    def test_default_template_is_visible_and_clears_model_credentials_for_generation(self):
+        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        main_source = MAIN_CJS.read_text(encoding="utf-8")
+        generate_block = main_source.split('ipcMain.handle("generate-materials"', 1)[1].split(
+            'ipcMain.handle("infer-feature-hint"', 1
+        )[0]
+
+        self.assertIn('label: "Default Template"', renderer_source)
+        self.assertIn('provider: "local-template"', renderer_source)
+        self.assertIn('cost: "不消耗 token"', renderer_source)
+        self.assertIn('payload?.modelPlan === "template"', generate_block)
+        self.assertIn('SOFT_MODEL_GPT_API_KEY: templateMode ? ""', generate_block)
+        self.assertIn('SOFT_MODEL_GPT_BASE_URL: templateMode ? ""', generate_block)
+        self.assertIn('SOFT_MODEL_GPT_IMAGE_API_KEY: templateMode ? ""', generate_block)
+        self.assertIn('SOFT_MODEL_IMAGE_API_KEY: templateMode ? ""', generate_block)
 
     def test_model_catalog_is_loaded_in_main_process(self):
         main_source = MAIN_CJS.read_text(encoding="utf-8")
@@ -45,6 +128,17 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertIn("自定义模型 ID（列表中没有时填写）", renderer_source)
         self.assertNotIn('<datalist id="available-model-catalog">', renderer_source)
         self.assertIn("refreshAvailableModels", renderer_source)
+
+    def test_model_fallback_choices_are_scoped_to_selected_provider(self):
+        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+
+        self.assertIn("const providerModelChoices =", renderer_source)
+        self.assertIn('grok: ["grok-3-mini"]', renderer_source)
+        self.assertIn('claude: ["claude-sonnet-4-20250514"]', renderer_source)
+        self.assertIn('gemini: ["gemini-2.5-flash"]', renderer_source)
+        self.assertIn('deepseek: ["deepseek-chat"]', renderer_source)
+        self.assertIn('modelCatalog.provider === selectedTextProvider.value', renderer_source)
+        self.assertNotIn('...modelChoices].filter(Boolean))];', renderer_source)
 
     def test_settings_has_single_animated_header_entry(self):
         renderer_source = MAIN_JSX.read_text(encoding="utf-8")
@@ -122,6 +216,24 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertNotIn("raw-log-details", renderer_source)
         self.assertNotIn("raw-log-details", style_source)
         self.assertNotIn(".log-view", style_source)
+
+    def test_progress_done_event_cannot_create_an_empty_success_result(self):
+        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        result_block = renderer_source.split("function resultFromGenerationEvent", 1)[1].split("function seedFromOutputDir", 1)[0]
+
+        self.assertIn('if (!event.result || typeof event.result !== "object") return null;', result_block)
+        self.assertNotIn('ok: event.stage === "done"', result_block)
+
+    def test_material_generation_success_requires_result_json_and_existing_zip(self):
+        main_source = MAIN_CJS.read_text(encoding="utf-8")
+        generate_block = main_source.split('ipcMain.handle("generate-materials"', 1)[1].split(
+            'ipcMain.handle("infer-feature-hint"', 1
+        )[0]
+
+        self.assertIn("const resultJsonReady = Boolean(resultMatch);", generate_block)
+        self.assertIn("const zipReady = Boolean(zipPath && fs.existsSync(zipPath)", generate_block)
+        self.assertIn("ok: code === 0 && resultJsonReady && zipReady", generate_block)
+        self.assertIn("files: Array.isArray(result.files) ? result.files : []", main_source)
 
 
 if __name__ == "__main__":

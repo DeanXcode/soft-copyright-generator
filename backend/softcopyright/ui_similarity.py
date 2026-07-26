@@ -238,7 +238,7 @@ def _matching_history(output_root: Path, fingerprint: dict[str, Any]) -> list[di
 def _package_page_similarity(ui_screenshots: dict | None) -> tuple[float, str]:
     if not isinstance(ui_screenshots, dict):
         return 0.0, ""
-    vectors: list[tuple[set[str], str, str, str]] = []
+    vectors: list[tuple[set[str], str, str, str, bool, Path | None]] = []
     for item in ui_screenshots.values():
         page_kind = str(getattr(item, "page_kind", "") or "")
         if page_kind not in {"module", "operation", "dashboard", "statistics"}:
@@ -259,13 +259,16 @@ def _package_page_similarity(ui_screenshots: dict | None) -> tuple[float, str]:
                     page_kind,
                     str(getattr(item, "interaction_mode", "") or ""),
                     str(getattr(item, "interaction_surface", "") or ""),
+                    bool(getattr(item, "requires_confirmation", False)),
+                    Path(str(getattr(item, "image_path", "") or "")) if str(getattr(item, "image_path", "") or "") else None,
                 )
             )
     if len(vectors) < 4:
         return 0.0, ""
     max_score = 0.0
-    for left_index, (left, left_kind, left_mode, left_surface) in enumerate(vectors):
-        for right, right_kind, right_mode, right_surface in vectors[left_index + 1 :]:
+    operation_image_max = 0.0
+    for left_index, (left, left_kind, left_mode, left_surface, left_confirmation, left_image) in enumerate(vectors):
+        for right, right_kind, right_mode, right_surface, right_confirmation, right_image in vectors[left_index + 1 :]:
             # Reusing the same query/form/result component across modules is a
             # deliberate design-system property. Diversity is required between
             # distinct operation surfaces and between primary module pages,
@@ -276,13 +279,43 @@ def _package_page_similarity(ui_screenshots: dict | None) -> tuple[float, str]:
                 and left_mode == right_mode
                 and left_surface == right_surface
             ):
+                # Confirmation pages deliberately share SharedConfirmDialog's
+                # dimensions and composition. Their business copy is validated
+                # separately, so pixel similarity is not evidence of duplication.
+                if left_confirmation and right_confirmation:
+                    continue
+                image_similarity = _operation_image_similarity(left_image, right_image)
+                if image_similarity is not None:
+                    operation_image_max = max(operation_image_max, image_similarity)
                 continue
             score = _set_similarity(left, right)
             if score > max_score:
                 max_score = score
-    if max_score >= 0.86:
-        return round(max_score, 4), "ui_package_pages_too_similar"
-    return round(max_score, 4), ""
+    combined_score = max(max_score, operation_image_max)
+    if max_score >= 0.86 or operation_image_max >= 0.97:
+        return round(combined_score, 4), "ui_package_pages_too_similar"
+    return round(combined_score, 4), ""
+
+
+def _operation_image_similarity(left: Path | None, right: Path | None) -> float | None:
+    if not left or not right or not left.is_file() or not right.is_file():
+        return None
+    try:
+        from PIL import Image, ImageChops, ImageFilter
+
+        with Image.open(left) as left_source, Image.open(right) as right_source:
+            left_edges = left_source.convert("L").resize((320, 180)).filter(ImageFilter.FIND_EDGES)
+            right_edges = right_source.convert("L").resize((320, 180)).filter(ImageFilter.FIND_EDGES)
+            difference = ImageChops.difference(left_edges, right_edges)
+            left_pixels = list(left_edges.get_flattened_data())
+            right_pixels = list(right_edges.get_flattened_data())
+            diff_pixels = list(difference.get_flattened_data())
+        edge_union = sum(max(int(left_value), int(right_value)) for left_value, right_value in zip(left_pixels, right_pixels))
+        if edge_union <= 0:
+            return 1.0
+        return max(0.0, 1.0 - (sum(int(value) for value in diff_pixels) / edge_union))
+    except Exception:
+        return None
 
 
 def _react_component_structure_source(html_path: Path, html: str) -> str:

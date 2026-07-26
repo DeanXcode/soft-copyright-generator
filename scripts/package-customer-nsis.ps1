@@ -61,11 +61,23 @@ try {
   ConvertTo-JsonUtf8File $buildConfig $builderConfigPath
 
   npm run prepare:runtime
+  if ($LASTEXITCODE -ne 0) {
+    throw "npm run prepare:runtime failed with exit code $LASTEXITCODE"
+  }
   npm run prepare:libreoffice
+  if ($LASTEXITCODE -ne 0) {
+    throw "npm run prepare:libreoffice failed with exit code $LASTEXITCODE"
+  }
   npm run build
+  if ($LASTEXITCODE -ne 0) {
+    throw "npm run build failed with exit code $LASTEXITCODE"
+  }
   $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"
   $env:ELECTRON_BUILDER_BINARIES_MIRROR = "https://npmmirror.com/mirrors/electron-builder-binaries/"
   npx electron-builder --win nsis --config $builderConfigPath
+  if ($LASTEXITCODE -ne 0) {
+    throw "electron-builder failed with exit code $LASTEXITCODE"
+  }
 
   Write-Host "Customer NSIS installer created under: $outputPath"
 }

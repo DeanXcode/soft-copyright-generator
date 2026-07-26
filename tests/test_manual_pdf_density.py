@@ -6,13 +6,23 @@ from backend.softcopyright.docgen import (
     _manual_architecture_name,
     _manual_content_for_renderer,
     _manual_deployment_topology,
+    _manual_paragraphs_for_renderer,
     _manual_pdf_text_density_page_result,
     _manual_product_type,
     _manual_runtime_environment_value,
+    _start_manual_closing_section,
 )
 
 
 class ManualPdfDensityTests(unittest.TestCase):
+    def test_operation_manual_cover_is_not_treated_as_body_density_page(self):
+        lines = ["客户安装版弹窗主题零令牌验收系统 V1.0 1", "客户安装版弹窗主题零令牌验收系统", "操作手册"]
+
+        result = _manual_pdf_text_density_page_result("\n".join(lines), 1, 22, 30)
+
+        self.assertFalse(result["text_density_page"])
+        self.assertTrue(result["ready"])
+
     def test_toc_page_is_not_treated_as_body_density_page(self):
         lines = ["目 录", "一 软件概述", "二 运行环境", "三 登录与主界面", "四 功能操作说明"]
 
@@ -42,6 +52,29 @@ class ManualPdfDensityTests(unittest.TestCase):
         self.assertFalse(result["ready"])
         self.assertEqual(result["soft_pass_reason"], "")
 
+    def test_compact_security_section_with_substantive_controls_is_content_sufficient(self):
+        lines = [
+            "六、权限与安全",
+            "系统通过用户、角色、菜单和数据范围进行权限控制，避免越权访问。",
+            "用户登录、数据新增、状态变更和导出下载等关键操作均记录审计日志。",
+            "管理员可根据岗位职责配置角色权限，并定期查看异常登录和高风险操作记录。",
+            "关键业务操作必须写入审计日志，统计报表必须按当前数据权限过滤。",
+            "服务预约管理必须校验状态流转顺序和重复提交。",
+            "门店核销管理必须校验状态流转顺序和重复提交。",
+            "售后工单管理必须校验状态流转顺序和重复提交。",
+            "模块之间通过业务编号和状态字段关联，用于支撑追溯和审计。",
+            "无对应菜单权限的用户不能进入受限页面。",
+            "高风险操作执行前需要核对当前角色和数据范围。",
+            "系统保留登录用户、操作时间、变更原因和处理结果。",
+        ]
+        text = "\n".join(lines) + " 权限控制和审计记录用于复核用户操作与状态流转。" * 6
+
+        result = _manual_pdf_text_density_page_result(text, 21, 22, 30)
+
+        self.assertGreaterEqual(result["character_count"], 420)
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["soft_pass_reason"], "security_content_page")
+
     def test_substantive_final_troubleshooting_page_is_not_blocked_by_30_line_rule(self):
         lines = [
             "用户进入页面后应检查当前状态、查询条件和业务记录，确认无误后重新提交处理结果。"
@@ -51,6 +84,51 @@ class ManualPdfDensityTests(unittest.TestCase):
         result = _manual_pdf_text_density_page_result("\n".join(lines), 10, 10, 30)
 
         self.assertTrue(result["text_density_page"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["soft_pass_reason"], "closing_content_page")
+
+    def test_compact_400_character_final_faq_is_content_sufficient(self):
+        lines = [
+            "用户在页面提交失败时，应检查必填字段、业务编号、处理人员和时间信息是否完整。",
+            "系统按照登录用户权限执行校验，用户应根据页面提示补齐后重新提交处理结果。",
+            "状态长时间未更新时，可刷新页面并查看处理轨迹、操作日志和关联任务记录。",
+            "若上一步尚未完成，应返回对应详情处理，不能直接跳过既定业务节点。",
+            "导入失败时应确认文件格式、字段表头、文件大小和当前账号权限符合页面要求。",
+            "修正后重新选择文件，先查看校验结果，再执行正式导入，避免重复写入。",
+            "导出结果异常时，应重新确认统计周期、筛选范围和数据版本，并检查下载目录。",
+            "重新生成后，页面应显示导出时间、操作人员和结果文件状态。",
+            "弱网或服务短暂中断时，不要连续重复提交同一业务操作。",
+            "用户可保留当前页面，待连接恢复后刷新处理结果并核对最新状态。",
+            "若系统已生成操作记录，应以最新状态和审计日志为准。",
+            "检查完成后重新查询页面，确认记录状态、处理结果和后续操作入口均正常。",
+        ]
+        text = "\n".join(lines)
+        text += " 用户应按页面提示复核查询结果、状态记录和系统处理反馈。" * 3
+
+        result = _manual_pdf_text_density_page_result(text, 29, 29, 30)
+
+        self.assertGreaterEqual(result["character_count"], 400)
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["soft_pass_reason"], "closing_content_page")
+
+    def test_nine_line_300_character_final_faq_is_content_sufficient(self):
+        lines = [
+            "状态长时间未更新时，用户可刷新当前页面并查看处理轨迹、操作日志和关联任务记录。",
+            "若上一步尚未完成，应返回对应详情处理，不能直接跳过既定业务节点。",
+            "导入附件失败时，应确认文件格式、字段表头、文件大小和当前账号权限符合要求。",
+            "修正后重新选择文件，先查看校验结果，再执行正式导入，避免重复写入。",
+            "导出结果异常时，应重新确认统计周期、筛选范围和数据版本，并检查下载目录。",
+            "重新生成后，页面应显示导出时间、操作人员和结果文件状态。",
+            "弱网或服务中断时，不要连续重复提交同一业务操作。",
+            "用户可保留当前页面，待连接恢复后刷新处理结果并确认记录状态。",
+            "若系统已生成操作记录，应以最新状态和审计日志为准。",
+        ]
+        text = "\n".join(lines)
+        text += " 用户应复核系统查询结果、页面状态和处理记录。" * 2
+
+        result = _manual_pdf_text_density_page_result(text, 27, 27, 30)
+
+        self.assertGreaterEqual(result["character_count"], 300)
         self.assertTrue(result["ready"])
         self.assertEqual(result["soft_pass_reason"], "closing_content_page")
 
@@ -80,10 +158,26 @@ class ManualPdfDensityTests(unittest.TestCase):
         self.assertEqual(len(paragraphs), 10)
         self.assertGreater(sum(len(item) for item in paragraphs), 700)
 
+    def test_closing_faq_section_starts_on_a_new_page(self):
+        from docx import Document
+        from docx.oxml.ns import qn
+
+        document = Document()
+        _start_manual_closing_section(document, "七、常见问题处理")
+
+        paragraphs = document.paragraphs
+        self.assertEqual(paragraphs[-1].text, "七、常见问题处理")
+        page_breaks = paragraphs[-2]._p.findall(".//" + qn("w:br"))
+        self.assertTrue(any(item.get(qn("w:type")) == "page" for item in page_breaks))
+
     def test_desktop_manual_filters_mobile_only_paragraphs_globally(self):
         manual_content = {
             "overview": ["系统用于桌面端质量管理。"],
-            "security": ["用户登录移动 App 后进入项目。", "系统按角色控制桌面页面权限。"],
+            "security": [
+                "用户登录移动 App 后进入项目。",
+                "系统按角色控制桌面页面权限。",
+                "管理员可为移动端用户配置角色权限。",
+            ],
             "faq": ["在个人中心切换项目身份后重试。", "用户可刷新当前桌面页面。"],
             "modules": {
                 "quality_plan": {
@@ -99,9 +193,23 @@ class ManualPdfDensityTests(unittest.TestCase):
 
         result = _manual_content_for_renderer(manual_content, design_brief)
 
-        self.assertEqual(result["security"], ["系统按角色控制桌面页面权限。"])
+        self.assertEqual(
+            result["security"],
+            ["系统按角色控制桌面页面权限。", "管理员可为终端用户配置角色权限。"],
+        )
         self.assertEqual(result["faq"], ["用户可刷新当前桌面页面。"])
         self.assertEqual(result["modules"]["quality_plan"]["paragraphs"], ["用户在列表页查看质量计划。"])
+
+    def test_actual_admin_renderer_overrides_stale_mobile_experience_terminal(self):
+        paragraphs = ["本页由移动端用户发起筛选。", "用户在桌面列表页查看处理结果。"]
+        design_brief = {
+            "expected_renderer": "admin",
+            "product_experience_spec": {"terminal": "mobile_app"},
+        }
+
+        result = _manual_paragraphs_for_renderer(paragraphs, design_brief)
+
+        self.assertEqual(result, ["本页由终端用户发起筛选。", "用户在桌面列表页查看处理结果。"])
 
     def test_desktop_manual_rewrites_mobile_architecture_table_fields(self):
         blueprint = self._desktop_blueprint()

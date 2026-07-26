@@ -26,13 +26,29 @@ import "./styles.css";
 
 const modelProviders = [
   {
+    value: "template",
+    label: "Default Template",
+    description: "使用本地模板和规则生成，不调用模型接口。",
+    provider: "local-template",
+    modelName: "template-v1",
+    cost: "不消耗 token"
+  },
+  {
     value: "gpt",
-    label: "GPT",
-    description: "仅使用 GPT 生成业务蓝图、产品蓝图、说明书正文和界面内容。",
+    label: "多模型 API",
+    description: "可选择现有兼容接口、Grok、Claude、Gemini 或 DeepSeek。",
     provider: "custom",
-    modelName: "gpt",
-    cost: "唯一模式"
+    modelName: "gpt-5.5",
+    cost: "按实际消耗"
   }
+];
+
+const textProviderChoices = [
+  { value: "custom", label: "现有兼容 API", defaultModel: "gpt-5.5", addressMode: "custom" },
+  { value: "grok", label: "Grok (xAI)", defaultModel: "grok-3-mini", addressMode: "preset" },
+  { value: "claude", label: "Claude (Anthropic)", defaultModel: "claude-sonnet-4-20250514", addressMode: "preset" },
+  { value: "gemini", label: "Gemini (Google)", defaultModel: "gemini-2.5-flash", addressMode: "preset" },
+  { value: "deepseek", label: "DeepSeek", defaultModel: "deepseek-chat", addressMode: "preset" }
 ];
 
 const generationStages = [
@@ -51,7 +67,14 @@ const generationStages = [
 ];
 
 const modelChoices = ["gpt-5.5", "gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-4.1"];
-const workflowStages = ["输入需求", "生成蓝图", "确认模块", "生成材料", "检查交付"];
+const providerModelChoices = {
+  custom: modelChoices,
+  grok: ["grok-3-mini"],
+  claude: ["claude-sonnet-4-20250514"],
+  gemini: ["gemini-2.5-flash"],
+  deepseek: ["deepseek-chat"]
+};
+const workflowStages = ["输入名称", "自动规划", "生成材料", "检查交付"];
 const reasoningEffortLabels = {
   minimal: "极简",
   low: "低",
@@ -63,12 +86,12 @@ const reasoningEffortLabels = {
 const stagePlannedSteps = {
   visual_reference: [
     { label: "准备视觉参考页面清单", match: ["视觉参考页面清单", "页面清单"] },
-    { label: "GPT 生成全局风格提示词", match: ["全局视觉风格提示词", "生成视觉提示词"] },
+    { label: "AI 生成全局风格提示词", match: ["全局视觉风格提示词", "生成视觉提示词"] },
     { label: "gpt-image-2 生成全局风格参考图", match: ["全局视觉风格参考图", "视觉参考稿", "视觉参考图"] }
   ],
   screenshots: [
     { label: "复用风格参考图", match: ["复用全局风格参考图", "根据参考图"] },
-    { label: "GPT 按风格参考图生成全部界面代码", match: ["全局视觉风格参考图生成界面代码", "生成界面代码"] },
+    { label: "AI 按风格参考图生成全部界面代码", match: ["全局视觉风格参考图生成界面代码", "生成界面代码"] },
     { label: "运行生成项目并重截手册图", match: ["生成项目服务", "渲染界面截图"] }
   ]
 };
@@ -89,13 +112,17 @@ function App() {
     modelPlan: "gpt",
     modelProvider: "custom",
     modelName: "gpt-5.5",
-    randomness: "standard"
+    randomness: "standard",
+    blueprintReviewBeforeGeneration: false
   });
   const [modelConfig, setModelConfig] = useState({
     mode: "gpt",
+    textProvider: "custom",
+    providerProfiles: {},
     modelName: "gpt-5.5",
     outlineModelName: "gpt-5.5",
     frontendModelName: "gpt-5.5",
+    frontendWorkers: 1,
     outlineTimeoutSeconds: 60,
     reasoningEffort: "medium",
     apiBaseUrl: "",
@@ -103,6 +130,13 @@ function App() {
     apiBaseUrlConfigured: false,
     apiKey: "",
     apiKeyConfigured: false,
+    imageModelName: "gpt-image-2",
+    imageUseTextApi: true,
+    imageApiBaseUrl: "",
+    imageApiBaseUrlMasked: "未单独配置，将复用文本请求地址",
+    imageApiBaseUrlConfigured: false,
+    imageApiKey: "",
+    imageApiKeyConfigured: false,
     preset: false
   });
   const [account, setAccount] = useState({
@@ -111,7 +145,7 @@ function App() {
     balanceLabel: "待配置",
     updatedAt: ""
   });
-  const [modelCatalog, setModelCatalog] = useState({ status: "idle", models: [], message: "" });
+  const [modelCatalog, setModelCatalog] = useState({ status: "idle", provider: "", models: [], message: "" });
   const [status, setStatus] = useState("idle");
   const [result, setResult] = useState(null);
   const [progress, setProgress] = useState(0);
@@ -133,10 +167,12 @@ function App() {
   const activeQueueTaskIdRef = useRef(activeQueueTaskId);
   const queueRunningRef = useRef(false);
 
-  const gptConfigured = Boolean(
-    (modelConfig.apiBaseUrlConfigured || modelConfig.apiBaseUrl.trim()) &&
-      (modelConfig.apiKey.trim() || (bridgeAvailable && modelConfig.apiKeyConfigured))
-  );
+  const gptConfigured =
+    form.modelPlan === "template" ||
+    Boolean(
+      (modelConfig.apiBaseUrlConfigured || modelConfig.apiBaseUrl.trim()) &&
+        (modelConfig.apiKey.trim() || (bridgeAvailable && modelConfig.apiKeyConfigured))
+    );
   const isGeneratingStatus = status === "running" || status === "planning";
   const currentPromptText = isGeneratingStatus ? inputText : inputText || form.name;
   const currentSoftwareName = extractSoftwareName(currentPromptText);
@@ -158,7 +194,14 @@ function App() {
       : cancelRequested
         ? "正在中止..."
         : "中止生成"
-    : primaryButtonLabel(status, outlineState, planReady, gptConfigured, canRetryFromConfirmedOutline);
+    : primaryButtonLabel(
+        status,
+        outlineState,
+        planReady,
+        gptConfigured,
+        canRetryFromConfirmedOutline,
+        form.blueprintReviewBeforeGeneration
+      );
   const hasOutlineError = canPlan && Boolean(configStatus) && configStatus !== "saved" && configStatus !== "saving";
   const taskStatusText = statusLabel(status, { canPlan, hasOutlineError });
   const generatedFiles = useMemo(() => buildGeneratedFiles(result), [result]);
@@ -194,7 +237,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [bridgeAvailable]);
+  }, [bridgeAvailable, form.modelPlan]);
 
   useEffect(() => {
     if (!bridgeAvailable) return undefined;
@@ -301,11 +344,15 @@ function App() {
     let cancelled = false;
     window.softCopyright.getModelConfig().then((config) => {
       if (cancelled || !config) return;
+      const plan = modelProviders.find((item) => item.value === config.mode) || modelProviders.find((item) => item.value === "gpt");
       setModelConfig({
-        mode: "gpt",
+        mode: plan.value,
+        textProvider: config.textProvider || "custom",
+        providerProfiles: config.providerProfiles || {},
         modelName: config.modelName || "gpt-5.5",
         outlineModelName: config.outlineModelName || config.modelName || "gpt-5.5",
         frontendModelName: config.frontendModelName || config.modelName || "gpt-5.5",
+        frontendWorkers: Number(config.frontendWorkers || 1),
         outlineTimeoutSeconds: Number(config.outlineTimeoutSeconds || 60),
         reasoningEffort: config.reasoningEffort || "medium",
         apiBaseUrl: "",
@@ -313,14 +360,22 @@ function App() {
         apiBaseUrlConfigured: Boolean(config.apiBaseUrlConfigured),
         apiKey: "",
         apiKeyConfigured: Boolean(config.apiKeyConfigured),
+        imageModelName: config.imageModelName || "gpt-image-2",
+        imageUseTextApi: config.imageUseTextApi !== false,
+        imageApiBaseUrl: "",
+        imageApiBaseUrlMasked:
+          config.imageApiBaseUrlMasked ||
+          (config.imageApiBaseUrlConfigured ? "已单独配置（地址已隐藏）" : "未单独配置，将复用文本请求地址"),
+        imageApiBaseUrlConfigured: Boolean(config.imageApiBaseUrlConfigured),
+        imageApiKey: "",
+        imageApiKeyConfigured: Boolean(config.imageApiKeyConfigured),
         preset: Boolean(config.preset)
       });
-      const plan = modelProviders[0];
       setForm((current) => ({
         ...current,
-        modelPlan: "gpt",
+        modelPlan: plan.value,
         modelProvider: plan.provider,
-        modelName: config.modelName || plan.modelName
+        modelName: plan.value === "gpt" ? config.modelName || plan.modelName : plan.modelName
       }));
     });
     return () => {
@@ -329,9 +384,9 @@ function App() {
   }, [bridgeAvailable]);
 
   useEffect(() => {
-    if (!settingsOpen || !bridgeAvailable || !window.softCopyright.listAvailableModels) return;
+    if (!settingsOpen || form.modelPlan !== "gpt" || !bridgeAvailable || !window.softCopyright.listAvailableModels) return;
     refreshAvailableModels();
-  }, [settingsOpen, bridgeAvailable]);
+  }, [settingsOpen, bridgeAvailable, form.modelPlan]);
 
   function updateField(key, value) {
     setResult(null);
@@ -362,57 +417,67 @@ function App() {
   async function inferBusinessPlan(payload, startedAt = Date.now()) {
     if (!payload.name.trim()) return null;
     const inferredProductType = inferProductType(payload.name, payload.featureHint || "");
+    const templateMode = form.modelPlan === "template";
     let featureHint = "";
     let meta = {};
-    if (!(modelConfig.apiBaseUrlConfigured || modelConfig.apiBaseUrl.trim())) {
-      setConfigStatus("请先配置 GPT 请求地址");
+    if (!templateMode && !(modelConfig.apiBaseUrlConfigured || modelConfig.apiBaseUrl.trim())) {
+      setConfigStatus("请先配置文本模型请求地址");
       setSettingsOpen(true);
       return null;
     }
-    if (!(modelConfig.apiKey.trim() || (bridgeAvailable && modelConfig.apiKeyConfigured))) {
-      setConfigStatus("请先配置 GPT API Key");
+    if (!templateMode && !(modelConfig.apiKey.trim() || (bridgeAvailable && modelConfig.apiKeyConfigured))) {
+      setConfigStatus("请先配置文本模型 API Key");
       setSettingsOpen(true);
       return null;
     }
     setStatus("planning");
     try {
-      const request =
-        bridgeAvailable && window.softCopyright.inferFeatureHint
-          ? window.softCopyright.inferFeatureHint({
-              ...payload,
-              productType: inferredProductType,
-              modelPlan: "gpt",
-              modelProvider: "custom",
-              modelName: modelConfig.outlineModelName || modelConfig.modelName,
-              timeoutSeconds: modelConfig.outlineTimeoutSeconds || 60
-            })
-          : inferFeatureHintThroughDevApi({
-              ...payload,
-              productType: inferredProductType,
-              modelName: modelConfig.outlineModelName || modelConfig.modelName,
-              timeoutSeconds: modelConfig.outlineTimeoutSeconds || 60,
-              apiBaseUrl: modelConfig.apiBaseUrl,
-              apiKey: modelConfig.apiKey
-            });
-      const outlineTimeoutMs = normalizeOutlineTimeout(modelConfig.outlineTimeoutSeconds || 60) * 1000 + OUTLINE_TIMEOUT_BUFFER_MS;
-      const response = await withTimeout(request, outlineTimeoutMs, "GPT 蓝图生成超时，请稍后重试或检查模型网关响应速度");
-      if (response?.cancelled) {
-        return { cancelled: true };
-      }
-      if (response?.ok && response.featureHint) {
-        featureHint = response.featureHint;
-        meta = response.meta || {};
+      if (templateMode) {
+        featureHint = [inferFeatureHint(payload.name, inferredProductType), payload.featureHint || ""].filter(Boolean).join("、");
+        meta = {
+          feature_hint_source: "local-template",
+          feature_hint_keywords: splitTerms(featureHint),
+          no_token_consumption: true
+        };
       } else {
-        const message = sanitizeErrorMessage(response?.message || response?.stderr || "GPT 蓝图生成失败，请检查接口配置");
-        setConfigStatus(message);
-        setEvents((current) => [...current, createProcessEvent("outline", 0, message, startedAt)]);
-        if (response?.meta?.requires_gpt_config) {
-          setSettingsOpen(true);
+        const request =
+          bridgeAvailable && window.softCopyright.inferFeatureHint
+            ? window.softCopyright.inferFeatureHint({
+                ...payload,
+                productType: inferredProductType,
+                modelPlan: "gpt",
+                modelProvider: "custom",
+                modelName: modelConfig.outlineModelName || modelConfig.modelName,
+                timeoutSeconds: modelConfig.outlineTimeoutSeconds || 60
+              })
+            : inferFeatureHintThroughDevApi({
+                ...payload,
+                productType: inferredProductType,
+                modelName: modelConfig.outlineModelName || modelConfig.modelName,
+                timeoutSeconds: modelConfig.outlineTimeoutSeconds || 60,
+                apiBaseUrl: modelConfig.apiBaseUrl,
+                apiKey: modelConfig.apiKey
+              });
+        const outlineTimeoutMs = normalizeOutlineTimeout(modelConfig.outlineTimeoutSeconds || 60) * 1000 + OUTLINE_TIMEOUT_BUFFER_MS;
+        const response = await withTimeout(request, outlineTimeoutMs, "GPT 蓝图生成超时，请稍后重试或检查模型网关响应速度");
+        if (response?.cancelled) {
+          return { cancelled: true };
         }
-        return null;
+        if (response?.ok && response.featureHint) {
+          featureHint = response.featureHint;
+          meta = response.meta || {};
+        } else {
+          const message = sanitizeErrorMessage(response?.message || response?.stderr || "GPT 蓝图生成失败，请检查服务配置");
+          setConfigStatus(message);
+          setEvents((current) => [...current, createProcessEvent("outline", 0, message, startedAt)]);
+          if (response?.meta?.requires_gpt_config) {
+            setSettingsOpen(true);
+          }
+          return null;
+        }
       }
     } catch (error) {
-      const message = sanitizeErrorMessage(error?.message || "GPT 蓝图生成失败，请检查接口配置");
+      const message = sanitizeErrorMessage(error?.message || "GPT 蓝图生成失败，请检查服务配置");
       setConfigStatus(message);
       setEvents((current) => [...current, createProcessEvent("outline", 0, message, startedAt)]);
       return null;
@@ -434,18 +499,19 @@ function App() {
     setProgress(6);
     setStatus("planning");
     setProcessClock({ mode: "outline", startedAt, elapsedMs: 0 });
+    const templateMode = form.modelPlan === "template";
     setEvents([createProcessEvent("outline", 6, `正在读取软件名称「${name}」和产品类型`, startedAt)]);
     await wait(180);
     setProgress(18);
     setEvents((current) => [
       ...current,
-      createProcessEvent("outline", 18, "正在构建两段式 GPT 蓝图请求，先识别名称语义，再生成模块草案", startedAt)
+      createProcessEvent("outline", 18, templateMode ? "正在使用本地规则构建零 token 模块草案" : "正在构建两段式 GPT 蓝图请求，先识别名称语义，再生成模块草案", startedAt)
     ]);
     await wait(180);
     setProgress(32);
     setEvents((current) => [
       ...current,
-      createProcessEvent("outline", 32, "正在调用 GPT 识别名称语义，随后会基于关键词生成可编辑模块", startedAt)
+      createProcessEvent("outline", 32, templateMode ? "Default Template 正在生成可编辑模块，不调用模型接口" : "正在调用 GPT 识别名称语义，随后会基于关键词生成可编辑模块", startedAt)
     ]);
     const response = await inferBusinessPlan({ ...form, name, featureHint: extractInputSupplement(promptText) }, startedAt);
     if (response?.cancelled) {
@@ -477,7 +543,7 @@ function App() {
       createProcessEvent(
         "outline",
         72,
-        `已收到 GPT 结构化结果，正在校验 ${response.plan.modules.length} 个模块的重复度和领域一致性`,
+        `${templateMode ? "已生成本地模板结果" : "已收到 GPT 结构化结果"}，正在校验 ${response.plan.modules.length} 个模块的重复度和领域一致性`,
         startedAt
       )
     ]);
@@ -485,7 +551,7 @@ function App() {
     setProgress(88);
     setEvents((current) => [
       ...current,
-      createProcessEvent("outline", 88, "正在整理为可编辑蓝图，保留 GPT 的分类、模块说明、流程和页面信息", startedAt)
+      createProcessEvent("outline", 88, templateMode ? "正在整理本地模板蓝图，确认本次不消耗 token" : "正在整理为可编辑蓝图，保留 GPT 的分类、模块说明、流程和页面信息", startedAt)
     ]);
     await wait(180);
     setFeatureHintMeta({ ...(response.meta || {}), _plannedAt: new Date().toLocaleTimeString() });
@@ -528,8 +594,26 @@ function App() {
   async function regenerateModule(moduleId) {
     const moduleIndex = businessPlan.modules.findIndex((module) => module.id === moduleId);
     if (moduleIndex < 0) return;
+    if (form.modelPlan === "template") {
+      const targetModule = businessPlan.modules[moduleIndex];
+      const next = {
+        ...businessPlan,
+        modules: businessPlan.modules.map((module, index) =>
+          module.id === moduleId ? regenerateModuleBlueprint(module, businessPlan, index) : module
+        )
+      };
+      setBusinessPlan(next);
+      setForm((formState) => ({ ...formState, featureHint: serializePlan(next) }));
+      setFeatureHintMeta((current) => ({ ...current, feature_hint_source: "local-template", no_token_consumption: true }));
+      setEvents((current) => [
+        ...current,
+        createProcessEvent("outline", 100, `已用本地规则刷新「${targetModule.title}」，未调用模型接口`)
+      ]);
+      setStatus("editing");
+      return;
+    }
     if (bridgeAvailable && !gptConfigured) {
-      setConfigStatus("请先配置 GPT 请求地址和 API Key");
+      setConfigStatus("请先选择文本模型供应商并配置 API Key");
       setSettingsOpen(true);
       return;
     }
@@ -688,18 +772,41 @@ function App() {
 
   function updateModelPlan(planValue) {
     const plan = modelProviders.find((item) => item.value === planValue) || modelProviders[0];
-    setModelConfig((current) => ({ ...current, mode: "gpt" }));
+    setModelConfig((current) => ({ ...current, mode: plan.value }));
     setForm((current) => ({
       ...current,
-      modelPlan: "gpt",
+      modelPlan: plan.value,
       modelProvider: plan.provider,
-      modelName: modelConfig.modelName || plan.modelName
+      modelName: plan.value === "gpt" ? modelConfig.modelName || plan.modelName : plan.modelName
     }));
+    setAccount(
+      plan.value === "template"
+        ? { status: "local", accountName: "Default Template", balanceLabel: "不消耗 token", updatedAt: "", message: "本地生成模式" }
+        : { status: "loading", accountName: "AI 账户", balanceLabel: "读取中", updatedAt: "", message: "" }
+    );
   }
 
   function updateModelConfig(key, value) {
     setConfigStatus("");
     setModelConfig((current) => {
+      if (key === "textProvider") {
+        const choice = textProviderChoices.find((item) => item.value === value) || textProviderChoices[0];
+        const savedProfile = current.providerProfiles?.[choice.value] || {};
+        const nextModel = savedProfile.modelName || choice.defaultModel;
+        return {
+          ...current,
+          textProvider: choice.value,
+          modelName: nextModel,
+          outlineModelName: savedProfile.outlineModelName || nextModel,
+          frontendModelName: savedProfile.frontendModelName || nextModel,
+          apiBaseUrl: "",
+          apiBaseUrlMasked: choice.addressMode === "preset" ? "官方预设（地址已隐藏）" : savedProfile.baseUrlConfigured ? "已配置（地址已隐藏）" : "未配置",
+          apiBaseUrlConfigured: choice.addressMode === "preset" || Boolean(savedProfile.baseUrlConfigured),
+          apiKey: "",
+          apiKeyConfigured: Boolean(savedProfile.apiKeyConfigured),
+          imageUseTextApi: choice.value === "custom" ? current.imageUseTextApi : false
+        };
+      }
       const nextValue = key === "outlineTimeoutSeconds" ? normalizeOutlineTimeout(value) : value;
       const next = { ...current, [key]: nextValue };
       if (key === "modelName" && (!current.outlineModelName || current.outlineModelName === current.modelName)) {
@@ -713,87 +820,149 @@ function App() {
     if (key === "modelName") {
       setForm((current) => ({ ...current, modelName: value }));
     }
+    if (key === "textProvider") {
+      const choice = textProviderChoices.find((item) => item.value === value) || textProviderChoices[0];
+      setForm((current) => ({ ...current, modelName: choice.defaultModel }));
+      setModelCatalog({ status: "idle", provider: choice.value, models: [], message: "保存供应商配置后可刷新该供应商的模型列表。" });
+    }
   }
 
   async function saveModelConfig() {
+    const separateImageApiReady =
+      modelConfig.imageUseTextApi ||
+      (Boolean(modelConfig.imageApiBaseUrlConfigured || modelConfig.imageApiBaseUrl.trim()) &&
+        Boolean(modelConfig.imageApiKeyConfigured || modelConfig.imageApiKey.trim()));
     if (!bridgeAvailable || !window.softCopyright.saveModelConfig) {
-      if ((!modelConfig.apiBaseUrlConfigured && !modelConfig.apiBaseUrl.trim()) || (!modelConfig.apiKeyConfigured && !modelConfig.apiKey.trim())) {
-        setConfigStatus("请填写 GPT 请求地址和 API Key");
+      if (modelConfig.mode === "gpt" && ((!modelConfig.apiBaseUrlConfigured && !modelConfig.apiBaseUrl.trim()) || (!modelConfig.apiKeyConfigured && !modelConfig.apiKey.trim()))) {
+        setConfigStatus("请填写文本模型请求地址和 API Key");
+        return;
+      }
+      if (modelConfig.mode === "gpt" && !separateImageApiReady) {
+        setConfigStatus("请填写独立图片 API 请求地址和 API Key，或选择复用文本 API");
         return;
       }
       setModelConfig((current) => ({
         ...current,
-        mode: "gpt",
+        mode: current.mode === "template" ? "template" : "gpt",
         apiBaseUrlMasked: current.apiBaseUrl.trim() ? "已配置（地址已隐藏）" : current.apiBaseUrlMasked,
         apiBaseUrlConfigured: Boolean(current.apiBaseUrlConfigured || current.apiBaseUrl.trim()),
-        apiKeyConfigured: Boolean(current.apiKeyConfigured || current.apiKey.trim())
+        apiKeyConfigured: Boolean(current.apiKeyConfigured || current.apiKey.trim()),
+        imageApiBaseUrlMasked: current.imageUseTextApi
+          ? "未单独配置，将复用文本请求地址"
+          : current.imageApiBaseUrl.trim()
+            ? "已单独配置（地址已隐藏）"
+            : current.imageApiBaseUrlMasked,
+        imageApiBaseUrlConfigured: current.imageUseTextApi
+          ? false
+          : Boolean(current.imageApiBaseUrlConfigured || current.imageApiBaseUrl.trim()),
+        imageApiKeyConfigured: current.imageUseTextApi
+          ? false
+          : Boolean(current.imageApiKeyConfigured || current.imageApiKey.trim())
       }));
       setConfigStatus("saved");
       return;
     }
     setConfigStatus("saving");
     const response = await window.softCopyright.saveModelConfig({
-      mode: "gpt",
+      mode: modelConfig.mode,
+      textProvider: modelConfig.textProvider || "custom",
       modelName: modelConfig.modelName,
       outlineModelName: modelConfig.outlineModelName || modelConfig.modelName,
       frontendModelName: modelConfig.frontendModelName || modelConfig.modelName,
+      frontendWorkers: modelConfig.frontendWorkers || 1,
       outlineTimeoutSeconds: modelConfig.outlineTimeoutSeconds || 60,
       reasoningEffort: modelConfig.reasoningEffort || "medium",
       apiBaseUrl: modelConfig.apiBaseUrl,
-      apiKey: modelConfig.apiKey
+      apiKey: modelConfig.apiKey,
+      imageModelName: modelConfig.imageModelName || "gpt-image-2",
+      imageUseTextApi: modelConfig.imageUseTextApi,
+      imageApiBaseUrl: modelConfig.imageApiBaseUrl,
+      imageApiKey: modelConfig.imageApiKey
     });
     if (!response?.ok) {
       setConfigStatus(response?.message || "保存失败");
       return;
     }
     setConfigStatus("saved");
-    const plan = modelProviders[0];
+    const plan = modelProviders.find((item) => item.value === response.mode) || modelProviders.find((item) => item.value === "gpt");
     setForm((current) => ({
       ...current,
-      modelPlan: "gpt",
+      modelPlan: plan.value,
       modelProvider: plan.provider,
-      modelName: response.modelName || plan.modelName
+      modelName: plan.value === "gpt" ? response.modelName || plan.modelName : plan.modelName
     }));
     setModelConfig((current) => ({
       ...current,
-      mode: "gpt",
+      mode: plan.value,
+      textProvider: response.textProvider || current.textProvider || "custom",
+      providerProfiles: response.providerProfiles || current.providerProfiles || {},
       modelName: response.modelName || current.modelName,
       outlineModelName: response.outlineModelName || current.outlineModelName || response.modelName || current.modelName,
       frontendModelName: response.frontendModelName || current.frontendModelName || response.modelName || current.modelName,
+      frontendWorkers: Number(response.frontendWorkers || current.frontendWorkers || 1),
       outlineTimeoutSeconds: Number(response.outlineTimeoutSeconds || current.outlineTimeoutSeconds || 60),
       reasoningEffort: response.reasoningEffort || current.reasoningEffort || "medium",
       apiBaseUrl: "",
       apiBaseUrlMasked: response.apiBaseUrlMasked || (response.apiBaseUrlConfigured ? "已配置（地址已隐藏）" : "未配置"),
       apiBaseUrlConfigured: Boolean(response.apiBaseUrlConfigured),
       apiKey: "",
-      apiKeyConfigured: Boolean(response.apiKeyConfigured)
+      apiKeyConfigured: Boolean(response.apiKeyConfigured),
+      imageModelName: response.imageModelName || current.imageModelName || "gpt-image-2",
+      imageUseTextApi: response.imageUseTextApi !== false,
+      imageApiBaseUrl: "",
+      imageApiBaseUrlMasked:
+        response.imageApiBaseUrlMasked ||
+        (response.imageApiBaseUrlConfigured ? "已单独配置（地址已隐藏）" : "未单独配置，将复用文本请求地址"),
+      imageApiBaseUrlConfigured: Boolean(response.imageApiBaseUrlConfigured),
+      imageApiKey: "",
+      imageApiKeyConfigured: Boolean(response.imageApiKeyConfigured)
     }));
     await refreshModelAccount();
-    await refreshAvailableModels();
+    if (plan.value === "gpt") await refreshAvailableModels(response.textProvider || modelConfig.textProvider || "custom");
   }
 
-  async function refreshAvailableModels() {
-    if (!bridgeAvailable || !window.softCopyright.listAvailableModels) {
-      setModelCatalog({ status: "unavailable", models: [], message: "当前环境不支持自动拉取模型" });
+  async function refreshAvailableModels(providerOverride = "") {
+    const requestedProvider = providerOverride || modelConfig.textProvider || "custom";
+    if (form.modelPlan !== "gpt") {
+      setModelCatalog({ status: "idle", provider: requestedProvider, models: [], message: "Default Template 使用本地规则，不读取模型目录" });
       return null;
     }
-    setModelCatalog((current) => ({ ...current, status: "loading", message: "" }));
+    if (!bridgeAvailable || !window.softCopyright.listAvailableModels) {
+      setModelCatalog({ status: "unavailable", provider: requestedProvider, models: [], message: "当前环境不支持自动拉取模型" });
+      return null;
+    }
+    setModelCatalog({ status: "loading", provider: requestedProvider, models: [], message: "" });
     try {
       const response = await window.softCopyright.listAvailableModels();
       const models = Array.isArray(response?.models) ? response.models.filter(Boolean) : [];
       if (!response?.ok) {
-        setModelCatalog({ status: "error", models: [], message: response?.message || "模型列表拉取失败" });
+        setModelCatalog((current) => current.provider === requestedProvider
+          ? { status: "error", provider: requestedProvider, models: [], message: response?.message || "模型列表拉取失败" }
+          : current);
         return response;
       }
-      setModelCatalog({ status: "loaded", models, message: `已从当前请求地址读取 ${models.length} 个模型` });
+      setModelCatalog((current) => current.provider === requestedProvider
+        ? { status: "loaded", provider: requestedProvider, models, message: `已读取 ${models.length} 个可用模型` }
+        : current);
       return response;
     } catch (error) {
-      setModelCatalog({ status: "error", models: [], message: sanitizeErrorMessage(error?.message || "模型列表拉取失败") });
+      setModelCatalog((current) => current.provider === requestedProvider
+        ? { status: "error", provider: requestedProvider, models: [], message: sanitizeErrorMessage(error?.message || "模型列表拉取失败") }
+        : current);
       return null;
     }
   }
 
   async function fetchModelAccount() {
+    if (form.modelPlan === "template") {
+      return {
+        status: "local",
+        accountName: "Default Template",
+        balanceLabel: "不消耗 token",
+        updatedAt: "",
+        message: "本地生成模式"
+      };
+    }
     if (!bridgeAvailable || !window.softCopyright.getModelAccount) return null;
     try {
       return await window.softCopyright.getModelAccount();
@@ -895,7 +1064,7 @@ function App() {
   function enqueueCurrentGeneration(overrides = {}, submitMessage = "已加入生成队列", options = {}) {
     if (!options.force && !canGenerate) return false;
     if (!gptConfigured) {
-      setConfigStatus("请先配置 GPT 请求地址和 API Key");
+      setConfigStatus("请先选择文本模型供应商并配置 API Key");
       setSettingsOpen(true);
       return false;
     }
@@ -908,12 +1077,12 @@ function App() {
     return true;
   }
 
-  function enqueueQuickTask() {
-    const promptText = inputText.trim();
+  function enqueueQuickTask(promptOverride = "") {
+    const promptText = String(promptOverride || inputText).trim();
     const name = extractSoftwareName(promptText);
     if (!name) return;
     if (!gptConfigured) {
-      setConfigStatus("请先配置 GPT 请求地址和 API Key");
+      setConfigStatus("请先选择文本模型供应商并配置 API Key");
       setSettingsOpen(true);
       return;
     }
@@ -1149,7 +1318,7 @@ function App() {
           return;
         }
         if (!outlineResponse?.plan?.modules?.length) {
-          throw new Error(configStatus || "队列任务蓝图生成失败，请检查 GPT 配置或稍后重试");
+          throw new Error(configStatus || "队列任务蓝图生成失败，请检查文本模型配置或稍后重试");
         }
         planSnapshot = clonePlainObject(outlineResponse.plan);
         formSnapshot = {
@@ -1417,7 +1586,7 @@ function App() {
     }
     if (!canPrimaryAction) return;
     if (!gptConfigured) {
-      setConfigStatus("请先配置 GPT 请求地址和 API Key");
+      setConfigStatus("请先选择文本模型供应商并配置 API Key");
       setSettingsOpen(true);
       return;
     }
@@ -1426,7 +1595,11 @@ function App() {
       return;
     }
     if (outlineState !== "draft" && outlineState !== "confirmed") {
-      await regeneratePlan();
+      if (form.blueprintReviewBeforeGeneration) {
+        await regeneratePlan();
+      } else {
+        enqueueQuickTask(currentPromptText);
+      }
       return;
     }
     if (outlineState === "draft") {
@@ -1612,7 +1785,7 @@ function App() {
               <span className="prompt-caption-icon">{isGeneratingStatus ? <Plus size={16} /> : <FileText size={16} />}</span>
               <div>
                 <strong>{isGeneratingStatus ? "继续添加任务" : "创建软著材料任务"}</strong>
-                <small>{isGeneratingStatus ? "当前任务生成期间，新任务会进入顺序队列" : "输入软件名称，也可以补充行业、功能或界面要求"}</small>
+                <small>{isGeneratingStatus ? "当前任务生成期间，新任务会进入顺序队列" : "只需输入软件名称，系统会自动规划并生成完整材料包"}</small>
               </div>
             </div>
             <div className="prompt-row">
@@ -1729,17 +1902,20 @@ function TaskTranscript({
         onDeleteRecoverableTask={onDeleteRecoverableTask}
       />
 
-      {(status === "planning" || status === "editing" || status === "idle") && (
+      {(status === "planning" || status === "editing" || status === "idle") &&
+        (form.blueprintReviewBeforeGeneration || status === "planning" || planReady) && (
         <section className="work-section editor-section">
           <div className="section-toolbar">
             <div>
               <strong>详细蓝图</strong>
               <span>
                 {status === "planning" && elapsedLabel
-                  ? `GPT 生成中 · ${elapsedLabel}`
+                  ? `AI 生成中 · ${elapsedLabel}`
                   : planReady
                     ? `${businessPlan.modules.length} 个模块 · ${outlineStatusLabel(outlineState, planReady)}`
-                    : "点击生成蓝图后开始生成"}
+                    : form.blueprintReviewBeforeGeneration
+                      ? "点击生成蓝图后开始审阅"
+                      : "系统会自动规划后直接生成材料"}
               </span>
             </div>
             <button type="button" onClick={onRegeneratePlan} disabled={!canPlan || status === "planning"}>
@@ -1766,14 +1942,18 @@ function TaskTranscript({
                 {canPlan && configStatus && configStatus !== "saved" && configStatus !== "saving"
                   ? "蓝图生成未完成"
                   : canPlan
-                    ? "等待生成蓝图"
+                    ? form.blueprintReviewBeforeGeneration
+                      ? "等待生成蓝图"
+                      : "等待开始生成"
                     : "等待输入软件名称"}
               </strong>
               <p>
                 {canPlan && configStatus && configStatus !== "saved" && configStatus !== "saving"
                   ? configStatus
                   : canPlan
-                    ? "点击底部“生成蓝图”后，这里会显示生成进度和可编辑的详细蓝图。"
+                    ? form.blueprintReviewBeforeGeneration
+                      ? "点击底部“生成蓝图”后，这里会显示生成进度和可编辑的详细蓝图。"
+                      : "点击底部“开始生成”后，系统会自动完成规划、确认和材料生成。"
                     : "输入软件名称后，点击底部按钮生成详细蓝图。"}
               </p>
               <div className="empty-feature-list">
@@ -1826,7 +2006,7 @@ function TaskTranscript({
                 {canRetryGenerate ? (
                   <small>已保留当前确认的蓝图，重试会直接复用蓝图并继续生成材料包。</small>
                 ) : (
-                  <small>请先返回蓝图检查软件名称、模块和 GPT 配置，再重新提交。</small>
+                  <small>请先返回蓝图检查软件名称、模块和文本模型配置，再重新提交。</small>
                 )}
               </div>
             </div>
@@ -2323,9 +2503,11 @@ function SettingsDrawer({
   onRefreshAccount,
   onRefreshModels
 }) {
-  const catalogModels = modelCatalog.models.length
+  const selectedTextProvider = textProviderChoices.find((item) => item.value === modelConfig.textProvider) || textProviderChoices[0];
+  const providerFallbackModels = providerModelChoices[selectedTextProvider.value] || [selectedTextProvider.defaultModel];
+  const catalogModels = modelCatalog.provider === selectedTextProvider.value && modelCatalog.models.length
     ? modelCatalog.models
-    : [...new Set([modelConfig.modelName, modelConfig.outlineModelName, modelConfig.frontendModelName, ...modelChoices].filter(Boolean))];
+    : [...new Set([modelConfig.modelName, modelConfig.outlineModelName, modelConfig.frontendModelName, ...providerFallbackModels].filter(Boolean))];
   return (
     <div
       className={`drawer-backdrop ${open ? "open" : ""}`}
@@ -2366,7 +2548,7 @@ function SettingsDrawer({
           </div>
         </section>
         <section>
-          <SettingsSectionHeading icon={<Sparkles size={17} />} title="GPT 配置" description="账户连接和生成模式" />
+          <SettingsSectionHeading icon={<Sparkles size={17} />} title="AI 配置" description="账户连接和生成模式" />
           <div className="model-option-grid">
             {modelProviders.map((item) => (
               <button
@@ -2399,12 +2581,31 @@ function SettingsDrawer({
           <SettingsSectionHeading icon={<Code2 size={17} />} title="模型配置" description="模型目录、推理强度与认证信息" />
           <div className="drawer-grid">
             <label>
+              <span>文本 API 供应商</span>
+              <select
+                value={modelConfig.textProvider || "custom"}
+                onChange={(event) => onUpdateModelConfig("textProvider", event.target.value)}
+              >
+                {textProviderChoices.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+              </select>
+            </label>
+            <label>
               <span>正式生成模型</span>
               <select
                 value={modelConfig.modelName}
                 onChange={(event) => onUpdateModelConfig("modelName", event.target.value)}
               >
                 {catalogModels.map((model) => <option key={model} value={model}>{model}</option>)}
+              </select>
+            </label>
+            <label>
+              <span>蓝图处理方式</span>
+              <select
+                value={form.blueprintReviewBeforeGeneration ? "review" : "auto"}
+                onChange={(event) => onUpdateField("blueprintReviewBeforeGeneration", event.target.value === "review")}
+              >
+                <option value="auto">自动确认并直接生成（推荐）</option>
+                <option value="review">生成后先人工审阅</option>
               </select>
             </label>
             <label>
@@ -2439,6 +2640,17 @@ function SettingsDrawer({
               </select>
             </label>
             <label>
+              <span>界面并发数</span>
+              <select
+                value={String(modelConfig.frontendWorkers || 1)}
+                onChange={(event) => onUpdateModelConfig("frontendWorkers", Number(event.target.value))}
+              >
+                <option value="1">1（最稳）</option>
+                <option value="2">2（推荐，更快）</option>
+                <option value="3">3（需要较高限流额度）</option>
+              </select>
+            </label>
+            <label>
               <span>蓝图超时秒数</span>
               <input
                 type="number"
@@ -2451,21 +2663,28 @@ function SettingsDrawer({
             <label>
               <span>请求地址状态</span>
               <input
-                value={modelConfig.apiBaseUrlMasked || (modelConfig.apiBaseUrlConfigured ? "已配置（地址已隐藏）" : "未配置")}
+                value={selectedTextProvider.addressMode === "preset" ? "官方预设（地址已隐藏）" : modelConfig.apiBaseUrlMasked || (modelConfig.apiBaseUrlConfigured ? "已配置（地址已隐藏）" : "未配置")}
                 readOnly
                 aria-label="请求地址配置状态"
               />
             </label>
-            <label>
-              <span>更换请求地址（留空则保持不变）</span>
-              <input
-                type="password"
-                value={modelConfig.apiBaseUrl}
-                onChange={(event) => onUpdateModelConfig("apiBaseUrl", event.target.value)}
-                placeholder={modelConfig.apiBaseUrlConfigured ? "已配置，输入新地址可替换" : "请输入 OpenAI 兼容请求地址"}
-                autoComplete="off"
-              />
-            </label>
+            {selectedTextProvider.addressMode === "custom" ? (
+              <label>
+                <span>更换请求地址（留空则保持不变）</span>
+                <input
+                  type="password"
+                  value={modelConfig.apiBaseUrl}
+                  onChange={(event) => onUpdateModelConfig("apiBaseUrl", event.target.value)}
+                  placeholder={modelConfig.apiBaseUrlConfigured ? "已配置，输入新地址可替换" : "请输入 OpenAI 兼容请求地址"}
+                  autoComplete="off"
+                />
+              </label>
+            ) : (
+              <label>
+                <span>供应商接口</span>
+                <input value={`${selectedTextProvider.label} 官方接口`} readOnly />
+              </label>
+            )}
             <label className="full">
               <span>自定义模型 ID（列表中没有时填写）</span>
               <input
@@ -2475,7 +2694,7 @@ function SettingsDrawer({
               />
             </label>
             <label className="full">
-              <span>更换 API Key（留空则保持不变）</span>
+              <span>{modelConfig.apiKeyConfigured ? "更换 API Key（留空则保持不变）" : `填写 ${selectedTextProvider.label} API Key`}</span>
               <input
                 type="password"
                 value={modelConfig.apiKey}
@@ -2488,13 +2707,75 @@ function SettingsDrawer({
           <div className={`model-catalog-status ${modelCatalog.status || "idle"}`}>
             <small>
               {modelCatalog.status === "loading"
-                ? "正在从当前请求地址读取模型列表…"
-                : modelCatalog.message || "打开高级设置或保存新地址后，会自动读取模型列表；也可以手动填写模型 ID。"}
+                ? "正在读取模型列表…"
+                : modelCatalog.message || "打开高级设置后会自动读取模型列表；也可以手动填写模型 ID。"}
             </small>
-            <button type="button" onClick={onRefreshModels} disabled={!bridgeAvailable || modelCatalog.status === "loading"}>
+            <button type="button" onClick={() => onRefreshModels()} disabled={!bridgeAvailable || modelCatalog.status === "loading"}>
               {modelCatalog.status === "loading" ? <Loader2 size={14} /> : <RefreshCw size={14} />}
               <span>刷新模型</span>
             </button>
+          </div>
+        </section>
+        <section>
+          <SettingsSectionHeading icon={<ImageIcon size={17} />} title="图片模型 API" description="为视觉参考图单独指定图片模型服务" />
+          <div className="drawer-grid">
+            <label>
+              <span>图片接口来源</span>
+              <select
+                value={modelConfig.imageUseTextApi ? "text" : "separate"}
+                onChange={(event) => onUpdateModelConfig("imageUseTextApi", event.target.value === "text")}
+              >
+                <option value="text">复用文本 API</option>
+                <option value="separate">使用独立图片 API</option>
+              </select>
+            </label>
+            <label>
+              <span>图片模型 ID</span>
+              <input
+                value={modelConfig.imageModelName || ""}
+                onChange={(event) => onUpdateModelConfig("imageModelName", event.target.value)}
+                placeholder="例如 gpt-image-2"
+              />
+            </label>
+            {!modelConfig.imageUseTextApi ? (
+              <>
+                <label>
+                  <span>图片请求地址状态</span>
+                  <input
+                    value={modelConfig.imageApiBaseUrlMasked || (modelConfig.imageApiBaseUrlConfigured ? "已单独配置（地址已隐藏）" : "未配置")}
+                    readOnly
+                    aria-label="图片请求地址配置状态"
+                  />
+                </label>
+                <label>
+                  <span>更换图片请求地址（留空则保持不变）</span>
+                  <input
+                    type="password"
+                    value={modelConfig.imageApiBaseUrl}
+                    onChange={(event) => onUpdateModelConfig("imageApiBaseUrl", event.target.value)}
+                    placeholder={modelConfig.imageApiBaseUrlConfigured ? "已配置，输入新地址可替换" : "请输入图片生成 API 地址"}
+                    autoComplete="off"
+                  />
+                </label>
+                <label className="full">
+                  <span>更换图片 API Key（留空则保持不变）</span>
+                  <input
+                    type="password"
+                    value={modelConfig.imageApiKey}
+                    onChange={(event) => onUpdateModelConfig("imageApiKey", event.target.value)}
+                    placeholder={modelConfig.imageApiKeyConfigured ? "已配置，输入新密钥可替换" : "请输入图片 API Key"}
+                    autoComplete="new-password"
+                  />
+                </label>
+              </>
+            ) : null}
+          </div>
+          <div className="model-catalog-status">
+            <small>
+              {modelConfig.imageUseTextApi
+                ? `图片阶段将使用文本 API 的地址和 Key，并请求 ${modelConfig.imageModelName || "gpt-image-2"}。`
+                : "独立图片地址和 API Key 保存后不会回显；模型目录没有列出图片模型时，可直接填写供应商提供的模型 ID。"}
+            </small>
           </div>
         </section>
         </div>
@@ -2507,7 +2788,10 @@ function SettingsDrawer({
               configStatus === "saving" ||
               (modelConfig.mode === "gpt" &&
                 ((!modelConfig.apiBaseUrl.trim() && !(bridgeAvailable && modelConfig.apiBaseUrlConfigured)) ||
-                  (!modelConfig.apiKey.trim() && !(bridgeAvailable && modelConfig.apiKeyConfigured))))
+                  (!modelConfig.apiKey.trim() && !(bridgeAvailable && modelConfig.apiKeyConfigured)) ||
+                  (!modelConfig.imageUseTextApi &&
+                    ((!modelConfig.imageApiBaseUrl.trim() && !(bridgeAvailable && modelConfig.imageApiBaseUrlConfigured)) ||
+                      (!modelConfig.imageApiKey.trim() && !(bridgeAvailable && modelConfig.imageApiKeyConfigured))))))
             }
           >
             {configStatus === "saving" ? <Loader2 size={16} /> : <Save size={16} />}
@@ -2518,7 +2802,9 @@ function SettingsDrawer({
               ? "模型配置已保存"
               : configStatus === "saving"
                 ? "正在写入本地配置"
-                : "模型和推理强度可直接调整；请求地址与 API Key 只接受新值，不回显已保存内容，留空会保持原配置。"}
+                : modelConfig.mode === "template"
+                  ? "Default Template 使用本地规则生成，不调用模型接口，不消耗 token。"
+                  : "各文本供应商的 API Key 独立保存且不回显；图片模型仍可使用独立的 gpt-image-2 API。"}
           </small>
         </div>
       </aside>
@@ -2575,19 +2861,8 @@ function sanitizeResult(result) {
 
 function resultFromGenerationEvent(event) {
   if (!event || !["done", "error", "cancelled"].includes(String(event.stage || ""))) return null;
-  if (event.result && typeof event.result === "object") {
-    return sanitizeResult(event.result);
-  }
-  return sanitizeResult({
-    ok: event.stage === "done",
-    cancelled: event.stage === "cancelled",
-    zipPath: event.zip_path || event.zipPath || "",
-    outputDir: event.output_dir || event.outputDir || "",
-    checks: event.checks || {},
-    warnings: event.warnings || [],
-    stdout: "",
-    stderr: event.stage === "done" ? "" : event.message || "材料生成失败"
-  });
+  if (!event.result || typeof event.result !== "object") return null;
+  return sanitizeResult(event.result);
 }
 
 function seedFromOutputDir(outputDir) {
@@ -2707,6 +2982,7 @@ function compactQueueTaskForStorage(task) {
 }
 
 function compactFormSnapshot(formSnapshot) {
+  const templateMode = formSnapshot.modelPlan === "template";
   return {
     name: formSnapshot.name || "",
     version: formSnapshot.version || "V1.0",
@@ -2714,9 +2990,9 @@ function compactFormSnapshot(formSnapshot) {
     productType: formSnapshot.productType || "APP",
     softwareCategory: formSnapshot.softwareCategory || "应用软件",
     featureHint: formSnapshot.featureHint || "",
-    modelPlan: "gpt",
-    modelProvider: "custom",
-    modelName: formSnapshot.modelName || "gpt-5.5",
+    modelPlan: templateMode ? "template" : "gpt",
+    modelProvider: templateMode ? "local-template" : "custom",
+    modelName: templateMode ? "template-v1" : formSnapshot.modelName || "gpt-5.5",
     randomness: formSnapshot.randomness || "standard"
   };
 }
@@ -2882,6 +3158,11 @@ function buildBusinessPlan(name, productType, featureHint, meta = {}) {
         dataObjects: module.dataObjects,
         userFlow: module.userFlow,
         screens: module.screens,
+        operations: module.operations,
+        operationSpecs: module.operationSpecs,
+        dataFields: module.dataFields,
+        rules: module.rules,
+        entities: module.entities,
         children: buildChildren(module.title)
       }))
     : (keywords.length ? keywords : splitTerms(featureHint)).slice(0, 10).map((keyword, index) => ({
@@ -2930,10 +3211,37 @@ function normalizeBlueprintModule(item) {
     userFlow: normalizeDetailList(item.user_flow || item.userFlow || item.flow || item.steps, 6),
     screens: normalizeDetailList(item.screens || item.pages, 5),
     operations: normalizeDetailList(item.operations || item.actions, 7),
+    operationSpecs: normalizeOperationSpecs(item.operation_specs || item.operationSpecs),
     dataFields: normalizeDetailList(item.data_fields || item.dataFields || item.fields, 10),
     rules: normalizeDetailList(item.rules || item.quality_rules || item.qualityRules, 5),
     entities: normalizeDetailList(item.entities, 4)
   };
+}
+
+function normalizeOperationSpecs(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const label = String(item.label || item.action || item.name || "").trim();
+      if (!label) return null;
+      return {
+        actionKey: String(item.action_key || item.actionKey || "").trim(),
+        label,
+        category: String(item.category || "").trim(),
+        role: String(item.role || "").trim(),
+        trigger: String(item.trigger || "").trim(),
+        inputFields: normalizeDetailList(item.input_fields || item.inputFields, 8),
+        preState: String(item.pre_state || item.preState || "").trim(),
+        postState: String(item.post_state || item.postState || "").trim(),
+        resultEvidence: String(item.result_evidence || item.resultEvidence || "").trim(),
+        requiresConfirmation: Boolean(
+          item.requires_confirmation !== undefined ? item.requires_confirmation : item.requiresConfirmation
+        )
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 7);
 }
 
 function normalizeDetailList(value, maxCount) {
@@ -3150,20 +3458,26 @@ function outlineStatusLabel(outlineState, planReady) {
 }
 
 function workflowStageIndex(status, outlineState, planReady) {
-  if (status === "success") return 4;
-  if (["running", "error", "cancelled"].includes(status)) return 3;
-  if (outlineState === "draft" || outlineState === "confirmed" || status === "editing") return 2;
-  if (status === "planning" || planReady) return 1;
+  if (status === "success") return 3;
+  if (["running", "error", "cancelled"].includes(status)) return 2;
+  if (status === "planning" || planReady || outlineState === "draft" || outlineState === "confirmed" || status === "editing") return 1;
   return 0;
 }
 
-function primaryButtonLabel(status, outlineState, planReady, gptConfigured, canRetryFromConfirmedOutline = false) {
+function primaryButtonLabel(
+  status,
+  outlineState,
+  planReady,
+  gptConfigured,
+  canRetryFromConfirmedOutline = false,
+  blueprintReviewBeforeGeneration = false
+) {
   if (status === "running") return "生成中";
-  if (status === "planning") return "生成蓝图中";
+  if (status === "planning") return "自动规划中";
   if (canRetryFromConfirmedOutline) return "保留蓝图重试";
-  if (!gptConfigured) return "配置 GPT";
-  if (!planReady || outlineState === "empty") return "生成蓝图";
-  if (outlineState === "draft") return "确认并加入队列";
+  if (!gptConfigured) return "配置 AI";
+  if (!planReady || outlineState === "empty") return blueprintReviewBeforeGeneration ? "生成蓝图" : "开始生成";
+  if (outlineState === "draft") return "确认并开始生成";
   return "加入生成队列";
 }
 
@@ -3643,10 +3957,11 @@ function qualityIcon(state) {
 }
 
 function balanceHint(account) {
+  if (account.status === "local") return account.message || "本地生成模式，不消耗 token";
   if (account.status === "connected") return account.updatedAt ? `更新于 ${account.updatedAt}` : "模型账户可用";
-  if (account.status === "unconfigured") return account.message || "请先配置 GPT 请求地址和 API Key";
+  if (account.status === "unconfigured") return account.message || "请先选择文本模型供应商并配置 API Key";
   if (account.status === "error") return account.message || "账户接口异常";
-  return "保存 GPT 配置后可读取账户状态";
+  return "保存文本模型配置后可读取账户状态";
 }
 
 function inferFeatureHint(name, productType = "") {

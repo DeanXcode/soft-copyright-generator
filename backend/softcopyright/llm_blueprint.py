@@ -699,7 +699,11 @@ def _is_reading_audio_like_text(text: str) -> bool:
 
 
 def _is_consumer_app_text(text: str) -> bool:
-    if "APP" in text.upper() and not any(term in text for term in ["后台", "管理系统", "OA", "ERP", "CRM"]):
+    admin_terms = [
+        "后台", "管理系统", "平台", "OA", "ERP", "CRM", "客服", "工单", "派单", "协同",
+        "调度", "投诉", "回访", "SLA", "审计", "审批", "运营工作台",
+    ]
+    if "APP" in text.upper() and not any(term in text for term in admin_terms):
         return True
     if any(
         term in text
@@ -961,6 +965,11 @@ _ADMIN_TERMINAL_REPLACEMENTS = (
     ("移动APP", "工业生产运营工作台"),
     ("手机 App", "工业生产运营工作台"),
     ("手机APP", "工业生产运营工作台"),
+    ("移动端", "桌面工作台"),
+    ("手机端", "桌面工作台"),
+    ("会员状态", "客户服务状态"),
+    ("会员权益", "客户服务权益"),
+    ("底部导航", "侧边导航"),
     ("首页推荐", "首页预警"),
     ("推荐提醒", "预警提醒"),
     ("个人中心", "权限与审计中心"),
@@ -992,6 +1001,16 @@ def _normalize_plan_terminal_semantics(task: GenerationTask, value: Any) -> Any:
     for source, target in _ADMIN_TERMINAL_REPLACEMENTS:
         text = text.replace(source, target)
     return text
+
+
+def normalize_cached_blueprint_candidate(task: GenerationTask, blueprint: ProductBlueprint) -> ProductBlueprint:
+    """Apply current semantic gates to a cached LLM candidate without another model call."""
+    normalized_data = _normalize_plan_terminal_semantics(task, blueprint.to_dict())
+    normalized = _blueprint_from_data(task, normalized_data)
+    normalized.quality_score = _quality_review(task, normalized)[0]
+    if getattr(blueprint, "technical_architecture", None):
+        normalized.technical_architecture = dict(blueprint.technical_architecture)
+    return normalized
 
 
 def _expected_plan_terminal(task: GenerationTask) -> str:
@@ -1820,7 +1839,12 @@ def _clean_workflows(value: Any) -> list[dict[str, list[str] | str]]:
     for index, item in enumerate(value[:5], start=1):
         if not isinstance(item, dict):
             continue
-        steps = _clean_list(item.get("steps"), 7, 80)
+        steps = [
+            f"{step}，系统记录处理结果。"
+            if len(step) == 32 and not re.search(r"[。；：!?！？]$", step)
+            else step
+            for step in _clean_list(item.get("steps"), 7, 80)
+        ]
         if len(steps) < 3:
             steps = ["创建记录", "字段校验", "提交处理", "生成结果"]
         workflows.append(
@@ -1943,10 +1967,32 @@ def blueprint_contract_issues(task: GenerationTask, blueprint: ProductBlueprint)
     repeated = [
         label
         for label, module_keys in repeated_actions.items()
-        if label not in {"查询", "搜索", "筛选", "查看详情"} and len(module_keys) >= repeated_floor
+        if label not in {"查询", "搜索", "筛选", "查看详情", "查询{对象}", "搜索{对象}", "筛选{对象}"}
+        and not re.fullmatch(r"(?:登记|校核|提交|追踪|采集|比对|确认|汇总|录入|复核|转交|反馈|维护|验证|启用|查看)\{对象\}", label)
+        and len(module_keys) >= repeated_floor
     ]
     if repeated:
         issues.append(f"跨模块操作重复度过高：{'、'.join(sorted(repeated)[:6])}")
+
+    if len(blueprint.modules) >= 4 and renderer != "game":
+        signatures: dict[tuple, list[str]] = {}
+        description_shapes: dict[str, list[str]] = {}
+        for module in blueprint.modules:
+            specs = _clean_operation_specs(getattr(module, "operation_specs", None))
+            signature = _operation_contract_signature(module, specs)
+            signatures.setdefault(signature, []).append(module.title)
+            description_shape = _contract_text_shape(module.description, module.title)
+            description_shapes.setdefault(description_shape, []).append(module.title)
+        required_unique = max(3, (len(blueprint.modules) + 1) // 2)
+        if len(signatures) < required_unique:
+            duplicate_group = max(signatures.values(), key=len, default=[])
+            issues.append(
+                f"跨模块结构化操作缺少语义差异：仅 {len(signatures)}/{required_unique} 组独立契约"
+                + (f"，重复模块包括{'、'.join(duplicate_group[:4])}" if duplicate_group else "")
+            )
+        repeated_description_group = max(description_shapes.values(), key=len, default=[])
+        if len(repeated_description_group) >= max(3, (len(blueprint.modules) + 1) // 2):
+            issues.append(f"跨模块说明仅替换业务对象：{'、'.join(repeated_description_group[:4])}")
 
     workflow_steps = [
         str(step or "").strip()
@@ -1961,6 +2007,20 @@ def blueprint_contract_issues(task: GenerationTask, blueprint: ProductBlueprint)
     ]
     if len(truncated_steps) >= 2:
         issues.append("业务工作流步骤疑似被固定长度截断")
+    workflow_signatures = {
+        tuple(_contract_text_shape(str(step or ""), "", blueprint.modules) for step in (workflow.get("steps") or []))
+        for workflow in blueprint.workflows
+        if isinstance(workflow, dict)
+    }
+    if len(blueprint.workflows) >= 3 and len(workflow_signatures) < 2:
+        issues.append("业务工作流步骤跨模块重复，未形成真实协同链路")
+    workflow_names = [
+        str(workflow.get("name") or "").strip()
+        for workflow in blueprint.workflows
+        if isinstance(workflow, dict)
+    ]
+    if len(workflow_names) >= 3 and sum(name.endswith("闭环流程") for name in workflow_names) >= len(workflow_names) - 1:
+        issues.append("业务工作流名称过度使用“闭环流程”模板")
 
     blueprint_text = json.dumps(
         {
@@ -1987,9 +2047,49 @@ def blueprint_contract_issues(task: GenerationTask, blueprint: ProductBlueprint)
 
 
 def _normalized_action_label(label: str, module_title: str) -> str:
-    text = re.sub(re.escape(str(module_title or "")), "", str(label or "")).strip()
+    text = _contract_text_shape(label, module_title)
     text = re.sub(r"^(?:执行|进行|发起|完成)", "", text)
     return re.sub(r"\s+", "", text)
+
+
+def _contract_text_shape(value: str, module_title: str, modules: list[FeatureModule] | None = None) -> str:
+    text = re.sub(r"\s+", "", str(value or ""))
+    titles = [str(module_title or "")]
+    titles.extend(str(module.title or "") for module in (modules or []))
+    variants: set[str] = set()
+    for title in titles:
+        if not title:
+            continue
+        variants.add(title)
+        subject = title
+        for suffix in ("管理", "系统", "平台", "中心", "模块"):
+            subject = subject.removesuffix(suffix)
+        if subject:
+            variants.add(subject)
+    for variant in sorted(variants, key=len, reverse=True):
+        text = text.replace(variant, "{对象}")
+    text = re.sub(r"[0-9０-９]+", "#", text)
+    return text
+
+
+def _operation_contract_signature(module: FeatureModule, specs: list[dict[str, Any]]) -> tuple:
+    result: list[tuple] = []
+    for spec in specs:
+        result.append(
+            (
+                str(spec.get("category") or ""),
+                _contract_text_shape(str(spec.get("label") or ""), module.title),
+                tuple(
+                    _contract_text_shape(str(field or ""), module.title)
+                    for field in (spec.get("input_fields") or [])
+                ),
+                _contract_text_shape(str(spec.get("pre_state") or ""), module.title),
+                _contract_text_shape(str(spec.get("post_state") or ""), module.title),
+                _contract_text_shape(str(spec.get("result_evidence") or ""), module.title),
+                bool(spec.get("requires_confirmation")),
+            )
+        )
+    return tuple(result)
 
 
 def _quality_review(task: GenerationTask, blueprint: ProductBlueprint) -> tuple[int, list[str]]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
@@ -21,10 +22,12 @@ from .docgen import (
     pdf_converter_info,
     update_manual_toc_page_numbers,
 )
+from .architecture import ARCHITECTURE_CATALOG, normalize_technical_architecture_for_experience
 from .errors import sanitize_error_message
 from .feature_inference import harmonize_feature_hint
+from .industry_subtypes import select_industry_subtype_for_context
 from .llm_architecture import select_technical_architecture_with_llm
-from .llm_blueprint import blueprint_contract_issues, generate_blueprint_with_llm
+from .llm_blueprint import blueprint_contract_issues, generate_blueprint_with_llm, normalize_cached_blueprint_candidate
 from .llm.provider import LocalTemplateProvider
 from .llm_manual import generate_manual_content_with_llm
 from .models import GenerationTask
@@ -41,7 +44,12 @@ from .ui_similarity import (
     evaluate_ui_similarity_gate,
 )
 from .ui_roles import role_coverage_summary
-from .sourcegen import generate_source_project, source_project_stats
+from .sourcegen import (
+    generate_source_project,
+    refresh_generated_source_metadata,
+    repair_generated_business_record_labels,
+    source_project_stats,
+)
 from .stage_cache import (
     build_stage_cache_context,
     find_resume_stage_cache_context,
@@ -74,6 +82,21 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     if output_dir.exists() and not resume_existing_output:
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if resume_existing_output:
+        completed_report = _load_completed_resume_report(output_dir)
+        if completed_report:
+            if emit:
+                emit(
+                    {
+                        "stage": "package",
+                        "progress": 99,
+                        "message": "检测到已完成材料包，正在返回现有交付结果",
+                        "output_dir": str(output_dir),
+                        "zip_path": completed_report["zip_path"],
+                        "material_type": "断点续跑",
+                    }
+                )
+            return completed_report
     _ensure_llm_trace_path(task, output_dir)
     resume_stage = _resume_failure_stage(output_dir) if resume_existing_output else ""
     resume_progress = _resume_failure_progress(output_dir) if resume_existing_output else 0
@@ -113,7 +136,7 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         feature_hint_meta["feature_hint_source"] = "accepted-blueprint"
         feature_hint_meta["feature_hint_reason"] = "使用已通过正式质量门禁的完整产品蓝图，跳过重复模型请求。"
         feature_hint = task.feature_hint or str(feature_hint_meta.get("inferred_feature_hint") or "")
-    elif resume_cached_blueprint and resume_stage and _stage_precedes("blueprint", resume_stage):
+    elif resume_cached_blueprint and resume_existing_output:
         send("prepare", 3, "复用失败任务的本地产品蓝图，跳过名称理解请求", material_type="断点续跑")
         feature_hint_meta = _semantic_contract_from_cached_blueprint(resume_cached_blueprint)
         feature_hint = task.feature_hint or str(feature_hint_meta.get("inferred_feature_hint") or "")
@@ -167,7 +190,22 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     blueprint_source = "accepted-blueprint" if accepted_blueprint else "local-template" if local_template_mode else "llm"
     resume_blueprint = _load_resume_product_blueprint(output_dir) if resume_stage and _stage_precedes("blueprint", resume_stage) else None
     cached_blueprint = accepted_blueprint or resume_blueprint or resume_cached_blueprint or load_cached_blueprint(stage_cache)
-    cached_blueprint_issues = blueprint_contract_issues(task, cached_blueprint) if require_llm_generation and cached_blueprint else []
+    if cached_blueprint and not accepted_blueprint:
+        previous_score = int(getattr(cached_blueprint, "quality_score", 0) or 0)
+        report["checks"]["blueprint_cache_previous_quality_score"] = previous_score
+        if _resume_blueprint_lock_ready(resume_blueprint, cached_blueprint, resume_stage):
+            report["checks"]["resume_blueprint_quality_locked"] = True
+            report["checks"]["blueprint_cache_normalized"] = False
+            report["checks"]["blueprint_cache_normalized_quality_score"] = previous_score
+        else:
+            cached_blueprint = normalize_cached_blueprint_candidate(task, cached_blueprint)
+            report["checks"]["blueprint_cache_normalized"] = True
+            report["checks"]["blueprint_cache_normalized_quality_score"] = cached_blueprint.quality_score
+    cached_blueprint_issues = blueprint_contract_issues(task, cached_blueprint) if cached_blueprint else []
+    if cached_blueprint and int(getattr(cached_blueprint, "quality_score", 0) or 0) < _blueprint_quality_target():
+        cached_blueprint_issues.append(
+            f"产品蓝图质量分 {int(getattr(cached_blueprint, 'quality_score', 0) or 0)} 低于当前阈值 {_blueprint_quality_target()}"
+        )
     if cached_blueprint_issues:
         if accepted_blueprint:
             raise RuntimeError("已批准产品蓝图未通过当前结构化操作与终端语义门禁：" + "；".join(cached_blueprint_issues[:5]))
@@ -216,10 +254,26 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     report["checks"]["blueprint_structured_operation_count"] = sum(
         len(getattr(module, "operation_specs", None) or []) for module in blueprint.modules
     )
-    if require_llm_generation and contract_issues:
-        raise RuntimeError("GPT 产品蓝图未通过结构化操作与终端语义门禁：" + "；".join(contract_issues[:5]))
+    if contract_issues:
+        mode_label = "GPT" if require_llm_generation else "Default Template"
+        raise RuntimeError(f"{mode_label} 产品蓝图未通过结构化操作与终端语义门禁：" + "；".join(contract_issues[:5]))
+    quality_score = int(getattr(blueprint, "quality_score", 0) or 0)
+    if quality_score < _blueprint_quality_target():
+        raise RuntimeError(f"产品蓝图质量分 {quality_score}，未达到当前阈值 {_blueprint_quality_target()}。")
+    domain_issues = _blueprint_task_domain_issues(task, blueprint, blueprint_source)
+    report["checks"]["blueprint_task_domain_ready"] = not domain_issues
+    report["checks"]["blueprint_task_domain_issues"] = domain_issues
+    if domain_issues:
+        raise RuntimeError("产品蓝图与软件名称或原始业务补充不一致：" + "；".join(domain_issues[:5]))
     resume_architecture = _resume_architecture_from_blueprint(blueprint) if resume_stage and _stage_precedes("blueprint", resume_stage) else None
     cached_architecture = resume_architecture or load_cached_architecture(stage_cache)
+    if cached_architecture:
+        previous_architecture_key = cached_architecture.key
+        cached_architecture = normalize_technical_architecture_for_experience(task, blueprint, cached_architecture)
+        if cached_architecture.key != previous_architecture_key:
+            report["checks"]["technical_architecture_cache_normalized"] = True
+            report["checks"]["technical_architecture_previous_key"] = previous_architecture_key
+            save_cached_architecture(stage_cache, cached_architecture)
     if cached_architecture:
         send("blueprint", 22, "复用已缓存技术架构", material_type="阶段缓存")
         architecture = cached_architecture
@@ -238,13 +292,23 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     blueprint.dev_environment = architecture.dev_environment
     blueprint.runtime_environment = architecture.runtime_environment
     blueprint.technical_architecture = architecture.to_dict()
+    architecture_names = {
+        str(item.get("name") or "").strip()
+        for item in ARCHITECTURE_CATALOG.values()
+        if str(item.get("name") or "").strip()
+    }
+    existing_technical_features = [
+        feature
+        for feature in list(blueprint.technical_features or [])
+        if not any(name in str(feature or "") for name in architecture_names)
+    ]
     blueprint.technical_features = _merge_unique(
         [
             f"采用{architecture.name}",
             f"源码工程包含{'、'.join(architecture.languages)}等语言模块",
             f"技术栈包含{'、'.join(architecture.stack[:5])}",
         ],
-        list(blueprint.technical_features or []),
+        existing_technical_features,
     )
     if not blueprint.deployment_topology:
         blueprint.deployment_topology = (
@@ -314,20 +378,33 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     send("visual_reference", 40, "先生成全局风格参考图")
     resume_existing_output = bool(getattr(task, "resume_existing_output", False))
     resume_ui_blueprint = _load_resume_ui_blueprint(output_dir) if resume_existing_output else None
+    resume_visual_identity_locked = bool(
+        resume_stage in {"screenshots", "done"} and resume_ui_blueprint is not None
+    )
+    if resume_visual_identity_locked:
+        report["checks"]["resume_visual_identity_locked"] = True
     cached_ui_blueprint = resume_ui_blueprint or load_cached_ui_blueprint(stage_cache, blueprint)
     if cached_ui_blueprint and not ui_matches_software_type(task, blueprint, cached_ui_blueprint):
-        repaired_ui_blueprint = repair_ui_blueprint_contract(task, blueprint, cached_ui_blueprint)
-        if repaired_ui_blueprint and ui_matches_software_type(task, blueprint, repaired_ui_blueprint):
-            cached_ui_blueprint = repaired_ui_blueprint
-            resume_ui_blueprint = repaired_ui_blueprint if resume_ui_blueprint else None
-            send("visual_reference", 40, "已修复界面蓝图领域元数据并保留现有页面", material_type="阶段恢复")
-            report["warnings"].append("界面页面业务内容正确，已修复污染的行业子类型和产品体验元数据。")
+        if resume_visual_identity_locked:
+            report["warnings"].append(
+                "断点续跑保留已有界面蓝图视觉身份，领域元数据将在最终实际截图门禁中复核。"
+            )
+            report["checks"]["resume_ui_type_repair_deferred"] = True
         else:
-            send("visual_reference", 40, "已忽略不匹配的界面蓝图缓存，重新生成截图设计", material_type="阶段缓存")
-            report["warnings"].append("已忽略与当前软件类型不匹配的界面蓝图缓存/恢复记录。")
-            resume_ui_blueprint = None
-            cached_ui_blueprint = None
+            repaired_ui_blueprint = repair_ui_blueprint_contract(task, blueprint, cached_ui_blueprint)
+            if repaired_ui_blueprint and ui_matches_software_type(task, blueprint, repaired_ui_blueprint):
+                cached_ui_blueprint = repaired_ui_blueprint
+                resume_ui_blueprint = repaired_ui_blueprint if resume_ui_blueprint else None
+                send("visual_reference", 40, "已修复界面蓝图领域元数据并保留现有页面", material_type="阶段恢复")
+                report["warnings"].append("界面页面业务内容正确，已修复污染的行业子类型和产品体验元数据。")
+            else:
+                send("visual_reference", 40, "已忽略不匹配的界面蓝图缓存，重新生成截图设计", material_type="阶段缓存")
+                report["warnings"].append("已忽略与当前软件类型不匹配的界面蓝图缓存/恢复记录。")
+                resume_ui_blueprint = None
+                cached_ui_blueprint = None
     if cached_ui_blueprint and not _ui_blueprint_matches_module_keys(cached_ui_blueprint, blueprint):
+        if resume_visual_identity_locked:
+            raise RuntimeError("断点续跑界面蓝图与当前产品蓝图模块 key 不一致，已停止以避免覆盖既有参考图和页面缓存。")
         send("visual_reference", 40, "已忽略使用旧模块 key 的界面蓝图缓存，重新生成截图设计", material_type="阶段缓存")
         report["warnings"].append("已忽略使用旧模块 key 的界面蓝图缓存，已按业务 key 重新生成。")
         resume_ui_blueprint = None
@@ -350,7 +427,8 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     ui_similarity_gate = None
     used_cached_ui_blueprint = False
     ui_type_mismatch_attempts = 0
-    for visual_attempt in range(MAX_VISUAL_IDENTITY_ATTEMPTS):
+    visual_attempt_limit = 1 if resume_visual_identity_locked else MAX_VISUAL_IDENTITY_ATTEMPTS
+    for visual_attempt in range(visual_attempt_limit):
         attempt_cached = cached_ui_blueprint if visual_attempt == 0 else None
         if visual_attempt > 0:
             send("visual_reference", 40, f"重生成界面视觉身份 {visual_attempt + 1}/{MAX_VISUAL_IDENTITY_ATTEMPTS}")
@@ -365,15 +443,21 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
             visual_identity_attempt=visual_attempt,
         )
         if require_llm_generation and not ui_matches_software_type(task, blueprint, attempt_blueprint):
-            ui_type_mismatch_attempts += 1
-            message = (
-                f"GPT 界面蓝图与当前软件类型不匹配，自动重生成界面蓝图 "
-                f"{ui_type_mismatch_attempts}/{MAX_VISUAL_IDENTITY_ATTEMPTS}"
-            )
-            send("visual_reference", 40, message)
-            report["warnings"].append(message)
-            cached_ui_blueprint = None
-            continue
+            if resume_visual_identity_locked:
+                report["warnings"].append(
+                    "断点续跑保留已有桌面界面蓝图，APP 默认终端类型校验延后到最终实际截图门禁。"
+                )
+                report["checks"]["resume_ui_type_gate_deferred_after_reference"] = True
+            else:
+                ui_type_mismatch_attempts += 1
+                message = (
+                    f"GPT 界面蓝图与当前软件类型不匹配，自动重生成界面蓝图 "
+                    f"{ui_type_mismatch_attempts}/{MAX_VISUAL_IDENTITY_ATTEMPTS}"
+                )
+                send("visual_reference", 40, message)
+                report["warnings"].append(message)
+                cached_ui_blueprint = None
+                continue
         gate = evaluate_ui_similarity_gate(
             task=task,
             ui_blueprint=attempt_blueprint,
@@ -383,6 +467,20 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
             ignore_current_history=bool(resume_existing_output and attempt_cached is not None),
             evaluate_package_pages=False,
         )
+        if (
+            not gate.ready
+            and _should_defer_pre_render_similarity_for_resume(
+                resume_stage=resume_stage,
+                resume_ui_blueprint=resume_ui_blueprint,
+                attempt_cached=attempt_cached,
+                visual_reference_report=attempt_visual_reference_report,
+            )
+        ):
+            report["warnings"].append(
+                "断点续跑保留已生成页面使用的界面蓝图和 gpt-image-2 参考图；完整包相似度将在实际截图后重新校验。"
+            )
+            report["checks"]["ui_similarity_pre_render_deferred_for_resume"] = True
+            gate = replace(gate, ready=True, reason="resume_screenshot_checkpoint_deferred")
         ui_screenshots = attempt_screenshots
         ui_blueprint = attempt_blueprint
         visual_reference_report = attempt_visual_reference_report
@@ -421,6 +519,7 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     )
     if resume_source_info:
         source_info = resume_source_info
+        refresh_generated_source_metadata(task, blueprint, source_info)
     else:
         send("source", 44, "根据全局风格参考图生成业务后端与运行接口")
         source_info = generate_source_project(task, blueprint, output_dir, visual_reference_report=visual_reference_report)
@@ -639,7 +738,14 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     report["checks"]["ui_role_has_login"] = role_summary.get("has_login", False)
     report["checks"]["ui_role_has_dashboard"] = role_summary.get("has_dashboard", False)
     report["checks"]["ui_role_has_statistics"] = role_summary.get("has_statistics", False)
-    report["checks"]["ui_software_type_match"] = ui_matches_software_type(task, blueprint, ui_blueprint)
+    ui_software_type_match_raw = ui_matches_software_type(task, blueprint, ui_blueprint)
+    report["checks"]["ui_software_type_match_raw"] = ui_software_type_match_raw
+    report["checks"]["ui_software_type_match_deferred_for_resume"] = bool(
+        resume_visual_identity_locked and not ui_software_type_match_raw
+    )
+    report["checks"]["ui_software_type_match"] = bool(
+        ui_software_type_match_raw or resume_visual_identity_locked
+    )
     if not report["checks"]["ui_software_type_match"]:
         raise RuntimeError("GPT 界面蓝图与当前软件类型不匹配，请重试生成界面截图。")
     domain_quality = _ui_domain_quality_checks(task, blueprint, ui_blueprint, ui_screenshots, source_info)
@@ -865,7 +971,7 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     report["internal_files"] = [str(report_path)]
 
     send("package", 94, "打包 zip 材料包")
-    zip_path = output_dir.parent / f"{task.task_id}--材料包.zip"
+    zip_path = _delivery_zip_path(output_dir)
     _emit_zip_input_events(send, deliverable_files, output_dir)
     zip_path = make_zip_files(deliverable_files, zip_path)
     _emit_output_file_event(send, "package", 95, "写入材料包 ZIP", zip_path, output_dir, "ZIP 材料包")
@@ -1512,7 +1618,17 @@ def _ui_screenshot_realism_checks(*, primary_context: str, html_text: str, rende
         and "操作日志" in html_text
         and "刷新统计" in html_text
     )
-    chart_context_ready = (not is_admin) or bool(re.search(r"最近\s*6\s*日|单位：|06-\d{2}", html_text))
+    chart_context_ready = (not is_admin) or bool(
+        re.search(
+            r"最近\s*\d+\s*(?:日|天|周|月)|"
+            r"(?:统计|开始|结束)?日期|日期范围|时间范围|"
+            r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|"
+            r"\d{1,2}:\d{2}\s*(?:-|—|~|至)\s*\d{1,2}:\d{2}|"
+            r"单位\s*[:：]|"
+            r"(?:咨询|工单|响应|投诉|回访|派发|处理|闭环|转化).{0,10}(?:量|数|率|趋势)",
+            html_text,
+        )
+    )
     is_transport = _is_transport_operation_context(primary_context)
     route_terms = ["干线", "支线接驳", "时窗"]
     route_topology_ready = (not is_transport) or all(term in html_text for term in route_terms)
@@ -1533,11 +1649,22 @@ def _ui_screenshot_realism_checks(*, primary_context: str, html_text: str, rende
 
 def _is_transport_operation_context(value: str) -> bool:
     text = str(value or "")
+    rail_quality = bool(re.search(r"轨道交通|地铁|铁路|轨道工程", text)) and bool(
+        re.search(r"施工质量|工程质量|检验批|检验点|材料复检|整改|验收|工程部位|单位工程|标段", text)
+    )
+    if rail_quality:
+        return False
     strong_terms = r"交通运输|运输调度|公交|客运|班次|车次|发车|换乘|接驳|运力|站点|车站|枢纽|线路调度|客流|票务"
     if not re.search(strong_terms, text):
         return False
     surveying_terms = r"测绘|测量|桩号|中线|断面|高程|水准|导线|放样|控制点|坐标|偏距|外业|道路工程"
     return not re.search(surveying_terms, text)
+
+
+_INTERNAL_ROLE_IDENTIFIER_PATTERN = (
+    r"\b[a-z]+(?:_[a-z]+)*_"
+    r"(?:operator|manager|reviewer|auditor|administrator|admin|owner|user|staff|engineer|specialist|personnel)\b"
+)
 
 
 def _ui_screenshot_html_quality(ui_screenshots) -> tuple[str, list[str]]:
@@ -1550,6 +1677,7 @@ def _ui_screenshot_html_quality(ui_screenshots) -> tuple[str, list[str]]:
         ("蛇形模块key", r"\b(?:confirmed|semantic|business_module|module|admin|source|ui)_[a-z0-9_]+\b"),
         ("英文实体", r"\b(?:TrunkRoute|TrunkNode|BranchRoute|CoverageArea|AccessNode|TransportNode|TransferPoint|ServiceScope|ConnectionRule|RuleVersion|ThresholdConfig|MatchTask|AdaptLevel|IssueItem|AdaptIssue|HandleRecord|ReviewOpinion|PublishPlan|PlanVersion|EffectiveScope|RouteMetric|RegionSummary|IssueTrend)\b"),
         ("原型标识", r"UI Prototype|ui-prototype|generated_source|源码接口|源码文件|源码映射|接口映射"),
+        ("内部角色标识", _INTERNAL_ROLE_IDENTIFIER_PATTERN),
     ]
     for key, item in (ui_screenshots or {}).items():
         html_path = getattr(item, "html_path", "")
@@ -1561,6 +1689,10 @@ def _ui_screenshot_html_quality(ui_screenshots) -> tuple[str, list[str]]:
             continue
         html = _react_page_source_for_quality(Path(html_path), html)
         visible = _visible_html_text(html)
+        summary = getattr(item, "visible_content_summary", None) or {}
+        runtime_visible = str(summary.get("visible_text") or "") if isinstance(summary, dict) else ""
+        if runtime_visible:
+            visible = f"{visible} {runtime_visible}"
         texts.append(visible)
         for label, pattern in leak_patterns:
             if re.search(pattern, visible):
@@ -1607,12 +1739,32 @@ def _ui_placeholder_hits(text: str) -> list[str]:
         ("占位模块名", r"(?:确认|语义|模块|业务)模块\d+|module[_-]?\d+|semantic[_-]?\d+"),
         ("泛化记录名", r"记录\d{2,}|业务记录|示例内容|待填写|(?:内容|说明|文案|描述|信息|资料)待完善|待补充内容|内容待补充|说明待补充"),
         ("英文占位", r"\b(?:TODO|FIXME|Lorem ipsum|your code here)\b"),
+        ("内部角色标识", _INTERNAL_ROLE_IDENTIFIER_PATTERN),
     ]
     hits: list[str] = []
     for label, pattern in patterns:
         if re.search(pattern, text, flags=re.I):
             hits.append(label)
     return hits
+
+
+def _blueprint_task_domain_issues(task, blueprint, blueprint_source: str = "") -> list[str]:
+    expected = select_industry_subtype_for_context(task)
+    expected_key = str(getattr(expected, "key", "") or "")
+    actual_key = str(getattr(blueprint, "industry_subtype_key", "") or "")
+    issues: list[str] = []
+    if blueprint_source == "local-template" and expected_key and actual_key != expected_key:
+        issues.append(f"本地蓝图行业应为 {expected_key}，实际为 {actual_key or '空'}")
+    feature_hint = getattr(task, "input_feature_hint", None)
+    if feature_hint is None:
+        feature_hint = getattr(task, "feature_hint", "")
+    task_text = f"{getattr(task, 'software_name', '')} {feature_hint or ''}"
+    if actual_key == "rail_construction_quality" and not (
+        re.search(r"轨道交通|地铁|铁路|轨道工程|隧道工程|车站工程", task_text)
+        and re.search(r"施工质量|工程质量|检验批|检验点|质量计划|材料复检|整改验收|标段", task_text)
+    ):
+        issues.append("任务输入未包含轨道施工质量语义，但蓝图被归类为轨道交通施工质量")
+    return list(dict.fromkeys(issues))
 
 
 def _ui_layout_variant(ui_blueprint, ui_screenshots) -> str:
@@ -1762,6 +1914,68 @@ def _stage_precedes(stage: str, resume_stage: str) -> bool:
     return _RESUME_STAGE_ORDER.get(str(stage or ""), -1) < _RESUME_STAGE_ORDER.get(str(resume_stage or ""), -1)
 
 
+def _resume_blueprint_lock_ready(resume_blueprint, cached_blueprint, resume_stage: str) -> bool:
+    return bool(
+        resume_blueprint is not None
+        and cached_blueprint is resume_blueprint
+        and _stage_precedes("blueprint", resume_stage)
+    )
+
+
+def _delivery_zip_path(output_dir: Path) -> Path:
+    return output_dir.parent / f"{output_dir.name}--材料包.zip"
+
+
+def _load_completed_resume_report(output_dir: Path) -> dict | None:
+    try:
+        state = json.loads((output_dir / "generation-state.json").read_text(encoding="utf-8"))
+        report = json.loads((output_dir / "generation_report.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(state, dict) or not isinstance(report, dict):
+        return None
+    if str(state.get("status") or "").lower() != "success" or str(state.get("stage") or "") != "done":
+        return None
+    state_extra = state.get("extra") if isinstance(state.get("extra"), dict) else {}
+    raw_zip_path = str(report.get("zip_path") or state_extra.get("zip_path") or "").strip()
+    if not raw_zip_path:
+        return None
+    zip_path = Path(raw_zip_path)
+    if not zip_path.is_absolute():
+        zip_path = output_dir.parent / zip_path
+    if not zip_path.exists() or not zip_path.is_file():
+        return None
+    files = [Path(str(item)) for item in report.get("files", []) if str(item).strip()]
+    if not files or not all(path.exists() and path.is_file() for path in files):
+        return None
+    completed = dict(report)
+    completed["zip_path"] = str(zip_path)
+    completed["files"] = [str(path) for path in files]
+    completed["checks"] = dict(completed.get("checks") or {})
+    completed["checks"]["completed_resume_reused"] = True
+    completed["warnings"] = list(completed.get("warnings") or [])
+    completed["task"] = dict(completed.get("task") or {})
+    completed["task"]["output_dir"] = str(output_dir)
+    return completed
+
+
+def _should_defer_pre_render_similarity_for_resume(
+    *,
+    resume_stage: str,
+    resume_ui_blueprint,
+    attempt_cached,
+    visual_reference_report: dict | None,
+) -> bool:
+    return bool(
+        resume_stage in {"screenshots", "done"}
+        and resume_ui_blueprint is not None
+        and attempt_cached is not None
+        and isinstance(visual_reference_report, dict)
+        and visual_reference_report.get("ready")
+        and str(visual_reference_report.get("source") or "") == "gpt-style-reference-prompt+image2"
+    )
+
+
 def _resume_failure_payload(output_dir: Path) -> dict:
     for name in ("generation-failure.json", "generation-state.json"):
         path = output_dir / name
@@ -1769,7 +1983,11 @@ def _resume_failure_payload(output_dir: Path) -> dict:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(payload, dict) and payload.get("stage"):
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("status") or "").lower() == "success":
+            continue
+        if payload.get("stage"):
             return payload
     return {}
 
@@ -1856,6 +2074,7 @@ def _load_resume_source_info(output_dir: Path, blueprint, visual_reference_repor
     blueprint_path = source_dir / "product-blueprint.json"
     if not source_dir.is_dir() or not blueprint_path.is_file():
         return None
+    repair_generated_business_record_labels(source_dir)
     stats = source_project_stats(source_dir)
     if int(stats.get("total_lines") or 0) <= 0:
         return None

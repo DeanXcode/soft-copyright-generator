@@ -12,6 +12,7 @@ from backend.softcopyright.screenshots import (
     _auto_repair_page_text_layout,
     _collect_page_text_layout_issues,
     _inject_runtime_script_into_ai_page,
+    runtime_api_script,
 )
 
 
@@ -51,6 +52,32 @@ class _RuntimeApiHandler(SimpleHTTPRequestHandler):
 
 
 class DashboardRuntimeApiTests(unittest.TestCase):
+    def test_route_runtime_binding_never_writes_business_text_into_decorative_icon(self):
+        script = runtime_api_script()
+
+        self.assertNotIn("pin.childNodes[0]", script)
+        self.assertIn("node.nodeType === Node.TEXT_NODE", script)
+        self.assertIn(":scope > b, :scope > strong", script)
+
+    def test_chart_context_accepts_business_date_range_and_legends(self):
+        checks = _ui_screenshot_realism_checks(
+            primary_context="客户服务协同平台",
+            html_text=(
+                "统计日期 2026-07-17 客户咨询与工单转化趋势 按小时汇总 "
+                "08:00 - 18:00 咨询接入量 转服务工单数 首次响应达标率 96.2%"
+            ),
+            renderer="admin",
+        )
+        self.assertTrue(checks["ui_chart_context_ready"])
+
+    def test_chart_context_rejects_context_free_chart_placeholders(self):
+        checks = _ui_screenshot_realism_checks(
+            primary_context="客户服务协同平台",
+            html_text="数据趋势 图表一 系列A 系列B",
+            renderer="admin",
+        )
+        self.assertFalse(checks["ui_chart_context_ready"])
+
     def test_injection_upgrades_cached_runtime_script(self):
         with TemporaryDirectory() as temporary_directory:
             page_path = Path(temporary_directory) / "dashboard.html"
@@ -68,7 +95,7 @@ class DashboardRuntimeApiTests(unittest.TestCase):
 
         self.assertIn('data-runtime-module-keys="inventory"', html)
         self.assertNotIn("soft-runtime-api-script:v4", html)
-        self.assertEqual(html.count("soft-runtime-api-script:v10"), 1)
+        self.assertEqual(html.count("soft-runtime-api-script:v11"), 1)
         self.assertIn("height:720px!important", html)
         self.assertIn("table-layout:fixed!important", html)
         self.assertIn("white-space:nowrap!important", html)
@@ -358,7 +385,7 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}
             _inject_runtime_script_into_ai_page(page_path, module_keys=["inventory"])
             html = page_path.read_text(encoding="utf-8")
             self.assertIn('data-runtime-module-keys="inventory"', html)
-            self.assertIn("soft-runtime-api-script:v10", html)
+            self.assertIn("soft-runtime-api-script:v11", html)
             self.assertNotIn("trunk_route_catalog", html)
 
             handler = partial(_RuntimeApiHandler, directory=str(root))
@@ -412,7 +439,7 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}.stable-card{width:900px
             )
             _inject_runtime_script_into_ai_page(page_path, module_keys=["inventory"])
             html = page_path.read_text(encoding="utf-8")
-            self.assertIn("soft-runtime-api-script:v10", html)
+            self.assertIn("soft-runtime-api-script:v11", html)
             self.assertIn('class="runtime-operation-evidence"', html)
             self.assertNotIn("data-runtime-operation-evidence-style", html)
 
@@ -538,6 +565,27 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}.screen-root{position:re
         self.assertFalse(after)
         self.assertEqual(canvas["width"], "")
         self.assertTrue(canvas["scale"])
+
+    def test_layout_gate_ignores_text_clipped_by_inner_overflow_container(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            page_path = root / "clipped.html"
+            page_path.write_text(
+                """<!doctype html><html><head><style>
+body{margin:0;width:1280px;height:720px;overflow:hidden}.viewport{position:absolute;left:20px;top:650px;width:600px;height:50px;overflow:hidden}.row{position:absolute;left:0;top:30px;width:600px;height:40px}.row td{width:200px;height:40px;white-space:nowrap}
+</style></head><body data-renderer="admin"><div class="viewport"><table class="row"><tr><td>已被内部滚动区域裁剪的下一行</td><td>待复核</td></tr></table></div></body></html>""",
+                encoding="utf-8",
+            )
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"width": 1280, "height": 720})
+                page.goto(page_path.as_uri(), wait_until="load")
+                issues = _collect_page_text_layout_issues(page, include_overlaps=True)
+                browser.close()
+
+        self.assertFalse(issues)
 
 
 if __name__ == "__main__":

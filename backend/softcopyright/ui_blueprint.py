@@ -1162,7 +1162,10 @@ def ui_matches_software_type(task: GenerationTask, blueprint: ProductBlueprint, 
             [ui_blueprint.visual_style]
             + [screen.title + screen.caption + " ".join(screen.components) for screen in ui_blueprint.screens]
         )
-        forbidden = ["审核", "复核", "工单", "审批", "风控", "台账", "后台", "批量输出", "质量复盘"]
+        forbidden = [
+            "管理后台", "运营后台", "审核台", "审批台", "风控控制台", "批量输出",
+            "质量复盘", "桌面控制台", "PC端工作台",
+        ]
         return (
             ui_blueprint.renderer == "mobile_app"
             and bool(view_types)

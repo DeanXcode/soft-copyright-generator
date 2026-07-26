@@ -49,6 +49,10 @@ _ACTION_SUFFIXES = (
     "打印",
     "校验",
     "验证",
+    "检验",
+    "评定",
+    "整改",
+    "验收",
     "分析",
     "审核",
     "复核",
@@ -80,6 +84,17 @@ def operation_action_label(value: str) -> str:
         if suffix in text:
             return suffix
     return text or "处理"
+
+
+def operation_page_title(module_title: str, action: str, *, mobile: bool = False) -> str:
+    module = str(module_title or "").strip()
+    normalized_action = str(action or "").strip()
+    while module and normalized_action.startswith(module):
+        normalized_action = normalized_action[len(module) :].strip()
+    normalized_action = normalized_action or "处理"
+    separator = "-" if mobile else ""
+    suffix = "" if mobile else "界面"
+    return f"{module}{separator}{normalized_action}{suffix}"
 
 
 def operation_category(action: str) -> str:
@@ -243,8 +258,9 @@ def operation_coverage_categories(specs: Iterable[OperationCoverageSpec]) -> lis
 
 
 def operation_caption(module_title: str, spec: OperationCoverageSpec) -> str:
-    subject = f"{module_title}{spec.action}"
-    role_note = f"由{spec.role}在{spec.trigger}时发起，" if spec.role and spec.trigger else ""
+    subject = operation_page_title(module_title, spec.action).removesuffix("界面")
+    trigger = str(spec.trigger or "").rstrip("时")
+    role_note = f"由{spec.role}在{trigger}时发起，" if spec.role and trigger else ""
     evidence_note = f"，完成后形成{spec.result_evidence}" if spec.result_evidence else ""
     templates = {
         "lookup": f"{subject}页面展示查询条件、结果列表、筛选状态和可用操作。",

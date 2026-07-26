@@ -18,14 +18,14 @@ from .ai_frontend_codegen import generate_ai_frontend_pages, generate_style_refe
 from .blueprint import FeatureModule, ProductBlueprint
 from .llm.provider import LLMProvider
 from .models import GenerationTask
-from .operation_coverage import module_operation_coverage, operation_caption
+from .operation_coverage import module_operation_coverage, operation_caption, operation_page_title
 from .packager import write_json
 from .ui_blueprint import UiBlueprint, UiScreenBlueprint, build_ui_blueprint, is_game_like, is_mobile_app_like
 
 ADMIN_VIEWPORT = {"width": 1280, "height": 720}
 GAME_VIEWPORT = {"width": 720, "height": 1280}
 MOBILE_VIEWPORT = {"width": 720, "height": 1280}
-SCREENSHOT_CHECKPOINT_VERSION = 7
+SCREENSHOT_CHECKPOINT_VERSION = 13
 
 
 def _is_mobile_renderer(renderer: str) -> bool:
@@ -470,6 +470,8 @@ body[data-renderer="admin"] .comparison-main:has(>.table-panel.operation-result)
 body[data-renderer="admin"] .comparison-main>.table-panel.operation-result{height:100%!important;min-height:0!important;max-height:170px!important;overflow:hidden!important;}
 body[data-renderer="admin"] .workspace>.execution-rail{height:100%!important;min-height:0!important;max-height:100%!important;overflow:hidden!important;}
 body[data-renderer="admin"] .operation-result:not(:has(> *)){white-space:normal!important;display:-webkit-box!important;-webkit-line-clamp:2;-webkit-box-orient:vertical;line-height:1.22!important;max-height:42px!important;}
+body[data-renderer="admin"] :is(.map-pin,.map-node,.relation-node,.flow-node) :is(b,strong,span,em){display:block!important;min-width:0!important;max-width:100%!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
+body[data-renderer="admin"][data-page-kind="login"] :is(.left-console,.login-hero,.login-brand) h1{max-width:none!important;font-size:31px!important;line-height:1.15!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
           `;
           document.head.appendChild(style);
         }"""
@@ -663,11 +665,37 @@ def _collect_page_text_layout_issues(page, *, include_overlaps: bool = False) ->
             .map((child) => child.textContent || "")
             .join("")
             .trim();
+          const paintedRect = (node, sourceRect) => {
+            const rect = {
+              left: sourceRect.left,
+              top: sourceRect.top,
+              right: sourceRect.right,
+              bottom: sourceRect.bottom
+            };
+            for (let ancestor = node.parentElement; ancestor && ancestor !== document.body && ancestor !== document.documentElement; ancestor = ancestor.parentElement) {
+              const style = getComputedStyle(ancestor);
+              const ancestorRect = ancestor.getBoundingClientRect();
+              if (["hidden", "clip", "auto", "scroll"].includes(style.overflowX)) {
+                rect.left = Math.max(rect.left, ancestorRect.left);
+                rect.right = Math.min(rect.right, ancestorRect.right);
+              }
+              if (["hidden", "clip", "auto", "scroll"].includes(style.overflowY)) {
+                rect.top = Math.max(rect.top, ancestorRect.top);
+                rect.bottom = Math.min(rect.bottom, ancestorRect.bottom);
+              }
+            }
+            return {
+              ...rect,
+              width: Math.max(0, rect.right - rect.left),
+              height: Math.max(0, rect.bottom - rect.top)
+            };
+          };
           const nodes = Array.from(document.querySelectorAll(selector));
           const visible = [];
           for (let index = 0; index < nodes.length; index += 1) {
             const node = nodes[index];
-            const rect = node.getBoundingClientRect();
+            const sourceRect = node.getBoundingClientRect();
+            const rect = paintedRect(node, sourceRect);
             if (rect.width < 3 || rect.height < 3) continue;
             if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= viewportHeight || rect.left >= viewportWidth) continue;
             const text = (directText(node) || node.innerText || "").replace(/\\s+/g, " ").trim();
@@ -755,7 +783,7 @@ def _collect_page_text_layout_issues(page, *, include_overlaps: bool = False) ->
               if (style.display === "none" || style.visibility === "hidden" || Number.parseFloat(style.opacity || "1") < 0.08) continue;
               const text = directText(node).replace(/\\s+/g, " ").trim();
               if (!text) continue;
-              const rect = node.getBoundingClientRect();
+              const rect = paintedRect(node, node.getBoundingClientRect());
               if (rect.width < 3 || rect.height < 3 || rect.bottom <= 0 || rect.right <= 0 || rect.top >= viewportHeight || rect.left >= viewportWidth) continue;
               textLeaves.push({node, rect, text});
             }
@@ -1880,7 +1908,7 @@ def _build_pages(task: GenerationTask, blueprint: ProductBlueprint, ui_dir: Path
                 _write_page(
                     ui_dir,
                     _module_operation_page_key(module.key, action, operation_index),
-                    f"{module.title}{action}界面",
+                    operation_page_title(module.title, action),
                     operation_caption(module.title, operation),
                     _module_operation_body(task, blueprint, module, action, design_brief),
                     renderer="admin",
@@ -1947,7 +1975,7 @@ def _build_page_specs(task: GenerationTask, blueprint: ProductBlueprint, ui_dir:
                         _page_spec(
                             ui_dir,
                             _module_operation_page_key(module.key, action, operation_index),
-                            f"{module.title}-{action}",
+                            operation_page_title(module.title, action, mobile=True),
                             operation_caption(module.title, operation),
                             renderer=renderer,
                             page_kind="operation",
@@ -2012,7 +2040,7 @@ def _build_page_specs(task: GenerationTask, blueprint: ProductBlueprint, ui_dir:
                 _page_spec(
                     ui_dir,
                     _module_operation_page_key(module.key, action, operation_index),
-                    f"{module.title}{action}界面",
+                    operation_page_title(module.title, action),
                     operation_caption(module.title, operation),
                     renderer="admin",
                     page_kind="operation",
@@ -2176,7 +2204,7 @@ def _module_operation_body(task: GenerationTask, blueprint: ProductBlueprint, mo
     profile = dict(profile)
     profile["table_headers"] = _module_table_headers(profile, module)
     fields = module.data_fields[:6] or ["业务编号", "业务名称", "业务状态", "责任角色", "更新时间", "处理备注"]
-    title = f"{module.title}{action}界面"
+    title = operation_page_title(module.title, action)
     standalone = _operation_standalone_content(profile, blueprint, module, action, fields)
     if standalone:
         return _layout(task, blueprint, title, standalone, module.title, design_brief)
@@ -2518,27 +2546,30 @@ def _operation_sample_value(module: FeatureModule, field: str, index: int) -> st
     code = f"{_business_code_prefix(module)}-{1001 + index}"
     names = _business_record_names_for_ui(module)
     name = names[index % len(names)]
+    transport = _ui_transport_module(module)
     if re.search(r"编号|编码|单号|代码|ID", label, re.I):
         return code
     if re.search(r"名称|标题|线路|路径|方案|节点", label):
         return name
-    if re.search(r"途经|节点序列|站点序列", label):
+    if transport and re.search(r"途经|节点序列|站点序列", label):
         return ["沪杭枢纽-浦东东区-临港接驳点", "虹桥枢纽-外环货运站-南环联络口", "机场北站-航站楼集散点-东区短驳口", "外高桥港区-保税仓节点-主干线入口"][index % 4]
-    if re.search(r"方向|通行", label):
+    if transport and re.search(r"方向|通行", label):
         return ["北向", "南向", "双向", "东向"][index % 4]
     if re.search(r"范围|服务|覆盖|片区|区域", label):
-        return ["浦东东区至临港片区", "虹桥枢纽至南环货运带", "机场枢纽至东部接驳区", "港区集疏运服务圈"][index % 4]
+        if transport:
+            return ["浦东东区至临港片区", "虹桥枢纽至南环货运带", "机场枢纽至东部接驳区", "港区集疏运服务圈"][index % 4]
+        return f"{title}服务区域{index + 1}"
     if re.search(r"状态|进度", label):
         return ["已启用", "待复核", "处理中", "已完成"][index % 4]
     if re.search(r"单位|部门|责任|角色|人员", label):
-        return "交通运输主管部门线路管理员"
+        return "线路管理员" if transport else "业务操作员"
     if re.search(r"时间|日期|更新|生效|闭环", label):
         return f"2026-06-{24 + (index % 4):02d} 15:{20 + index % 4:02d}"
     if re.search(r"等级|适配|优先级", label):
         return ["一级适配", "二级适配", "重点复核", "冲突校验"][index % 4]
     if re.search(r"结果|结论|说明|备注|意见", label):
         return f"{title}已完成{['建档', '复核', '匹配', '归档'][index % 4]}"
-    values = [code, name, "已启用", "交通运输主管部门线路管理员", "2026-06-24 15:20", f"{title}业务数据已完成校验"]
+    values = [code, name, "已启用", "线路管理员" if transport else "业务操作员", "2026-06-24 15:20", f"{title}业务数据已完成校验"]
     return values[index % len(values)]
 
 
@@ -2554,13 +2585,24 @@ def _business_record_names_for_ui(module: FeatureModule) -> list[str]:
         return ["干支线接驳时效评估", "覆盖盲区匹配复核", "节点容量冲突评估", "跨区线路组合测算"]
     if "规则" in title:
         return ["接驳距离阈值规则", "等待时长上限规则", "节点容量窗口规则", "服务范围重叠规则"]
-    if "问题" in title:
+    if "问题" in title and _ui_transport_module(module):
         return ["支线覆盖缺口工单", "节点容量冲突工单", "方向不一致处置单", "服务范围越界工单"]
     if "发布" in title or "方案" in title:
         return ["临港干支线适配方案", "机场枢纽接驳发布单", "港区集疏运生效方案", "城际线路换乘方案"]
     if "统计" in title or "报表" in title:
         return ["日运行适配汇总", "区域衔接效率报表", "规则命中趋势分析", "问题闭环统计清单"]
-    return [f"{title}{suffix}" for suffix in ["台账", "明细", "复核单", "归档单"]]
+    return [f"{title}{suffix}" for suffix in ["待办", "明细", "复核单", "归档单"]]
+
+
+def _ui_transport_module(module: FeatureModule) -> bool:
+    text = " ".join(
+        [
+            str(getattr(module, "title", "") or ""),
+            str(getattr(module, "description", "") or ""),
+            " ".join(str(item) for item in (getattr(module, "data_fields", []) or [])),
+        ]
+    )
+    return bool(re.search(r"交通|运输|线路|干线|支线|接驳|换乘|站点|车站|枢纽|班次|运力", text))
 
 
 def _business_code_prefix(module: FeatureModule) -> str:
@@ -2625,7 +2667,7 @@ def _build_mobile_app_pages(task: GenerationTask, blueprint: ProductBlueprint, u
                 _write_page(
                     ui_dir,
                     _module_operation_page_key(module.key, action, operation_index),
-                    f"{module.title}-{action}",
+                    operation_page_title(module.title, action, mobile=True),
                     caption,
                     _mobile_operation_body(task, blueprint, module, action, caption, operation.mode, design_brief),
                     renderer="mobile_app",
@@ -3077,7 +3119,7 @@ def _page_shell(
     .warning-dialog {{ width: 520px; }}
     .review-dialog {{ width: min(720px, calc(100vw - 96px)); }}
     .dialog-head {{ height: 48px; padding: 0 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #e5e7eb; background: #f8fafc; }}
-    .dialog-head strong {{ font-size: 18px; color: #1f2937; }}
+    .dialog-head strong {{ min-width: 0; overflow: hidden; color: #1f2937; font-size: 18px; text-overflow: ellipsis; white-space: nowrap; }}
     .dialog-close {{ width: 22px; height: 22px; display: grid; place-items: center; color: #64748b; font-size: 20px; line-height: 1; }}
     .dialog-body {{ padding: 16px; display: grid; gap: 14px; }}
     .form-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 14px; }}
@@ -3600,6 +3642,8 @@ body[data-ai-frontend="true"][data-renderer="admin"] .detail-panel.operation-res
 body[data-ai-frontend="true"][data-renderer="admin"] .comparison-main:has(>.table-panel.operation-result){height:100%!important;min-height:0!important;grid-template-rows:minmax(0,1fr) minmax(0,170px)!important;overflow:hidden!important;}
 body[data-ai-frontend="true"][data-renderer="admin"] .comparison-main>.table-panel.operation-result{height:100%!important;min-height:0!important;max-height:170px!important;overflow:hidden!important;}
 body[data-ai-frontend="true"][data-renderer="admin"] .workspace>.execution-rail{height:100%!important;min-height:0!important;max-height:100%!important;overflow:hidden!important;}
+body[data-ai-frontend="true"][data-renderer="admin"] :is(.map-pin,.map-node,.relation-node,.flow-node) :is(b,strong,span,em){display:block!important;min-width:0!important;max-width:100%!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
+body[data-ai-frontend="true"][data-renderer="admin"][data-page-kind="login"] :is(.left-console,.login-hero,.login-brand) h1{max-width:none!important;font-size:31px!important;line-height:1.15!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
 """.strip()
     return f"""
 <style id="soft-ai-runtime-guard">
@@ -3670,6 +3714,20 @@ def _normalize_visible_content_summary(payload: dict[str, Any] | None, item: UiS
         visible_text = visible_text[:16000]
     actions = values("actions", limit=12, max_length=24)
     if item is not None:
+        title = clean(item.title, max_length=72)
+        if visible_text and title and not any(str(value).strip() for value in raw.get("headings", [])):
+            raw["headings"] = [title]
+        if visible_text and item.interaction_input_fields and not item.requires_confirmation:
+            raw_fields = list(raw.get("fields") or [])
+            raw_fields.extend(str(value) for value in item.interaction_input_fields if str(value).strip())
+            raw["fields"] = raw_fields
+        interaction_action = _normalize_visible_action_label(clean(item.interaction_action, max_length=24))
+        if visible_text and interaction_action and interaction_action not in actions:
+            actions.append(interaction_action)
+        if item.key == "login":
+            for login_action in ("登录并进入应用", "登录系统", "进入系统", "提交登录"):
+                if login_action in visible_text and login_action not in actions:
+                    actions.append(login_action)
         for label in (item.action_crops or {}):
             normalized = _normalize_visible_action_label(clean(label, max_length=24))
             if normalized and normalized not in actions:
@@ -3696,10 +3754,16 @@ def _normalize_visible_content_summary(payload: dict[str, Any] | None, item: UiS
 
 
 def _capture_visible_content_summary(page, item: UiScreenshot) -> dict[str, Any]:
+    root_selector = (
+        '[data-shared-confirm-dialog="true"][data-shared-confirm-ready="true"][role="dialog"]'
+        if item.requires_confirmation
+        else "body"
+    )
     payload = page.evaluate(
         r"""
-        () => {
+        (rootSelector) => {
           const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+          const root = document.querySelector(rootSelector) || document.body;
           const visible = (element) => {
             if (!element) return false;
             const style = getComputedStyle(element);
@@ -3719,17 +3783,17 @@ def _capture_visible_content_summary(page, item: UiScreenshot) -> dict[str, Any]
             return result;
           };
           const texts = (selector, limit = 40) => unique(
-            Array.from(document.querySelectorAll(selector))
+            Array.from(root.querySelectorAll(selector))
               .filter(visible)
               .map((element) => clean(element.innerText || element.value || element.getAttribute('aria-label') || ''))
               .filter((text) => text.length >= 2 && text.length <= 48),
             limit,
           );
           const headings = texts('h1,h2,h3,h4,[role="heading"],legend,[class*="panel-title"],[class*="card-title"],[class*="section-title"],[class*="block-title"],[class*="widget-title"]', 36);
-          const fields = texts('th,label,dt,[data-field-label],[class*="field-label"],[class*="form-label"],[class*="meta-label"],[class*="item-label"],[class*="table-head"]', 48);
+          const fields = texts('th,label,dt,[data-field-label],[class*="field-label"],[class*="form-label"],[class*="meta-label"],[class*="item-label"],[class*="table-head"],.shared-confirm-summary span,.shared-confirm-evidence>span,.shared-confirm-note strong', 48);
           const statuses = texts('[class*="status"],[class*="badge"],[class*="tag"],[class*="pill"],[class*="chip"],[class*="state"]', 36);
           const actions = unique(
-            Array.from(document.querySelectorAll('button,a,[role="button"],input[type="button"],input[type="submit"],[onclick]'))
+            Array.from(root.querySelectorAll('button,a,[role="button"],input[type="button"],input[type="submit"],[onclick]'))
               .filter(visible)
               .map((element) => clean(
                 element.getAttribute('aria-label')
@@ -3741,21 +3805,21 @@ def _capture_visible_content_summary(page, item: UiScreenshot) -> dict[str, Any]
               .filter((text) => text.length >= 2 && text.length <= 48),
             48,
           );
-          const filterContainers = Array.from(document.querySelectorAll('[class~="filter-block"],[class*="filter-item"],[class*="filter-chip"],[class*="filter-option"],[class*="tab-item"],[class*="tab-button"],[class*="segment-item"],[class*="range-label"]')).filter(visible);
+          const filterContainers = Array.from(root.querySelectorAll('[class~="filter-block"],[class*="filter-item"],[class*="filter-chip"],[class*="filter-option"],[class*="tab-item"],[class*="tab-button"],[class*="segment-item"],[class*="range-label"]')).filter(visible);
           const filters = unique(filterContainers.map((element) => clean(element.innerText)).filter((text) => text.length >= 2 && text.length <= 64), 36);
           const filterActions = unique(filterContainers.flatMap((element) => Array.from(element.querySelectorAll('button,[role="button"]')).filter(visible).map((button) => clean(button.innerText || button.getAttribute('aria-label') || ''))), 36);
-          for (const input of Array.from(document.querySelectorAll('input,select,textarea')).filter(visible)) {
+          for (const input of Array.from(root.querySelectorAll('input,select,textarea')).filter(visible)) {
             const value = clean(input.getAttribute('placeholder') || input.value || input.getAttribute('aria-label') || '');
             if (value && value.length <= 48) filters.push(value);
           }
           const metrics = [];
-          for (const card of Array.from(document.querySelectorAll('[class~="metric"],[class*="metric-"],[class*="_metric"],[class~="kpi"],[class*="kpi-"],[class*="_kpi"],[class~="stat"],[class*="stat-"],[class*="_stat"],[class~="indicator"],[class*="indicator-"],[class*="summary-card"]')).filter(visible)) {
+          for (const card of Array.from(root.querySelectorAll('[class~="metric"],[class*="metric-"],[class*="_metric"],[class~="kpi"],[class*="kpi-"],[class*="_kpi"],[class~="stat"],[class*="stat-"],[class*="_stat"],[class~="indicator"],[class*="indicator-"],[class*="summary-card"]')).filter(visible)) {
             const labelNode = card.querySelector('[class*="label"],[class*="name"],[class*="title"],h1,h2,h3,h4,dt');
             const label = clean((labelNode && labelNode.innerText) || (card.innerText || '').split(/\n/)[0]);
             if (label && label.length >= 2 && label.length <= 48) metrics.push(label);
           }
           return {
-            visible_text: clean(document.body && document.body.innerText),
+            visible_text: clean(root && root.innerText),
             headings: unique(headings, 36),
             metrics: unique(metrics, 36),
             fields: unique(fields, 48),
@@ -3765,7 +3829,8 @@ def _capture_visible_content_summary(page, item: UiScreenshot) -> dict[str, Any]
             actions: unique(actions, 48),
           };
         }
-        """
+        """,
+        root_selector,
     )
     return _normalize_visible_content_summary(payload, item)
 
@@ -3773,9 +3838,14 @@ def _capture_visible_content_summary(page, item: UiScreenshot) -> dict[str, Any]
 def _capture_visible_action_crops(page, item: UiScreenshot, ui_dir: Path) -> dict[str, str]:
     crop_dir = ui_dir / "button-crops"
     crop_dir.mkdir(parents=True, exist_ok=True)
+    scope = (
+        page.locator('[data-shared-confirm-dialog="true"][data-shared-confirm-ready="true"][role="dialog"]')
+        if item.requires_confirmation
+        else page.locator("body")
+    )
     candidate_groups = [
-        page.locator('button, a, [role="button"], input[type="button"], input[type="submit"]'),
-        page.locator('[onclick], [class*="btn"], [class*="button"], [class*="action"]'),
+        scope.locator('button, a, [role="button"], input[type="button"], input[type="submit"]'),
+        scope.locator('[onclick], [class*="btn"], [class*="button"], [class*="action"], [class*="primary"], [class*="submit"]'),
     ]
     result: dict[str, str] = {}
     for group_index, candidates in enumerate(candidate_groups):
@@ -3788,6 +3858,12 @@ def _capture_visible_action_crops(page, item: UiScreenshot, ui_dir: Path) -> dic
             try:
                 if not locator.is_visible():
                     continue
+                interactive = locator.evaluate(
+                    "element => ['BUTTON','A','INPUT'].includes(element.tagName) || "
+                    "element.getAttribute('role') === 'button' || element.hasAttribute('onclick')"
+                )
+                if not interactive:
+                    continue
                 label = (
                     locator.get_attribute("aria-label")
                     or locator.get_attribute("title")
@@ -3797,17 +3873,92 @@ def _capture_visible_action_crops(page, item: UiScreenshot, ui_dir: Path) -> dic
                 )
                 label = _normalize_visible_action_label(label)
                 box = locator.bounding_box()
-                if not label or len(label) > 16 or label in result or not box:
+                if not label or len(label) > 16 or label in result or not box or not _is_action_crop_label(label):
                     continue
-                if box["width"] < 18 or box["height"] < 14 or box["width"] > 360 or box["height"] > 100:
+                if box["width"] < 18 or box["height"] < 14 or box["width"] > 720 or box["height"] > 100:
                     continue
                 safe_label = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "-", label).strip("-") or f"action-{group_index + 1}-{index + 1}"
                 crop_path = crop_dir / f"{item.key}-{safe_label[:24]}.png"
                 locator.screenshot(path=str(crop_path))
+                if not _action_crop_has_visible_content(crop_path):
+                    crop_path.unlink(missing_ok=True)
+                    continue
+                _normalize_action_crop_image(crop_path)
                 result[label] = str(crop_path)
             except Exception:
                 continue
     return result
+
+
+def _normalize_action_crop_image(path: Path, *, canvas_height: int = 40, content_height: int = 32) -> None:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as source:
+            image = source.convert("RGBA")
+        if image.width <= 0 or image.height <= 0:
+            return
+        scale = min(content_height / image.height, 340 / image.width)
+        width = max(1, round(image.width * scale))
+        height = max(1, round(image.height * scale))
+        resized = image.resize((width, height), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", (width + 8, canvas_height), (255, 255, 255, 0))
+        canvas.alpha_composite(resized, (4, max(0, (canvas_height - height) // 2)))
+        canvas.save(path)
+    except Exception:
+        return
+
+
+def _is_action_crop_label(label: str) -> bool:
+    text = re.sub(r"\s+", "", str(label or ""))
+    if not text or text in {
+        "操作", "状态", "已启用", "待启用", "待评估", "有冲突", "已适配", "处理中", "已完成",
+        "已归档", "正常", "异常", "在线", "离线", "成功", "失败",
+    }:
+        return False
+    return bool(
+        re.search(
+            r"登录|进入|查询|搜索|筛选|重置|保存|新增|添加|登记|录入|创建|编辑|修改|配置|"
+            r"导入|上传|导出|下载|打印|校验|核验|检验|评定|审核|复核|确认|发布|下发|提交|"
+            r"处置|整改|调度|排程|预警|追踪|跟踪|统计|分析|归档|删除|失效|打开|查看|"
+            r"详情|关闭|取消|返回|刷新|同步|定位|分派|流转|研判|留痕|更新|重试|播放|收藏",
+            text,
+        )
+    )
+
+
+def _action_crop_has_visible_content(path: Path) -> bool:
+    try:
+        from PIL import Image, ImageStat
+    except ImportError:
+        return True
+    try:
+        with Image.open(path) as source:
+            image = source.convert("RGB")
+            width, height = image.size
+            if width < 18 or height < 14:
+                return False
+            inset_x = max(2, min(width // 8, 12))
+            inset_y = max(2, min(height // 8, 8))
+            interior = image.crop((inset_x, inset_y, width - inset_x, height - inset_y))
+            quantized = interior.quantize(colors=16)
+            colors = quantized.getcolors(maxcolors=16) or []
+            if not colors:
+                return False
+            _, dominant_index = max(colors)
+            palette = quantized.getpalette() or []
+            offset = dominant_index * 3
+            dominant = tuple(palette[offset : offset + 3])
+            pixel_map = interior.load()
+            pixels = [pixel_map[x, y] for y in range(interior.height) for x in range(interior.width)]
+            informative = sum(
+                1 for pixel in pixels if max(abs(int(pixel[channel]) - int(dominant[channel])) for channel in range(3)) >= 18
+            )
+            informative_ratio = informative / max(len(pixels), 1)
+            luminance_stddev = float(ImageStat.Stat(interior.convert("L")).stddev[0])
+            return informative_ratio >= 0.008 and luminance_stddev >= 2.5
+    except Exception:
+        return False
 
 
 def _instant_interaction_text_hits(text: str) -> list[str]:
@@ -3886,7 +4037,7 @@ def _inject_runtime_script_into_ai_page(html_path: Path, *, module_keys: Iterabl
     html = _ensure_runtime_layout_guard(html)
     html = _ensure_operation_evidence_block(html)
     script = runtime_api_script()
-    if "soft-runtime-api-script:v10" in html:
+    if "soft-runtime-api-script:v11" in html:
         html_path.write_text(_sanitize_formal_ui_html(html), encoding="utf-8")
         return
     if "__runtimeApiReady" in html:
@@ -4027,7 +4178,7 @@ def _set_body_attribute(html: str, name: str, value: str) -> str:
 
 def runtime_api_script() -> str:
     return r"""
-<!-- soft-runtime-api-script:v10 -->
+<!-- soft-runtime-api-script:v11 -->
 <script>
 (function () {
   const body = document.body;
@@ -4284,7 +4435,7 @@ def runtime_api_script() -> str:
     const panels = Array.from(document.querySelectorAll(".runtime-record-panel"));
     function bindPanel(panel) {
       const codeValue = cleanCode(valueForField(record, "编号", pick(record, ["code"], "YW-0001")));
-      const nameValue = pick(record, ["name", "moduleTitle"], "当前业务记录");
+      const nameValue = pick(record, ["name", "moduleTitle", "code"], "当前对象");
       const scopeValue = pick(record, ["serviceScope", "region", "nodeSequence"], "默认范围");
       const statusValue = statusText(record.status);
       const code = panel.querySelector("[data-runtime-field='code']");
@@ -4322,7 +4473,11 @@ def runtime_api_script() -> str:
     const pins = Array.from(document.querySelectorAll(".map-pin"));
     pins.forEach((pin, index) => {
       const record = records[index % records.length];
-      const labelNode = pin.childNodes[0];
+      const directTextNode = Array.from(pin.childNodes || []).find(
+        (node) => node.nodeType === Node.TEXT_NODE && String(node.textContent || "").trim()
+      );
+      const labelElement = pin.querySelector(":scope > [data-runtime-field='name'], :scope > b, :scope > strong");
+      const labelNode = directTextNode || labelElement;
       const label = pick(record, ["name", "moduleTitle", "code"], labelNode && labelNode.textContent || "");
       const small = pin.querySelector("small");
       if (labelNode) labelNode.textContent = String(label || "").slice(0, 18);
@@ -6281,7 +6436,12 @@ def _is_transport_route_context(blueprint: ProductBlueprint) -> bool:
         ]
         if str(item).strip()
     )
-    return bool(re.search(r"交通|运输|干线|支线|线路|路径|接驳|换乘|站点|客运|货运", text))
+    rail_quality = bool(re.search(r"轨道交通|地铁|铁路|轨道工程", text)) and bool(
+        re.search(r"施工质量|工程质量|检验批|检验点|材料复检|整改|验收|工程部位|单位工程|标段", text)
+    )
+    if rail_quality:
+        return False
+    return bool(re.search(r"交通运输|运输调度|公交|客运|货运|干线|支线|班次|车次|发车|换乘|接驳|运力|站点|枢纽|线路调度|客流|票务", text))
 
 
 def _workspace_ribbon(profile: dict[str, Any], active: str) -> str:

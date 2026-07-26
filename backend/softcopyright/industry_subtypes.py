@@ -7,7 +7,7 @@ from typing import Any
 
 from .design_dna import build_design_dna
 from .models import GenerationTask
-from .module_keys import semantic_module_key
+from .module_keys import is_placeholder_module_key, semantic_module_key
 
 
 @dataclass(frozen=True)
@@ -76,6 +76,7 @@ INDUSTRY_SUBTYPES: dict[str, tuple[IndustrySubtype, ...]] = {
     "VR软件": (
         IndustrySubtype("vr_training", "VR安全培训系统", "虚拟现实培训", "三维场景、设备校准、训练任务、成绩评分、体验记录和复盘分析", "面向培训机构或企业安全培训的沉浸式训练平台", ("内容管理员", "设备管理员", "培训教师", "体验学员"), ("虚拟场景", "训练任务", "VR设备", "交互脚本", "体验记录", "成绩评分", "复盘报告"), ("场景完成率", "设备在线率", "平均训练时长", "成绩达标率", "异常退出数", "复盘报告数"), ("pipeline", "command", "matrix"), ("side_menu", "top_tabs"), ("VR培训运营台", "沉浸训练任务界面", "设备与体验监控台"), ("场景任务+设备状态", "训练链路+成绩评分", "体验记录+复盘分析"), ("设备详情", "训练发布", "成绩统计"), ("发布", "审核", "统计", "详情", "预警")),
         IndustrySubtype("vr_showroom", "VR展厅内容管理系统", "虚拟展厅与数字内容", "展厅场景、素材资源、路线配置、讲解脚本、设备状态和访问统计", "面向数字展厅运营的VR内容发布与设备管理平台", ("展厅运营", "内容管理员", "设备管理员", "讲解人员"), ("展厅场景", "三维素材", "游览路线", "讲解脚本", "头显设备", "访问记录"), ("场景访问量", "素材审核数", "设备在线率", "平均停留时长", "路线完成率", "讲解触发量"), ("matrix", "pipeline", "command"), ("top_tabs", "side_menu"), ("VR展厅运营界面", "虚拟内容发布台", "设备巡检管理界面"), ("场景访问+素材审核", "路线配置+设备在线", "讲解脚本+访问统计"), ("素材审核", "路线配置", "设备详情"), ("审核", "发布", "查询", "统计", "导出")),
+        IndustrySubtype("vr_spatial_modeling", "三维空间建模与测绘平台", "三维空间建模与地理测绘", "空间模型导入、坐标配准、点云与倾斜摄影处理、模型分块编辑、质量检查和成果交付", "面向测绘、GIS和三维建模团队的空间数据生产与成果管理平台", ("测绘工程师", "三维建模人员", "质量检查人员", "成果审核人员"), ("测绘项目", "空间模型", "坐标控制点", "点云数据", "倾斜摄影", "模型分块", "纹理材质", "测绘成果"), ("模型接入成功率", "坐标配准误差", "点云处理进度", "分块接边通过率", "质量问题闭环率", "成果交付数量"), ("map", "pipeline", "matrix"), ("side_menu", "rail", "top_tabs"), ("三维空间生产工作台", "测绘模型编辑界面", "空间成果质量控制台"), ("三维场景+作业队列", "坐标配准+质量结果", "模型分块+成果交付"), ("模型编辑器", "坐标配准", "质量检查"), ("导入", "定位", "校验", "编辑", "审核", "导出")),
     ),
     "5G软件": (
         IndustrySubtype("private_network", "5G专网运维平台", "5G专网与边缘运维", "基站站点、网络切片、边缘节点、终端接入、QoS监控和告警派单", "面向行业专网运营团队的5G网络保障平台", ("网络管理员", "边缘节点管理员", "业务运营员", "监控人员"), ("基站站点", "网络切片", "边缘节点", "终端接入", "QoS指标", "告警派单", "流量趋势"), ("平均时延", "切片达标率", "边缘负载", "终端在线数", "告警闭环率", "流量峰值"), ("map", "pipeline", "command"), ("side_menu", "top_tabs"), ("5G专网监控台", "边缘节点运维界面", "切片保障工作台"), ("站点地图+切片指标", "边缘节点+告警派单", "QoS趋势+终端接入"), ("站点详情", "切片开通", "告警处置"), ("定位", "发布", "预警", "统计", "详情")),
@@ -110,27 +111,36 @@ def select_industry_subtype(task: GenerationTask) -> IndustrySubtype:
 def select_industry_subtype_for_context(task: GenerationTask, context_text: str = "") -> IndustrySubtype:
     product_type = _context_product_type(task, context_text)
     choices = INDUSTRY_SUBTYPES.get(product_type, DEFAULT_SUBTYPES)
-    matched = _keyword_matched_subtype(task, choices, context_text)
+    matched = _keyword_matched_subtype(task, choices, "")
+    if not matched and context_text:
+        matched = _keyword_matched_subtype(task, choices, context_text)
     if matched:
         return matched
-    seed = _seed_value(task, "industry-subtype")
-    return choices[seed % len(choices)]
+    if product_type in {"APP", "智慧城市软件"}:
+        return DEFAULT_SUBTYPES[0]
+    return choices[0] if choices else DEFAULT_SUBTYPES[0]
 
 
 def _context_product_type(task: GenerationTask, context_text: str = "") -> str:
-    primary_text = f"{task.software_name} {task.product_type} {task.feature_hint}"
-    domain_text = f"{task.software_name} {task.feature_hint} {context_text}"
+    input_text = _task_input_text(task)
+    primary_text = f"{input_text} {task.product_type}"
+    domain_text = f"{input_text} {context_text}"
     full_text = f"{primary_text} {context_text}"
+    if re.search(r"(?:APP|App|app)(?:\b|二期|平台|系统|服务)?", input_text) and not re.search(
+        r"后台|管理后台|运营后台|控制台|管理端|商家端|门店端|平台端|PC端|Web端",
+        input_text,
+    ):
+        return "APP"
     if _has_rail_construction_quality_signal(domain_text):
         return "智慧城市软件"
-    if _has_transport_domain_signal(domain_text):
-        return "智慧城市软件" if task.product_type not in {"地理信息软件", "物联网软件"} else task.product_type
     if re.search(r"医疗|医院|诊疗|处方|病历|药品|随访|护理|患者|手术|麻醉|科室|医生|住院|病区|床位|生命体征|医嘱", full_text):
         return "医疗软件"
     if re.search(r"云计算|云资源|云主机|云平台|容器|集群|Kubernetes|K8S|k8s|资源编排|弹性伸缩|租户|SaaS", full_text):
         return "云计算软件"
     if task.product_type in INDUSTRY_SUBTYPES and _strong_product_type_signal(task.product_type, primary_text):
         return task.product_type
+    if _has_transport_domain_signal(domain_text):
+        return "智慧城市软件" if task.product_type not in {"地理信息软件", "物联网软件"} else task.product_type
     if _has_transport_domain_signal(primary_text):
         return "智慧城市软件" if task.product_type == "智慧城市软件" else task.product_type
     return task.product_type
@@ -170,6 +180,8 @@ def _keyword_matched_subtype(task: GenerationTask, choices: tuple[IndustrySubtyp
     query_text = f"{task.software_name} {task.feature_hint} {task.product_type} {context_text}".lower()
     best: tuple[int, IndustrySubtype] | None = None
     for subtype in choices:
+        if subtype.key == "rail_construction_quality" and not _has_rail_construction_quality_signal(query_text):
+            continue
         score = 0
         for keyword in _explicit_subtype_keywords(subtype):
             if keyword.lower() in query_text:
@@ -193,11 +205,20 @@ def _keyword_matched_subtype(task: GenerationTask, choices: tuple[IndustrySubtyp
 
 
 def _task_match_keywords(task: GenerationTask, context_text: str = "") -> list[str]:
-    text = f"{task.software_name} {task.feature_hint} {task.product_type} {context_text}"
+    text = f"{_task_input_text(task)} {task.product_type} {context_text}"
     return [item.lower() for item in re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]{2,}", text) if len(item.strip()) >= 2]
 
 
+def _task_input_text(task: GenerationTask) -> str:
+    feature_hint = getattr(task, "input_feature_hint", None)
+    if feature_hint is None:
+        feature_hint = task.feature_hint
+    return f"{task.software_name} {feature_hint or ''}".strip()
+
+
 def _explicit_subtype_keywords(subtype: IndustrySubtype) -> tuple[str, ...]:
+    if subtype.key == "community_service":
+        return ("社区预约", "社区服务", "预约服务", "场地预约", "活动预约", "上门预约", "门店预约", "社区生活")
     if subtype.key == "rail_construction_quality":
         return ("轨道交通", "地铁", "铁路", "施工质量", "工程质量", "检验批", "检验点", "质量计划", "材料复检", "整改", "验收", "标段", "单位工程", "工程部位")
     if subtype.key == "smart_manufacturing":
@@ -208,19 +229,26 @@ def _explicit_subtype_keywords(subtype: IndustrySubtype) -> tuple[str, ...]:
         return ("手术", "手术室", "术前", "术后", "术式", "麻醉", "科室", "医生", "护士")
     if subtype.key == "transport_route":
         return ("交通", "运输", "干线", "支线", "线路", "路径", "班次", "接驳", "换乘", "站点", "公交", "客运")
+    if subtype.key == "vr_spatial_modeling":
+        return ("测绘", "GIS", "地理信息", "空间模型", "三维模型", "实景三维", "点云", "倾斜摄影", "坐标配准", "控制点", "模型分块", "纹理贴合")
     return ()
 
 
 def subtype_module_specs(subtype: IndustrySubtype, fallback_specs: list[tuple[str, str, str, list[str]]]) -> list[tuple[str, str, str, list[str]]]:
     specs: list[tuple[str, str, str, list[str]]] = []
+    used_keys: set[str] = set()
     for index, term in enumerate(subtype.domain_terms[:7], start=1):
         title = _module_title(term)
         key = semantic_module_key(
             title,
             index,
             raw_key="",
+            used=used_keys,
             context_terms=[term, subtype.title, subtype.scenario, subtype.positioning],
         )
+        if is_placeholder_module_key(key):
+            key = f"{subtype.key}_feature_{index:02d}"
+        used_keys.add(key)
         desc = f"围绕{subtype.title}中的{term}提供业务录入、状态跟踪、异常处理和统计分析。"
         entities = [f"{_ascii_prefix(subtype.key)}Record{index}", f"{_ascii_prefix(subtype.key)}Flow{index}"]
         specs.append((key, title, desc, entities))

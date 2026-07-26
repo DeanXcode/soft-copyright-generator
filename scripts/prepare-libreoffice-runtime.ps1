@@ -61,8 +61,22 @@ New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destinationPath) 
 Copy-Item -LiteralPath $sourcePath -Destination $destinationPath -Recurse -Force
 
 $sofficePath = Join-Path $destinationPath "program\soffice.exe"
-if (-not (Test-Path -LiteralPath $sofficePath)) {
-  throw "LibreOffice runtime copy is incomplete: $sofficePath"
+$requiredRuntimePaths = @(
+  $sofficePath,
+  (Join-Path $destinationPath "program\soffice.com"),
+  (Join-Path $destinationPath "program\services"),
+  (Join-Path $destinationPath "program\types\offapi.rdb")
+)
+foreach ($requiredPath in $requiredRuntimePaths) {
+  if (-not (Test-Path -LiteralPath $requiredPath)) {
+    throw "LibreOffice runtime copy is incomplete: $requiredPath"
+  }
+}
+
+$sofficeConsolePath = Join-Path $destinationPath "program\soffice.com"
+& $sofficeConsolePath --headless --version | Out-Host
+if ($LASTEXITCODE -ne 0) {
+  throw "LibreOffice runtime startup probe failed with exit code ${LASTEXITCODE}: $sofficeConsolePath"
 }
 
 $sizeBytes = (Get-ChildItem -LiteralPath $destinationPath -Recurse -Force | Measure-Object -Property Length -Sum).Sum

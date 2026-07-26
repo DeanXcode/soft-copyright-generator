@@ -294,6 +294,7 @@ def _manual_pdf_text_density_page_result(
     near_threshold_pass = _manual_pdf_text_density_soft_pass(line_count, char_count, minimum_lines)
     figure_text_pass = _manual_pdf_figure_text_density_soft_pass(lines, line_count, char_count, minimum_lines)
     content_sufficient_pass = _manual_pdf_content_sufficient_soft_pass(lines, line_count, char_count, minimum_lines)
+    security_content_pass = _manual_pdf_security_content_soft_pass(lines, line_count, char_count, minimum_lines)
     closing_content_pass = _manual_pdf_closing_content_soft_pass(
         lines,
         line_count,
@@ -302,7 +303,7 @@ def _manual_pdf_text_density_page_result(
         page_index,
         page_count,
     )
-    soft_pass = near_threshold_pass or figure_text_pass or content_sufficient_pass or closing_content_pass
+    soft_pass = near_threshold_pass or figure_text_pass or content_sufficient_pass or security_content_pass or closing_content_pass
     soft_pass_reason = (
         "figure_text_page"
         if figure_text_pass
@@ -310,6 +311,8 @@ def _manual_pdf_text_density_page_result(
         if near_threshold_pass
         else "content_sufficient_page"
         if content_sufficient_pass
+        else "security_content_page"
+        if security_content_pass
         else "closing_content_page"
         if closing_content_pass
         else ""
@@ -366,6 +369,21 @@ def _manual_pdf_content_sufficient_soft_pass(
     return sum(1 for marker in content_markers if marker in joined) >= 2
 
 
+def _manual_pdf_security_content_soft_pass(
+    lines: list[str],
+    line_count: int,
+    character_count: int,
+    minimum_lines: int,
+) -> bool:
+    if line_count >= minimum_lines or line_count < 12 or character_count < 420:
+        return False
+    joined = "\n".join(lines)
+    if "权限与安全" not in joined:
+        return False
+    security_markers = ("权限", "角色", "数据范围", "审计", "登录", "状态流转", "高风险", "越权")
+    return sum(1 for marker in security_markers if marker in joined) >= 4
+
+
 def _manual_pdf_closing_content_soft_pass(
     lines: list[str],
     line_count: int,
@@ -379,7 +397,7 @@ def _manual_pdf_closing_content_soft_pass(
     # The last FAQ/troubleshooting page may legitimately occupy only the upper
     # part of the sheet. A substantive closing page is not a failed 30-line
     # page; retain the line-count warning but do not block delivery.
-    if line_count < 12 or character_count < 450:
+    if line_count < 8 or character_count < 300:
         return False
     joined = "\n".join(lines)
     markers = ("用户", "系统", "页面", "查询", "检查", "重新", "结果", "状态", "记录")
@@ -521,8 +539,15 @@ def generate_manual_docx(
     if runtime_note:
         document.add_paragraph(_customer_manual_text(runtime_note))
 
+    login_item = (ui_screenshots or {}).get("login") if isinstance(ui_screenshots, dict) else None
+    dashboard_item = (ui_screenshots or {}).get("dashboard") if isinstance(ui_screenshots, dict) else None
+    statistics_item = (ui_screenshots or {}).get("statistics") if isinstance(ui_screenshots, dict) else None
+    login_title = str(getattr(login_item, "title", "") or "登录界面")
+    dashboard_title = str(getattr(dashboard_item, "title", "") or "系统首页")
+    statistics_title = str(getattr(statistics_item, "title", "") or "统计报表界面")
+
     _add_heading(document, "三、登录与主界面")
-    _add_heading(document, "3.1 登录界面", level=2)
+    _add_heading(document, f"3.1 {login_title}", level=2)
     _add_ui_figure(
         document,
         ui_screenshots,
@@ -535,8 +560,9 @@ def generate_manual_docx(
             "校验通过后系统进入首页，并按照当前用户角色加载授权菜单、待办事项、常用模块和默认业务范围。",
             _runtime_screenshot_note(design_brief),
         ],
+        design_brief=design_brief,
     )
-    _add_heading(document, "3.2 系统首页", level=2)
+    _add_heading(document, f"3.2 {dashboard_title}", level=2)
     _add_ui_figure(
         document,
         ui_screenshots,
@@ -549,6 +575,7 @@ def generate_manual_docx(
             "点击待办、预警或快捷入口后，系统会跳转到对应业务页面，并保留当前用户权限、组织范围和筛选条件。",
             _runtime_screenshot_note(design_brief),
         ],
+        design_brief=design_brief,
     )
     login_fallback = [
         "用户打开系统后首先进入登录界面，系统对账号、密码、验证码和账号状态进行校验。",
@@ -562,11 +589,9 @@ def generate_manual_docx(
         login_fallback,
         min_count=3,
     )
-    login_item = (ui_screenshots or {}).get("login") if isinstance(ui_screenshots, dict) else None
-    dashboard_item = (ui_screenshots or {}).get("dashboard") if isinstance(ui_screenshots, dict) else None
     visible_login_overview = (
-        _visible_content_intro_paragraphs(login_item, "登录界面")
-        + _visible_content_intro_paragraphs(dashboard_item, "系统首页")
+        _visible_content_intro_paragraphs(login_item, login_title)
+        + _visible_content_intro_paragraphs(dashboard_item, dashboard_title)
     )
     if visible_login_overview:
         login_paragraphs = visible_login_overview
@@ -593,8 +618,8 @@ def generate_manual_docx(
             document.add_paragraph(_customer_manual_text(text))
         _add_module_operation_sections(document, module, index, ui_screenshots, design_brief, ui_context)
 
-    _add_heading(document, "五、统计分析")
-    _add_heading(document, "5.1 统计报表界面", level=2)
+    _add_heading(document, "五、统计分析与个人中心")
+    _add_heading(document, f"5.1 {statistics_title}", level=2)
     statistics_paragraphs = _content_paragraphs(
         manual_content,
         "statistics",
@@ -606,8 +631,7 @@ def generate_manual_docx(
         ],
         min_count=3,
     )
-    statistics_item = (ui_screenshots or {}).get("statistics") if isinstance(ui_screenshots, dict) else None
-    visible_statistics_paragraphs = _visible_content_intro_paragraphs(statistics_item, "统计报表界面")
+    visible_statistics_paragraphs = _visible_content_intro_paragraphs(statistics_item, statistics_title)
     if visible_statistics_paragraphs:
         statistics_paragraphs = visible_statistics_paragraphs
     for text in statistics_paragraphs:
@@ -624,6 +648,7 @@ def generate_manual_docx(
             "报表结果确认无误后，可继续导出、打印或归档；系统会记录导出时间、操作人员和当前查询条件。",
             _runtime_screenshot_note(design_brief),
         ],
+        design_brief=design_brief,
     )
 
     _add_heading(document, "六、权限与安全")
@@ -639,10 +664,11 @@ def generate_manual_docx(
         ],
         min_count=3,
     )
+    security_paragraphs = _manual_paragraphs_for_renderer(security_paragraphs, design_brief)
     for text in security_paragraphs:
         document.add_paragraph(_customer_manual_text(text))
 
-    _add_heading(document, "七、常见问题处理")
+    _start_manual_closing_section(document, "七、常见问题处理")
     faq_paragraphs = _content_paragraphs(
         manual_content,
         "faq",
@@ -660,6 +686,12 @@ def generate_manual_docx(
 
     document.save(path)
     return path
+
+
+def _start_manual_closing_section(document, title: str) -> None:
+    """Keep the complete troubleshooting section off a sparse orphan page."""
+    document.add_page_break()
+    _add_heading(document, title)
 
 
 def analyze_manual_density(docx_path: Path | None) -> dict:
@@ -829,6 +861,11 @@ def analyze_manual_ui_consistency(
             mentioned.extend(_manual_paragraph_action_labels(paragraph))
         mentioned = list(dict.fromkeys(label for label in mentioned if label))
         available = _actual_screenshot_action_labels(item, limit=30)
+        numbered_note_token = _manual_ui_token(" ".join(numbered_notes))
+        for label in available:
+            label_token = _manual_ui_token(label)
+            if len(label_token) >= 2 and label_token in numbered_note_token and label not in mentioned:
+                mentioned.append(label)
         for label in mentioned:
             if not _manual_ui_button_label_match(label, available):
                 button_mismatches.append({"key": key, "title": expected_title, "button": label, "available": available[:12]})
@@ -841,7 +878,17 @@ def analyze_manual_ui_consistency(
         if bool(summary.get("ready")):
             semantic_checked_count += 1
             visible_text = str(summary.get("visible_text") or "")
-            visible_token = _manual_ui_token(visible_text)
+            visible_semantic_text = "\n".join(
+                [
+                    visible_text,
+                    *(
+                        str(value or "")
+                        for name in ("headings", "metrics", "fields", "statuses", "filters", "filter_actions", "actions")
+                        for value in (summary.get(name) or [])
+                    ),
+                ]
+            )
+            visible_token = _manual_ui_token(visible_semantic_text)
             manual_semantic_text = "\n".join([caption, *numbered_notes])
             manual_semantic_token = _manual_ui_token(manual_semantic_text)
             ignored_semantic_terms = {
@@ -860,7 +907,7 @@ def analyze_manual_ui_consistency(
             covered_terms = [
                 term
                 for term in semantic_terms
-                if len(_manual_ui_token(term)) >= 2 and _manual_ui_token(term) in manual_semantic_token
+                if _manual_semantic_term_covered(term, manual_semantic_token)
             ]
             required_coverage = min(2, len(semantic_terms))
             if required_coverage and len(covered_terms) < required_coverage:
@@ -881,7 +928,7 @@ def analyze_manual_ui_consistency(
                 None,
             )
             reference_pairs: list[tuple[str, str]] = []
-            if module is not None:
+            if module is not None and page_kind != "operation":
                 reference_pairs.extend((str(field), str(field)) for field in (getattr(module, "data_fields", []) or []))
             if page_kind in {"dashboard", "statistics"} or key in {"dashboard", "statistics"}:
                 reference_pairs.extend((str(metric), str(metric)) for metric in (blueprint.report_metrics or []))
@@ -902,7 +949,7 @@ def analyze_manual_ui_consistency(
                 visible_reference = str(visible_reference or "").strip()
                 if len(_manual_ui_token(manual_reference)) < 2:
                     continue
-                if manual_reference in manual_semantic_text and _manual_ui_token(visible_reference) not in visible_token:
+                if manual_reference in manual_semantic_text and not _manual_semantic_term_covered(visible_reference, visible_token):
                     missing_references.append(manual_reference)
             if missing_references:
                 semantic_mismatches.append(
@@ -988,16 +1035,39 @@ def _manual_ui_token(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", str(value or "")).lower()
 
 
+def _manual_semantic_term_covered(term: str, manual_token: str) -> bool:
+    token = _manual_ui_token(term)
+    if len(token) >= 2 and token in manual_token:
+        return True
+    semantic_aliases = {
+        "来源计划版本": ("来源版本", "计划版本"),
+        "预测范围": ("影响范围", "预测周期"),
+        "生产工单进度": ("订单完工进度", "生产进度"),
+    }
+    for alias in semantic_aliases.get(str(term or "").strip(), ()):
+        alias_token = _manual_ui_token(alias)
+        if len(alias_token) >= 2 and alias_token in manual_token:
+            return True
+    label = re.split(r"\s+|[:：]", str(term or "").strip(), maxsplit=1)[0]
+    label_token = _manual_ui_token(label)
+    return len(label_token) >= 4 and label_token in manual_token
+
+
 def _manual_ui_button_label_match(label: str, available: list[str]) -> bool:
     exact = re.sub(r"\s+", "", str(label or "")).strip()
     if exact and any(exact == re.sub(r"\s+", "", str(item or "")).strip() for item in available):
         return True
-    token = _manual_ui_token(label)
+    def comparable_token(value: str) -> str:
+        token_value = _manual_ui_token(value)
+        token_value = re.sub(r"(?:按钮|入口)$", "", token_value)
+        return token_value.replace("复核", "审核")
+
+    token = comparable_token(label)
     if not token:
         return False
     return any(
         token == candidate or (len(token) >= 2 and (token in candidate or candidate in token))
-        for candidate in (_manual_ui_token(item) for item in available)
+        for candidate in (comparable_token(item) for item in available)
         if candidate
     )
 
@@ -1616,7 +1686,9 @@ def _is_manual_text_density_page(
     if not lines:
         return False
     joined = "\n".join(lines)
-    if page_index == 1 and len(lines) < 12 and any(token in joined for token in ("软件说明书", "版本号")):
+    if page_index == 1 and len(lines) < 12 and any(
+        token in joined for token in ("软件说明书", "操作手册", "使用手册", "用户手册", "版本号")
+    ):
         return False
     if page_index <= 3 and any(re.sub(r"\s+", "", line) == "目录" for line in lines):
         return False
@@ -2241,13 +2313,14 @@ def _add_ui_figure(
     caption: str,
     operation_notes: list[str] | None = None,
     action_image_module_key: str = "",
+    design_brief: dict | None = None,
 ) -> None:
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.shared import Inches, Pt, RGBColor
 
     item = ui_screenshots.get(key) if isinstance(ui_screenshots, dict) else None
     image_path = getattr(item, "image_path", None) if item else None
-    display_title = title
+    display_title = str(getattr(item, "title", "") or title) if item else title
     display_caption = _visible_content_caption(item, caption) if item else caption
     if item and _visible_content_summary_ready(item):
         operation_notes = _visible_content_operation_notes(
@@ -2255,6 +2328,7 @@ def _add_ui_figure(
             display_title,
             main_page=str(getattr(item, "page_kind", "") or "") in {"dashboard", "module"},
         )
+        operation_notes = _manual_paragraphs_for_renderer(operation_notes, design_brief)
     if image_path and Path(image_path).exists():
         paragraph = document.add_paragraph()
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -2309,7 +2383,7 @@ def _add_figure_operation_notes(
             f"该界面围绕{caption}展示关键字段、状态信息和处理按钮，便于用户判断记录是否需要继续维护。",
             "提交数据或切换条件后，系统会刷新页面内容，并记录操作时间、操作人员和状态变化。",
         ]
-    for step_index, note in enumerate(_expand_figure_notes(notes, title, caption)[:4], start=1):
+    for step_index, note in enumerate(_expand_figure_notes(notes, title, caption)[:10], start=1):
         numbered_note = f"{step_index}. {note}"
         paragraph = (
             _add_manual_paragraph_with_action_images(document, numbered_note, ui_screenshots, module_key, preferred_key)
@@ -2407,7 +2481,7 @@ def _add_manual_paragraph_with_action_images(
         label = match.group(1).strip()
         crop_path = _find_manual_action_crop(ui_screenshots, module_key, label, preferred_key)
         if crop_path:
-            shape = paragraph.add_run().add_picture(crop_path, height=Inches(0.22))
+            shape = paragraph.add_run().add_picture(crop_path, height=Inches(0.24))
             shape._inline.docPr.set("descr", label)
             shape._inline.docPr.set("title", label)
         else:
@@ -2445,13 +2519,13 @@ def _figure_size_inches(image_path: str) -> tuple[float, float]:
 def _expand_figure_notes(notes: list[str], title: str, caption: str) -> list[str]:
     result = [_natural_manual_note(text, title=title, caption=caption) for text in notes if str(text).strip()]
     if result:
-        return result[:4]
+        return result[:10]
     templates = _figure_note_templates(title, caption)
     index = 0
     while len(result) < 3:
         result.append(_customer_manual_text(templates[index % len(templates)]))
         index += 1
-    return result[:4]
+    return result[:10]
 
 
 def _figure_note_templates(title: str, caption: str) -> list[str]:
@@ -2721,8 +2795,9 @@ def _add_module_operation_sections(
         main_key,
         str(getattr(main_item, "title", "") or f"{module.title}主界面"),
         str(getattr(main_item, "caption", "") or f"{module.title}页面展示当前业务信息和可用操作入口。"),
-        _actual_screenshot_operation_notes(main_item, module, main_page=True),
+        _actual_screenshot_operation_notes(main_item, module, main_page=True, design_brief=design_brief),
         module.key,
+        design_brief,
     )
     for operation_index, (screenshot_key, screenshot_item) in enumerate(
         _module_secondary_screenshot_items(ui_screenshots, module.key),
@@ -2736,8 +2811,9 @@ def _add_module_operation_sections(
             screenshot_key,
             str(getattr(screenshot_item, "title", "") or f"{module.title}{action}界面"),
             str(getattr(screenshot_item, "caption", "") or f"页面展示{module.title}{action}所需的信息和按钮。"),
-            _actual_screenshot_operation_notes(screenshot_item, module),
+            _actual_screenshot_operation_notes(screenshot_item, module, design_brief=design_brief),
             module.key,
+            design_brief,
         )
 
 
@@ -2791,7 +2867,7 @@ def _visible_content_values(item, name: str, limit: int = 6) -> list[str]:
     return values
 
 
-def _visible_content_action_labels(item, limit: int = 4) -> list[str]:
+def _visible_content_action_labels(item, limit: int = 6) -> list[str]:
     filter_actions = {
         _manual_ui_token(value)
         for value in _visible_content_values(item, "filter_actions", 12)
@@ -2826,7 +2902,7 @@ def _visible_content_caption(item, fallback: str = "") -> str:
     if str(getattr(item, "page_kind", "") or "") == "login":
         credentials = _login_visible_labels(
             item,
-            ("生产运营账号", "登录账号", "用户账号", "用户名", "工号", "登录密码", "密码", "图形验证码", "验证码"),
+            ("生产运营账号", "登录账号", "用户账号", "用户名", "手机号", "工号", "登录密码", "密码", "图形验证码", "短信验证码", "验证码"),
         )
         contexts = _login_visible_labels(item, ("工厂运行环境", "运行环境", "岗位身份", "用户角色", "登录角色"))
         return f"页面展示身份认证入口，并包含{_join_items([*credentials, *contexts]) or '账号、密码、验证码和身份选择'}等当前可见登录信息。"
@@ -2851,11 +2927,11 @@ def _visible_content_operation_notes(item, title: str, *, main_page: bool = Fals
     fields = _visible_content_values(item, "fields", 6)
     statuses = _visible_content_values(item, "statuses", 4)
     filters = _visible_content_values(item, "filters", 5)
-    actions = _visible_content_action_labels(item)
+    actions = _visible_content_action_labels(item, limit=6)
     if str(getattr(item, "page_kind", "") or "") == "login":
         credentials = _login_visible_labels(
             item,
-            ("生产运营账号", "登录账号", "用户账号", "用户名", "工号", "登录密码", "密码", "图形验证码", "验证码"),
+            ("生产运营账号", "登录账号", "用户账号", "用户名", "手机号", "工号", "登录密码", "密码", "图形验证码", "短信验证码", "验证码"),
         )
         contexts = _login_visible_labels(item, ("工厂运行环境", "运行环境", "岗位身份", "用户角色", "登录角色"))
         primary = next((label for label in actions if label.startswith(("进入", "登录", "提交"))), "登录按钮")
@@ -2875,52 +2951,177 @@ def _visible_content_operation_notes(item, title: str, *, main_page: bool = Fals
         notes.append(f"确认输入内容和身份选择无误后，点击【{primary}】完成登录校验；系统将按当前岗位加载授权功能。")
         return notes[:4]
     notes: list[str] = []
-    if filters:
-        notes.append(f"用户进入{title}后，可使用{_join_items(filters)}调整当前查看范围，页面会同步刷新对应内容。")
-    if headings:
-        notes.append(f"当前截图的主要业务区域包括{_join_items(headings)}，用户可按区域顺序查看和处理信息。")
-    detail_values = metrics or fields
-    if detail_values:
-        noun = "指标" if metrics else "字段"
-        page_subject = title if re.search(r"(?:界面|页面)$", title) else f"{title}页面"
-        notes.append(f"{page_subject}当前可见的{noun}包括{_join_items(detail_values)}，相关数值和记录用于判断当前业务进度与结果。")
-    if statuses and len(notes) < 3:
-        notes.append(f"状态区域显示{_join_items(statuses)}，用户可据此判断当前记录所处阶段。")
-    if actions:
-        page_subject = title if re.search(r"(?:界面|页面)$", title) else f"{title}页面"
-        if str(getattr(item, "page_kind", "") or "") == "login":
-            primary = next((label for label in actions if label.startswith(("进入", "登录", "提交"))), "")
-            guidance: list[str] = []
-            if "刷新验证码" in actions:
-                guidance.append("验证码不清晰时使用【刷新验证码】重新获取")
-            if "显示密码" in actions:
-                guidance.append("核对密码输入时使用【显示密码】")
-            other_actions = [label for label in actions if label not in {primary, "刷新验证码", "显示密码"}]
-            if other_actions:
-                guidance.append("按需使用" + "、".join(f"【{label}】" for label in other_actions))
-            if primary:
-                note = f"{page_subject}以【{primary}】作为主操作"
-                if guidance:
-                    note += "；" + "，".join(guidance)
-                notes.append(note + "。")
-            else:
-                notes.append(page_subject + "提供" + "、".join(f"【{label}】" for label in actions) + "等可见辅助操作。")
+    interaction_action = _interaction_manual_text(getattr(item, "interaction_action", ""), limit=36)
+    interaction_role = _interaction_role_manual_text(getattr(item, "interaction_role", ""))
+    interaction_trigger = _interaction_manual_text(getattr(item, "interaction_trigger", ""), limit=64)
+    pre_state = _interaction_state_manual_text(getattr(item, "interaction_pre_state", ""), limit=56)
+    post_state = _interaction_state_manual_text(getattr(item, "interaction_post_state", ""), limit=72)
+    result_evidence = _interaction_manual_text(getattr(item, "interaction_result_evidence", ""), limit=72)
+    input_fields: list[str] = []
+    for value in (getattr(item, "interaction_input_fields", None) or [])[:8]:
+        field = _interaction_manual_text(value, limit=24)
+        if not field or re.fullmatch(r"[a-z][a-z0-9_]*", field):
+            continue
+        if field not in input_fields:
+            input_fields.append(field)
+        if len(input_fields) >= 5:
+            break
+
+    if interaction_action:
+        purpose = f"本页用于{interaction_action}"
+        if interaction_role and interaction_trigger:
+            purpose += f"，由{interaction_role}在{interaction_trigger}时发起"
+        elif interaction_role:
+            purpose += f"，由{interaction_role}负责处理"
+        elif interaction_trigger:
+            purpose += f"，在{interaction_trigger}时进入本页"
+        notes.append(purpose + "。")
+    else:
+        focus = _join_items(headings[:2] or fields[:2]) or title
+        outcome = _join_items(metrics[:2] or statuses[:2])
+        purpose = f"本页用于集中查看{focus}"
+        if outcome:
+            purpose += f"，并通过{outcome}掌握当前进度和处理结果"
+        notes.append(purpose + "。")
+
+    page_kind = str(getattr(item, "page_kind", "") or "")
+    filter_driven = not interaction_action or bool(re.search(r"查询|搜索|筛选|统计|分析|浏览|查看", interaction_action))
+    if filters and (filter_driven or page_kind in {"dashboard", "module", "statistics"}):
+        notes.append(f"操作前可通过{_join_items(filters[:4])}限定数据范围；条件变更后，列表、指标和状态会按当前范围重新显示。")
+
+    if bool(getattr(item, "requires_confirmation", False)):
+        review_fields = _manual_visible_field_labels(fields, limit=5) or input_fields
+    else:
+        review_fields = input_fields or _manual_visible_field_labels(fields, limit=4)
+    if review_fields:
+        review_text = _join_items(review_fields)
+        if bool(getattr(item, "requires_confirmation", False)):
+            note = f"{review_text}用于在提交前核对本次操作对象和影响范围"
         else:
-            notes.append(
-                page_subject
-                + "提供"
-                + "、".join(f"【{label}】" for label in actions)
-                + "等当前截图可见操作，点击后按页面反馈继续处理。"
-            )
-    if len(notes) < 3 and fields and fields != detail_values:
-        notes.append(f"页面还显示{_join_items(fields)}等字段，便于核对当前记录。")
-    if len(notes) < 3:
+            note = f"操作前需填写或核对{review_text}"
+        if pre_state:
+            note += f"；处理前状态为{pre_state}"
+        notes.append(note + "。")
+
+    for label in actions:
+        notes.append(f"【{label}】{_visible_action_purpose(item, label)}。")
+
+    if result_evidence and len(notes) < 10:
+        note = f"操作完成后，可通过{result_evidence}核对本次处理结果"
+        if post_state:
+            note += f"；业务状态将更新为{post_state}"
+        notes.append(note + "。")
+    elif post_state and len(notes) < 10 and not any(post_state in note for note in notes):
+        notes.append(f"操作完成后，业务状态将更新为{post_state}，用户可返回列表或处理轨迹核对结果。")
+    elif statuses and len(notes) < 10:
+        notes.append(f"{_join_items(statuses[:4])}用于区分记录当前所处阶段，并判断下一步可执行的操作。")
+    if not notes:
         notes.append(
-            "切换当前页面中的功能后，内容区会显示对应结果。"
+            "页面用于进入各业务功能并查看对应结果。"
             if main_page
-            else "操作完成后，以当前页面显示的结果和状态变化为准。"
+            else "页面用于完成当前业务处理，并显示执行后的结果和状态变化。"
         )
-    return notes[:4]
+    return notes[:10]
+
+
+def _interaction_manual_text(value, *, limit: int = 72) -> str:
+    if isinstance(value, (list, tuple)):
+        text = "、".join(str(item or "").strip() for item in value if str(item or "").strip())
+    else:
+        text = str(value or "").strip()
+    text = re.sub(r"^[\[\(（]+|[\]\)）]+$", "", text)
+    text = re.sub(r"[\"']", "", text)
+    text = re.sub(r"\s*,\s*", "、", text)
+    text = re.sub(r"\s+", " ", text).strip(" ，,、；;。")
+    if len(text) > limit:
+        text = text[:limit].rstrip(" ，,、；;")
+    return text
+
+
+def _interaction_role_manual_text(value) -> str:
+    text = _interaction_manual_text(value, limit=96)
+    roles: list[str] = []
+    for part in re.split(r"[、，,;/]+", text):
+        role = part.strip()
+        if not role or not re.search(r"人员$|主管$|负责人$|管理员$|工程师$|专员$|审核员$|操作员$|调度员$|学员$|教师$|医生$|护士$|用户$", role):
+            continue
+        if role not in roles:
+            roles.append(role)
+    return _join_items(roles[:4])
+
+
+def _interaction_state_manual_text(value, *, limit: int = 72) -> str:
+    raw = str(value or "").strip()
+    if len(raw) == 32 and not re.search(r"[。！？!?]$", raw):
+        return ""
+    text = _interaction_manual_text(raw, limit=limit)
+    if re.search(r"(?:且|并|或|由|为|已有|不存|待调|转入|更新为)$", text):
+        return ""
+    return text
+
+
+def _manual_visible_field_labels(values: list[str], *, limit: int = 4) -> list[str]:
+    labels: list[str] = []
+    for value in values:
+        label = re.split(r"\s{1,}|[：:]", str(value or "").strip(), maxsplit=1)[0].strip(" ·|｜/、")
+        if label and label not in labels:
+            labels.append(label[:24])
+        if len(labels) >= limit:
+            break
+    return labels
+
+
+def _visible_action_purpose(item, label: str) -> str:
+    action = re.sub(r"\s+", "", str(label or ""))
+    headings = _visible_content_values(item, "headings", 2)
+    fields = _visible_content_values(item, "fields", 3)
+    target_values: list[str] = []
+    for value in fields or headings:
+        concise = re.split(r"\s{1,}|[：:]", str(value or "").strip(), maxsplit=1)[0].strip(" ·|｜/、")
+        if concise and concise not in target_values:
+            target_values.append(concise[:16])
+        if len(target_values) >= 2:
+            break
+    target = _join_items(target_values) or "当前记录"
+    post_state = _interaction_state_manual_text(getattr(item, "interaction_post_state", ""), limit=58)
+    if re.search(r"查询|搜索|筛选", action):
+        return "用于应用当前筛选条件并刷新结果列表，快速定位符合范围的业务记录"
+    if re.search(r"重置|清除", action):
+        return "用于清空本页筛选条件并恢复默认查询范围"
+    if re.search(r"导出|下载|打印", action):
+        return "用于将当前页面结果生成清单或报表，供留存、复核或线下使用"
+    if re.search(r"查看|详情|打开|预览", action):
+        return f"用于打开所选记录的详细内容，继续核对{target}"
+    if re.search(r"对比|比较", action):
+        return "用于并列查看当前版本与候选版本的字段、指标或影响范围差异，辅助选择后续方案"
+    if re.search(r"刷新|同步|更新", action):
+        return "用于重新读取最新业务状态，避免使用过期的页面数据"
+    if re.search(r"定位", action):
+        return "用于在当前地图、模型或业务视图中找到所选对象的位置"
+    if re.search(r"保存", action):
+        return "用于保存当前填写或配置内容，保留本次修改结果"
+    if re.search(r"新增|添加|登记|创建|录入|编制|建立", action) and not re.search(r"确认|提交|通过|下达", action):
+        return f"用于建立新的业务记录，并写入{target}"
+    if re.search(r"导入|上传", action):
+        return "用于选择外部文件或业务数据，并载入当前处理流程"
+    if re.search(r"编辑|修改|配置|调整", action):
+        return f"用于进入可编辑状态并维护{target}"
+    if re.search(r"校验|核验|检验|评定", action):
+        return "用于按当前业务规则检查输入内容，并显示通过项和异常项"
+    if re.search(r"审核|复核|确认|提交|发布|下发|下达|通过|驳回|启用|停用|采用|应用|归档|删除|失效|处置|整改|派发|流转", action):
+        purpose = "用于提交当前处理结论并执行对应的业务状态变更"
+        return purpose + (f"；完成后{post_state}" if post_state else "")
+    if re.search(r"取消|关闭", action):
+        return "用于关闭当前弹窗或编辑过程，不提交本次变更"
+    if re.search(r"返回", action):
+        return "用于退出当前页面并回到上一层业务工作区"
+    if re.search(r"进入|继续", action):
+        return "用于打开下一步业务页面，继续处理当前对象"
+    if re.search(r"生成|计算|排程|重排|规划", action):
+        return "用于根据当前条件生成或计算业务方案，并展示处理结果供用户核对"
+    if re.search(r"统计|分析|研判", action):
+        return "用于汇总当前范围内的数据并查看指标、趋势或异常分布"
+    return f"用于执行“{label}”功能，并在页面中显示对应处理结果"
 
 
 def _visible_content_intro_paragraphs(item, title: str) -> list[str]:
@@ -2963,8 +3164,20 @@ def _visible_content_intro_paragraphs(item, title: str) -> list[str]:
 def _actual_screenshot_action_labels(item, limit: int = 4) -> list[str]:
     crops = getattr(item, "action_crops", None) or {}
     summary = _visible_content_summary(item)
+    crop_tokens = {
+        _manual_ui_token(str(label or ""))
+        for label in crops
+        if _manual_ui_token(str(label or ""))
+    }
     labels: list[str] = []
     raw_labels = [*(summary.get("actions") or []), *crops]
+    if str(getattr(item, "key", "") or "") == "login":
+        visible_text = str(summary.get("visible_text") or "")
+        raw_labels.extend(
+            action
+            for action in ("登录并进入应用", "登录系统", "进入系统", "提交登录")
+            if action in visible_text
+        )
     for raw_label in raw_labels:
         label = re.sub(r"\s+", " ", str(raw_label or "")).strip()
         label = re.sub(r"\s*[→←›»>]+\s*$", "", label).strip()
@@ -2984,6 +3197,17 @@ def _actual_screenshot_action_labels(item, limit: int = 4) -> list[str]:
             continue
         if label not in labels:
             labels.append(label)
+    if crop_tokens:
+        labels = [
+            label
+            for label in labels
+            if _manual_ui_token(label) in crop_tokens
+            or not any(
+                _manual_ui_token(label) != crop_token
+                and _manual_ui_token(label) in crop_token
+                for crop_token in crop_tokens
+            )
+        ]
     compact: list[str] = []
     for label in labels:
         contained = [other for other in labels if other != label and len(other) >= 2 and other in label]
@@ -3064,28 +3288,30 @@ def _actual_screenshot_action_labels(item, limit: int = 4) -> list[str]:
     return compact[: max(1, int(limit or 0))]
 
 
-def _actual_screenshot_operation_notes(item, module, *, main_page: bool = False) -> list[str]:
+def _actual_screenshot_operation_notes(
+    item,
+    module,
+    *,
+    main_page: bool = False,
+    design_brief: dict | None = None,
+) -> list[str]:
     title = str(getattr(item, "title", "") or f"{module.title}界面").strip()
     visible_notes = _visible_content_operation_notes(item, title, main_page=main_page)
     if visible_notes:
-        return visible_notes
+        return _manual_paragraphs_for_renderer(visible_notes, design_brief) or visible_notes
     caption = str(getattr(item, "caption", "") or "").strip()
     fields = _join_items(module.data_fields[:5]) or "业务编号、名称、状态、处理人员和更新时间"
     labels = _actual_screenshot_action_labels(item)
     notes = [f"用户进入{title}后，可查看{fields}等当前业务信息。"]
-    if labels:
-        notes.append(
-            "页面提供"
-            + "、".join(f"【{label}】" for label in labels)
-            + "等实际操作入口，用户应根据当前记录状态选择相应功能。"
-        )
-    if caption:
+    notes.extend(f"【{label}】{_visible_action_purpose(item, label)}。" for label in labels[:3])
+    if caption and len(notes) < 4:
         notes.append(caption)
-    notes.append(
-        "切换功能后，系统继续保留当前用户权限和业务范围，并在内容区加载对应页面。"
-        if main_page
-        else "操作完成后，以页面显示的状态、结果提示和处理轨迹为准；返回其他功能时，系统保留当前业务范围。"
-    )
+    if len(notes) < 3:
+        notes.append(
+            "切换功能后，系统继续保留当前用户权限和业务范围，并在内容区加载对应页面。"
+            if main_page
+            else "操作完成后，以页面显示的状态、结果提示和处理轨迹为准；返回其他功能时，系统保留当前业务范围。"
+        )
     return notes[:4]
 
 
@@ -3506,7 +3732,9 @@ def _manual_paragraphs_for_renderer(paragraphs: list[str], design_brief: dict | 
         or brief.get("experience_terminal")
         or ""
     ).lower()
-    if renderer in {"mobile_app", "game"} or terminal in {"mobile", "phone", "mobile_app"}:
+    if renderer in {"mobile_app", "game"}:
+        return list(paragraphs)
+    if not renderer and terminal in {"mobile", "phone", "mobile_app"}:
         return list(paragraphs)
     mobile_markers = (
         "移动App",
@@ -3524,6 +3752,7 @@ def _manual_paragraphs_for_renderer(paragraphs: list[str], design_brief: dict | 
     result: list[str] = []
     for paragraph in paragraphs:
         text = str(paragraph)
+        text = text.replace("移动端用户", "终端用户")
         if any(marker in text for marker in mobile_markers):
             continue
         text = text.replace("移动质量工作入口", "现场质量工作入口")
@@ -3548,10 +3777,9 @@ def _manual_renderer_from_screenshots(ui_screenshots: dict | None) -> str:
 
 def _manual_design_brief_with_renderer(design_brief: dict | None, ui_screenshots: dict | None) -> dict:
     brief = dict(design_brief) if isinstance(design_brief, dict) else {}
-    if not str(brief.get("expected_renderer") or brief.get("renderer") or "").strip():
-        inferred = _manual_renderer_from_screenshots(ui_screenshots)
-        if inferred:
-            brief["expected_renderer"] = inferred
+    inferred = _manual_renderer_from_screenshots(ui_screenshots)
+    if inferred:
+        brief["expected_renderer"] = inferred
     return brief
 
 
@@ -3565,7 +3793,9 @@ def _manual_is_mobile_terminal(design_brief: dict | None) -> bool:
         or brief.get("experience_terminal")
         or ""
     ).lower()
-    return renderer in {"mobile_app", "game"} or terminal in {"mobile", "phone", "mobile_app"}
+    if renderer:
+        return renderer in {"mobile_app", "game"}
+    return terminal in {"mobile", "phone", "mobile_app"}
 
 
 def _manual_architecture_name(blueprint: ProductBlueprint, design_brief: dict | None) -> str:

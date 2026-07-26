@@ -7,6 +7,10 @@ from backend.softcopyright.operation_coverage import (
     configured_operation_screen_count,
     module_operation_category,
     module_operation_coverage,
+    operation_action_label,
+    operation_caption,
+    operation_page_title,
+    OperationCoverageSpec,
     operation_spec,
 )
 from backend.softcopyright.ai_frontend_codegen import _visual_reference_cache_key
@@ -15,6 +19,24 @@ from backend.softcopyright.ui_blueprint import UiBlueprint, UiScreenBlueprint
 
 
 class OperationCoverageTests(unittest.TestCase):
+    def test_legacy_domain_actions_do_not_repeat_module_title(self):
+        self.assertEqual(operation_action_label("施工工序管理评定"), "评定")
+        self.assertEqual(operation_action_label("质量计划管理验收"), "验收")
+        self.assertEqual(operation_page_title("施工工序管理", "施工工序管理评定"), "施工工序管理评定界面")
+        caption = operation_caption(
+            "门店核销管理",
+            OperationCoverageSpec(
+                action="核验门店核销",
+                category="workflow",
+                surface="workflow_result",
+                mode="workflow",
+                role="平台运营",
+                trigger="需要核验门店核销时",
+            ),
+        )
+        self.assertIn("需要核验门店核销时发起", caption)
+        self.assertNotIn("时时发起", caption)
+
     def test_style_reference_cache_is_independent_of_manual_page_count(self):
         task = SimpleNamespace(seed="seed-1", software_name="\u751f\u4ea7\u5e73\u53f0", product_type="\u4eba\u5de5\u667a\u80fd\u8f6f\u4ef6")
         ui_blueprint = SimpleNamespace(

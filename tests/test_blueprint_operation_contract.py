@@ -5,7 +5,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 import unittest
 
-from backend.softcopyright.blueprint import FeatureModule, ProductBlueprint
+from backend.softcopyright.blueprint import FeatureModule, ProductBlueprint, generate_blueprint
+from backend.softcopyright.industry_subtypes import INDUSTRY_SUBTYPES
 from backend.softcopyright.llm_blueprint import (
     _clean_workflows,
     _generate_module_batches,
@@ -14,6 +15,7 @@ from backend.softcopyright.llm_blueprint import (
     _quality_review,
     _select_contract_modules,
     blueprint_contract_issues,
+    normalize_cached_blueprint_candidate,
 )
 from backend.softcopyright.models import GenerationTask
 from backend.softcopyright.module_keys import is_placeholder_module_key, semantic_module_key
@@ -111,6 +113,114 @@ class BlueprintOperationContractTests(unittest.TestCase):
 
         self.assertEqual(blueprint_contract_issues(self.task, blueprint), [])
 
+    def test_local_template_subtype_modules_keep_unique_keys(self):
+        task = GenerationTask(
+            software_name="零令牌模板安装验收系统",
+            product_type="APP",
+            feature_hint="用户入口、首页导航、核心工作台、业务表单处理、记录查询、统计分析、消息提醒、系统设置",
+            model_provider="local-template",
+            seed="local-template-key-smoke",
+        )
+
+        blueprint = generate_blueprint(task)
+        keys = [module.key for module in blueprint.modules]
+
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertGreaterEqual(len(keys), 6)
+        self.assertTrue(all(len(module.operation_specs) >= 3 for module in blueprint.modules))
+        self.assertGreaterEqual(blueprint.quality_score, 86)
+        self.assertEqual(blueprint_contract_issues(task, blueprint), [])
+        self.assertNotIn("业务记录", json.dumps(blueprint.to_dict(), ensure_ascii=False))
+
+    def test_local_community_modules_use_distinct_domain_operations_and_workflows(self):
+        task = GenerationTask(
+            software_name="社区生活预约服务平台",
+            product_type="APP",
+            feature_hint="社区预约、门店核销、会员权益、消息推送、售后工单、活动运营和订单支付",
+            model_provider="local-template",
+            seed="community-semantic-diversity",
+        )
+
+        blueprint = generate_blueprint(task)
+        operation_signatures = {
+            tuple((operation["category"], operation["label"]) for operation in module.operation_specs)
+            for module in blueprint.modules
+        }
+        normalized_descriptions = {
+            module.description.replace(module.title, "{模块}").replace(module.title.removesuffix("管理"), "{对象}")
+            for module in blueprint.modules
+        }
+        workflow_steps = {
+            tuple(workflow["steps"])
+            for workflow in blueprint.workflows
+        }
+
+        self.assertEqual(blueprint.industry_subtype_key, "community_service")
+        self.assertEqual(
+            [module.title for module in blueprint.modules],
+            ["服务预约管理", "门店核销管理", "会员权益管理", "消息推送管理", "售后工单管理", "活动入口管理", "订单支付管理"],
+        )
+        expected_keys = {
+            "服务预约管理": "service_booking",
+            "门店核销管理": "store_redemption",
+            "会员权益管理": "member_benefit",
+            "消息推送管理": "message_delivery",
+            "售后工单管理": "aftersales_ticket",
+            "活动入口管理": "campaign_entry",
+            "订单支付管理": "order_payment",
+        }
+        self.assertTrue(all(module.key == expected_keys[module.title] for module in blueprint.modules))
+        self.assertGreaterEqual(len(operation_signatures), 4)
+        self.assertGreaterEqual(len(normalized_descriptions), 4)
+        self.assertTrue(any("创建服务预约" in operation["label"] for module in blueprint.modules for operation in module.operation_specs))
+        self.assertTrue(any("执行门店核销" in operation["label"] for module in blueprint.modules for operation in module.operation_specs))
+        self.assertTrue(any("发布活动入口" in operation["label"] for module in blueprint.modules for operation in module.operation_specs))
+        self.assertEqual(len(workflow_steps), 3)
+        self.assertFalse(any(str(workflow["name"]).endswith("闭环流程") for workflow in blueprint.workflows))
+        self.assertGreaterEqual(blueprint.quality_score, 86)
+        self.assertEqual(blueprint_contract_issues(task, blueprint), [])
+
+    def test_contract_review_rejects_noun_substituted_operation_templates(self):
+        blueprint = _valid_blueprint(self.task)
+        blueprint.modules = []
+        for index in range(1, 7):
+            title = f"生产对象{index}管理"
+            subject = title.removesuffix("管理")
+            operations = [
+                _operation(f"object_{index}_query", f"筛选{subject}", "lookup", "操作员", "需要定位对象", [f"{subject}编号", "业务状态"], "未应用查询条件", "显示匹配业务对象", "筛选条件和结果数量"),
+                _operation(f"object_{index}_verify", f"核验{subject}", "workflow", "操作员", "对象待处理", [f"{subject}编号", "业务状态"], "记录处于待处理状态", "记录更新为已核验", "核验结论和操作日志"),
+                _operation(f"object_{index}_archive", f"归档{subject}结果", "result", "操作员", "对象已完成核验", [f"{subject}编号", "业务状态"], "记录已完成核验", "记录更新为已归档", "归档编号和完成时间"),
+            ]
+            module = _module(f"production_object_{index}", title, operations)
+            module.description = f"围绕{subject}提供业务录入、状态跟踪、异常处理和统计分析。"
+            blueprint.modules.append(module)
+
+        issues = blueprint_contract_issues(self.task, blueprint)
+
+        self.assertTrue(any("结构化操作缺少语义差异" in issue for issue in issues))
+        self.assertTrue(any("说明仅替换业务对象" in issue for issue in issues))
+
+    def test_all_local_subtypes_pass_semantic_contract_review(self):
+        checked = 0
+        for product_type, subtypes in INDUSTRY_SUBTYPES.items():
+            for subtype in subtypes:
+                task = GenerationTask(
+                    software_name=subtype.title,
+                    product_type=product_type,
+                    feature_hint="、".join(subtype.domain_terms),
+                    model_provider="local-template",
+                    seed=f"semantic-audit-{subtype.key}",
+                )
+
+                blueprint = generate_blueprint(task)
+                checked += 1
+
+                self.assertEqual(blueprint.industry_subtype_key, subtype.key)
+                self.assertGreaterEqual(blueprint.quality_score, 86)
+                self.assertEqual(blueprint_contract_issues(task, blueprint), [])
+
+        self.assertGreaterEqual(checked, 37)
+
     def test_missing_specs_and_mobile_pollution_fail_contract_review(self):
         blueprint = _valid_blueprint(self.task)
         blueprint.modules[0].operation_specs = []
@@ -159,9 +269,44 @@ class BlueprintOperationContractTests(unittest.TestCase):
             self.assertEqual(key, expected)
             self.assertFalse(is_placeholder_module_key(key))
 
+    def test_prefabricated_building_quality_keys_are_repaired_locally(self):
+        cases = {
+            "构件进场验收": "component_site_acceptance",
+            "预制构件安装定位校验": "component_installation_positioning_prefabricated",
+            "拼装节点与连接质量检查": "assembly_joint_connection_quality",
+            "灌浆与焊接质量检验": "welding_quality_grouting",
+            "质量缺陷整改复验": "quality_defect_rectification_reinspection",
+        }
+
+        for index, (title, expected) in enumerate(cases.items(), start=1):
+            key = semantic_module_key(title, index, raw_key=f"domain_{index:02d}_24005")
+            self.assertEqual(key, expected)
+            self.assertFalse(is_placeholder_module_key(key))
+
+    def test_unknown_chinese_title_fallback_never_creates_a_forbidden_domain_hash(self):
+        key = semantic_module_key("量子态熵谱跃迁", 6, raw_key="domain_06_24005")
+
+        self.assertTrue(key.startswith("capability_06_"))
+        self.assertFalse(is_placeholder_module_key(key))
+
+    def test_prefabricated_quality_candidate_passes_weak_key_gate_after_local_normalization(self):
+        task = GenerationTask(
+            software_name="装配式建筑构件安装质量智能校验与管理平台",
+            product_type="人工智能软件",
+        )
+        blueprint = generate_blueprint(task)
+        blueprint.modules[-1].title = "质量缺陷整改复验"
+        blueprint.modules[-1].key = "domain_06_24005"
+
+        normalized = normalize_cached_blueprint_candidate(task, blueprint)
+        issues = blueprint_contract_issues(task, normalized)
+
+        self.assertEqual(normalized.modules[-1].key, "quality_defect_rectification_reinspection")
+        self.assertFalse(any("弱语义模块 key" in issue for issue in issues))
+
     def test_admin_blueprint_terminal_semantics_are_normalized_without_touching_mobile_apps(self):
         polluted = {
-            "summary": "生产主管登录移动 App，在个人中心收藏计划并离线缓存甘特图。",
+            "summary": "生产主管登录移动 App，移动端会员状态通过底部导航进入个人中心，并收藏计划和离线缓存甘特图。",
             "workflows": [
                 {
                     "name": "首页推荐",
@@ -181,6 +326,9 @@ class BlueprintOperationContractTests(unittest.TestCase):
         normalized_text = str(normalized)
 
         self.assertNotIn("移动 App", normalized_text)
+        self.assertNotIn("移动端", normalized_text)
+        self.assertNotIn("会员状态", normalized_text)
+        self.assertNotIn("底部导航", normalized_text)
         self.assertNotIn("个人中心", normalized_text)
         self.assertNotIn("离线查看", normalized_text)
         self.assertIn("工业生产运营工作台", normalized_text)
@@ -202,6 +350,48 @@ class BlueprintOperationContractTests(unittest.TestCase):
             _expected_plan_terminal(GenerationTask(software_name="个人待办清单", product_type="APP")),
             "mobile_app",
         )
+        self.assertEqual(
+            _expected_plan_terminal(
+                GenerationTask(
+                    software_name="客户服务协同平台",
+                    product_type="APP",
+                    feature_hint="客户咨询、客服工单、投诉处理和服务回访",
+                )
+            ),
+            "admin",
+        )
+
+    def test_customer_service_modules_receive_stable_semantic_keys(self):
+        cases = {
+            "客户咨询接入": "customer_inquiry",
+            "工单派发调度": "ticket_dispatch",
+            "客户投诉闭环": "customer_complaint",
+            "服务回访安排": "service_followup",
+            "服务评价采集": "service_evaluation",
+            "客户签收与验收结论": "customer_acceptance_conclusion",
+        }
+
+        for index, (title, expected) in enumerate(cases.items(), start=1):
+            key = semantic_module_key(title, index, raw_key=f"domain_{index:02d}_75070")
+            self.assertEqual(key, expected)
+            self.assertFalse(is_placeholder_module_key(key))
+
+    def test_cached_admin_candidate_is_normalized_and_rescored_without_model_call(self):
+        blueprint = generate_blueprint(self.task)
+        blueprint.quality_score = 80
+        blueprint.summary += " 生产主管通过手机 App 和移动端进入个人中心，并使用离线缓存。"
+        blueprint.workflows[0]["trigger"] += "，随后从手机 App 进入个人中心"
+        blueprint.modules[-1].title = "客户签收与验收结论"
+        blueprint.modules[-1].key = "domain_08_72556"
+
+        normalized = normalize_cached_blueprint_candidate(self.task, blueprint)
+        normalized_text = json.dumps(normalized.to_dict(), ensure_ascii=False)
+
+        self.assertEqual(normalized.quality_score, _quality_review(self.task, normalized)[0])
+        self.assertEqual(normalized.modules[-1].key, "customer_acceptance_conclusion")
+        self.assertEqual(blueprint_contract_issues(self.task, normalized), [])
+        for term in ("移动端", "手机 App", "个人中心", "离线缓存"):
+            self.assertNotIn(term, normalized_text)
 
     def test_accepted_blueprint_loader_requires_matching_identity_and_quality(self):
         blueprint = _valid_blueprint(self.task)
@@ -243,7 +433,19 @@ class BlueprintOperationContractTests(unittest.TestCase):
         self.assertEqual(workflows[0]["steps"][0], step)
         self.assertGreater(len(workflows[0]["steps"][0]), 32)
 
-    def test_final_validator_requires_contract_only_for_formal_gpt_mode(self):
+    def test_workflow_cleanup_completes_exactly_32_character_truncated_steps(self):
+        step = "读取客户工单与服务记录并核对当前处理状态后提交协同人员继续跟进并反馈客户处理结果"
+        step = step[:32]
+
+        workflows = _clean_workflows(
+            [{"name": "协同流程", "trigger": "工单提交", "steps": [step, "校验处理状态并输出结果", "记录协同结论并归档"], "output": "处理记录"}]
+        )
+
+        self.assertEqual(len(step), 32)
+        self.assertGreater(len(workflows[0]["steps"][0]), 32)
+        self.assertTrue(workflows[0]["steps"][0].endswith("系统记录处理结果。"))
+
+    def test_final_validator_requires_contract_for_all_generation_modes(self):
         blueprint = _valid_blueprint(self.task)
         with TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir)
@@ -258,6 +460,7 @@ class BlueprintOperationContractTests(unittest.TestCase):
                 checks={
                     "blueprint_operation_contract_ready": False,
                     "blueprint_operation_contract_issues": ["生产计划协同缺少至少 3 个结构化操作契约"],
+                    "blueprint_task_domain_ready": True,
                 },
             )
             local_task = GenerationTask(
@@ -274,7 +477,7 @@ class BlueprintOperationContractTests(unittest.TestCase):
                 ui_blueprint=None,
                 ui_screenshots={},
                 deliverable_files=[],
-                checks={"blueprint_operation_contract_ready": False},
+                checks={"blueprint_operation_contract_ready": False, "blueprint_task_domain_ready": True},
             )
 
         gpt_codes = {item["code"] for item in gpt_validation["findings"]}
@@ -282,9 +485,9 @@ class BlueprintOperationContractTests(unittest.TestCase):
         self.assertTrue(gpt_validation["authenticity"]["blueprint_operation_contract_required"])
         self.assertFalse(gpt_validation["authenticity"]["blueprint_operation_contract_ready"])
         self.assertIn("blueprint_operation_contract_not_ready", gpt_codes)
-        self.assertFalse(local_validation["authenticity"]["blueprint_operation_contract_required"])
-        self.assertTrue(local_validation["authenticity"]["blueprint_operation_contract_ready"])
-        self.assertNotIn("blueprint_operation_contract_not_ready", local_codes)
+        self.assertTrue(local_validation["authenticity"]["blueprint_operation_contract_required"])
+        self.assertFalse(local_validation["authenticity"]["blueprint_operation_contract_ready"])
+        self.assertIn("blueprint_operation_contract_not_ready", local_codes)
 
     def test_balanced_module_batches_repair_only_the_failed_batch(self):
         outline = [

@@ -105,7 +105,7 @@ class OpenAICompatibleProvider(LLMProvider):
             "stream": bool(self.config.stream) and not _messages_include_image(messages),
         }
         reasoning_effort = _normalize_reasoning_effort(self.config.reasoning_effort)
-        if reasoning_effort:
+        if reasoning_effort and _supports_reasoning_effort(self.config.provider):
             payload["reasoning_effort"] = reasoning_effort
         if response_format:
             payload["response_format"] = response_format
@@ -197,6 +197,7 @@ class OpenAICompatibleProvider(LLMProvider):
         }
         headers = _auth_headers(api_key)
         last_error: Exception | None = None
+        error_history: list[dict[str, Any]] = []
         timeout = int(getattr(self.config, "image_timeout", self.config.timeout) or self.config.timeout)
         total_attempts = max(1, getattr(self.config, "image_retry_count", self.config.retry_count) + 1)
         for attempt in range(1, total_attempts + 1):
@@ -244,6 +245,14 @@ class OpenAICompatibleProvider(LLMProvider):
                 last_error = exc
                 status_code = getattr(getattr(exc, "response", None), "status_code", None)
                 safe_error = sanitize_error_message(exc, limit=500)
+                error_history.append(
+                    {
+                        "attempt": attempt,
+                        "status_code": status_code,
+                        "size": size_for_attempt,
+                        "error": safe_error,
+                    }
+                )
                 trace_event(
                     "provider_image_request_error",
                     label=trace_label,
@@ -257,7 +266,131 @@ class OpenAICompatibleProvider(LLMProvider):
                     time.sleep(_retry_delay_seconds(attempt))
                     continue
                 break
-        raise RuntimeError(_image_failure_message(last_error, model=model, attempts=attempt))
+        raise RuntimeError(
+            _image_failure_message(last_error, model=model, attempts=attempt, error_history=error_history)
+        )
+
+
+class AnthropicProvider(LLMProvider):
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        response_format: dict[str, Any] | None = None,
+        trace_label: str = "",
+        timeout: int | None = None,
+    ) -> str:
+        base_url = self.config.base_url.rstrip("/")
+        if not base_url:
+            raise ValueError("Claude base_url 不能为空")
+        if not self.config.api_key:
+            raise ValueError("Claude api_key 不能为空")
+        url = base_url if base_url.endswith("/messages") else f"{base_url}/messages"
+        system_parts: list[str] = []
+        anthropic_messages: list[dict[str, Any]] = []
+        for message in messages:
+            role = str(message.get("role") or "user")
+            content = message.get("content", "")
+            if role == "system":
+                system_parts.append(_message_content_as_text(content))
+                continue
+            anthropic_messages.append(
+                {
+                    "role": "assistant" if role == "assistant" else "user",
+                    "content": _anthropic_message_content(content),
+                }
+            )
+        payload: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": anthropic_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if system_parts:
+            payload["system"] = "\n\n".join(part for part in system_parts if part)
+        headers = {
+            "x-api-key": self.config.api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        last_error: Exception | None = None
+        total_attempts = max(1, self.config.retry_count + 1)
+        effective_timeout = max(10, int(timeout or self.config.timeout or 120))
+        for attempt in range(1, total_attempts + 1):
+            started_at = time.perf_counter()
+            trace_event(
+                "provider_request_begin",
+                label=trace_label,
+                attempt=attempt,
+                total_attempts=total_attempts,
+                provider=self.config.provider,
+                model=self.config.model,
+                timeout=effective_timeout,
+                max_tokens=max_tokens,
+                message_count=len(messages),
+                response_format=bool(response_format),
+                multimodal=_messages_include_image(messages),
+                stream_hard_timeout=0,
+            )
+            try:
+                session = _new_requests_session()
+                try:
+                    response = session.post(url, json=payload, headers=headers, timeout=effective_timeout)
+                    response.raise_for_status()
+                    content = _extract_anthropic_content(response.json())
+                    if not content:
+                        raise ValueError("Claude response content is empty")
+                finally:
+                    session.close()
+                trace_event(
+                    "provider_request_success",
+                    label=trace_label,
+                    attempt=attempt,
+                    elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                    status_code=response.status_code,
+                    content_chars=len(content),
+                )
+                return content
+            except Exception as exc:
+                last_error = exc
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                trace_event(
+                    "provider_request_error",
+                    label=trace_label,
+                    attempt=attempt,
+                    elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                    status_code=status_code,
+                    error_type=type(exc).__name__,
+                    error=sanitize_error_message(exc, limit=500),
+                )
+                if attempt < total_attempts and _should_retry_provider_error(exc):
+                    time.sleep(_retry_delay_seconds(attempt))
+                    continue
+                break
+        raise RuntimeError(f"Claude 请求失败：{sanitize_error_message(last_error)}")
+
+    def generate_image(
+        self,
+        *,
+        prompt: str,
+        output_path: Path,
+        size: str = "1024x1024",
+        trace_label: str = "",
+    ) -> dict[str, Any]:
+        image_base_url = str(self.config.image_base_url or "").rstrip("/")
+        shares_text_endpoint = image_base_url == str(self.config.base_url or "").rstrip("/") and (
+            not self.config.image_api_key or self.config.image_api_key == self.config.api_key
+        )
+        if not image_base_url or shares_text_endpoint:
+            raise RuntimeError("Claude API 不提供当前流程所需的图片生成接口，请为图片阶段配置独立的 gpt-image-2 API")
+        image_config = _with_provider_type(self.config, "custom")
+        return OpenAICompatibleProvider(image_config).generate_image(
+            prompt=prompt,
+            output_path=output_path,
+            size=size,
+            trace_label=trace_label,
+        )
 
 
 def build_provider(config: LLMConfig) -> LLMProvider:
@@ -270,6 +403,15 @@ def build_provider(config: LLMConfig) -> LLMProvider:
     if provider == "deepseek":
         normalized = _with_default(config, base_url="https://api.deepseek.com")
         return OpenAICompatibleProvider(normalized)
+    if provider in {"grok", "xai"}:
+        normalized = _with_default(config, base_url="https://api.x.ai/v1")
+        return OpenAICompatibleProvider(normalized)
+    if provider in {"gemini", "google"}:
+        normalized = _with_default(config, base_url="https://generativelanguage.googleapis.com/v1beta/openai")
+        return OpenAICompatibleProvider(normalized)
+    if provider in {"claude", "anthropic"}:
+        normalized = _with_default(config, base_url="https://api.anthropic.com/v1")
+        return AnthropicProvider(normalized)
     if provider in {"custom", "openai-compatible"}:
         return OpenAICompatibleProvider(config)
     raise ValueError(f"不支持的模型供应商：{config.provider}")
@@ -398,9 +540,83 @@ def _with_default(config: LLMConfig, base_url: str) -> LLMConfig:
     )
 
 
+def _with_provider_type(config: LLMConfig, provider: str) -> LLMConfig:
+    return LLMConfig(
+        provider=provider,
+        base_url=config.base_url,
+        api_key=config.api_key,
+        model=config.model,
+        image_base_url=config.image_base_url,
+        image_api_key=config.image_api_key,
+        image_model=config.image_model,
+        timeout=config.timeout,
+        image_timeout=config.image_timeout,
+        retry_count=config.retry_count,
+        image_retry_count=config.image_retry_count,
+        stream=config.stream,
+        reasoning_effort=config.reasoning_effort,
+    )
+
+
 def _normalize_reasoning_effort(value: str) -> str:
     normalized = str(value or "").strip().lower()
     return normalized if normalized in {"minimal", "low", "medium", "high", "xhigh"} else "medium"
+
+
+def _supports_reasoning_effort(provider: str) -> bool:
+    return str(provider or "").strip().lower() in {"openai", "custom", "openai-compatible"}
+
+
+def _message_content_as_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content or "")
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text" or "text" in item:
+            parts.append(str(item.get("text") or ""))
+    return "\n".join(part for part in parts if part)
+
+
+def _anthropic_message_content(content: Any) -> str | list[dict[str, Any]]:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content or "")
+    blocks: list[dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text" or "text" in item:
+            blocks.append({"type": "text", "text": str(item.get("text") or "")})
+            continue
+        image_url = item.get("image_url")
+        if isinstance(image_url, dict):
+            image_url = image_url.get("url")
+        if isinstance(image_url, str) and image_url.startswith("data:") and ";base64," in image_url:
+            header, data = image_url.split(",", 1)
+            media_type = header[5:].split(";", 1)[0] or "image/png"
+            blocks.append(
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": data},
+                }
+            )
+    return blocks or ""
+
+
+def _extract_anthropic_content(data: dict[str, Any]) -> str:
+    blocks = data.get("content") if isinstance(data, dict) else None
+    if not isinstance(blocks, list):
+        return ""
+    return "".join(
+        str(block.get("text") or "")
+        for block in blocks
+        if isinstance(block, dict) and block.get("type") == "text"
+    ).strip()
 
 
 def _auth_headers(api_key: str) -> dict[str, str]:
@@ -486,35 +702,31 @@ def _image_prompt_for_attempt(prompt: str, attempt: int) -> str:
 
 def _image_size_for_attempt(size: str, attempt: int) -> str:
     text = str(size or "").strip().lower()
-    if attempt <= 1:
-        return text or "1280x720"
-    if not re.fullmatch(r"\d+x\d+", text):
-        return "1024x576"
-    width_text, height_text = text.split("x", 1)
-    try:
-        width = int(width_text)
-        height = int(height_text)
-    except ValueError:
-        return "1024x576"
-    if width >= height:
-        retry_sizes = ["1024x576", "768x432", "640x360"]
-    else:
-        retry_sizes = ["576x1024", "432x768", "360x640"]
-    index = min(max(attempt - 2, 0), len(retry_sizes) - 1)
-    candidate = retry_sizes[index]
-    cand_width, cand_height = (int(part) for part in candidate.split("x", 1))
-    if max(width, height) <= max(cand_width, cand_height):
-        return text
-    return candidate
+    # The image gateway may accept the configured project size while rejecting
+    # ad-hoc smaller dimensions. Retry with a shorter prompt, not a new contract.
+    return text if re.fullmatch(r"\d+x\d+", text) else "1024x1024"
 
 
-def _image_failure_message(exc: Exception | None, *, model: str, attempts: int) -> str:
+def _image_failure_message(
+    exc: Exception | None,
+    *,
+    model: str,
+    attempts: int,
+    error_history: list[dict[str, Any]] | None = None,
+) -> str:
     status_code = getattr(getattr(exc, "response", None), "status_code", None)
     detail = sanitize_error_message(exc)
     retry_text = f"，已请求 {attempts} 次" if attempts > 1 else ""
-    if status_code in {429, 500, 502, 503, 504, 520, 522, 523, 524}:
+    statuses = [
+        int(item["status_code"])
+        for item in (error_history or [])
+        if item.get("status_code") is not None
+    ]
+    status_summary = f"，状态序列 {' → '.join(str(item) for item in statuses)}" if statuses else ""
+    transient_statuses = {429, 500, 502, 503, 504, 520, 522, 523, 524}
+    if status_code in transient_statuses or any(item in transient_statuses for item in statuses):
         return (
-            f"图片生成请求失败：图片模型 {model} 当前返回 {status_code} 临时不可用{retry_text}。"
+            f"图片生成请求失败：图片模型 {model} 的上游服务临时不可用{retry_text}{status_summary}。"
             "正式流程不会使用模板或中间图兜底；请稍后保留蓝图重试，或检查图片模型配置 "
             "SOFT_MODEL_GPT_IMAGE_NAME / SOFT_MODEL_GPT_IMAGE_BASE_URL 是否指向可用的 gpt-image-2 图片服务；"
             "如果连续返回 502/524，通常需要更换、充值或修复 NewAPI 图片上游渠道。"
@@ -522,7 +734,7 @@ def _image_failure_message(exc: Exception | None, *, model: str, attempts: int) 
         )
     if status_code in {400, 401, 403, 404}:
         return (
-            f"图片生成请求失败：图片模型 {model} 的接口或权限配置不可用，状态码 {status_code}。"
+            f"图片生成请求失败：图片模型 {model} 的接口或权限配置不可用，状态码 {status_code}{status_summary}。"
             "请检查图片模型名称、图片网关权限和 API Key；正式流程不能跳过 image2 视觉参考稿。"
             f" 原始摘要：{detail}"
         )

@@ -13,6 +13,30 @@ from backend.softcopyright.screenshots import (
 
 
 class ScreenshotCheckpointResumeTests(unittest.TestCase):
+    def test_confirmation_summary_does_not_invent_contract_fields(self):
+        item = UiScreenshot(
+            "confirm",
+            "确认结果",
+            "确认结果。",
+            "confirm.html",
+            page_kind="operation",
+            requires_confirmation=True,
+            interaction_action="确认结果",
+            interaction_input_fields=["未显示的内部字段", "任务编号"],
+        )
+
+        summary = _normalize_visible_content_summary(
+            {
+                "visible_text": "确认结果 任务 2026-0718 状态影响 确认结果 取消",
+                "headings": ["确认结果"],
+                "fields": ["任务", "状态影响"],
+                "actions": ["取消", "确认结果"],
+            },
+            item,
+        )
+
+        self.assertEqual(summary["fields"], ["任务", "状态影响"])
+        self.assertNotIn("未显示的内部字段", summary["semantic_terms"])
     def test_resume_restores_only_the_contiguous_valid_prefix(self):
         with TemporaryDirectory() as temporary_directory:
             ui_dir = Path(temporary_directory)
@@ -145,6 +169,34 @@ class ScreenshotCheckpointResumeTests(unittest.TestCase):
         )
 
         self.assertEqual(summary["actions"], ["刷新验证码", "显示密码", "进入生产指挥台"])
+
+    def test_visible_content_summary_uses_screen_contract_for_plain_template_dom(self):
+        item = UiScreenshot(
+            "service_operation_2_2",
+            "服务预约管理查询界面",
+            "",
+            "service_operation_2_2.html",
+            page_kind="operation",
+            module_key="service_booking",
+            interaction_action="查询服务预约",
+            interaction_input_fields=["预约编号", "服务日期"],
+        )
+
+        summary = _normalize_visible_content_summary(
+            {
+                "visible_text": "服务预约管理 查询服务预约 预约编号 服务日期 待处理记录 12 条",
+                "headings": [],
+                "metrics": [],
+                "fields": [],
+                "actions": [],
+            },
+            item,
+        )
+
+        self.assertTrue(summary["ready"])
+        self.assertIn("服务预约管理查询界面", summary["headings"])
+        self.assertIn("预约编号", summary["fields"])
+        self.assertIn("查询服务预约", summary["actions"])
 
 
 if __name__ == "__main__":

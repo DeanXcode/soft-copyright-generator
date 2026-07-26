@@ -3,7 +3,12 @@ import unittest
 
 from PIL import Image, ImageDraw
 
-from backend.softcopyright.llm.provider import GeneratedImageQualityError, _inspect_generated_image
+from backend.softcopyright.llm.provider import (
+    GeneratedImageQualityError,
+    _image_failure_message,
+    _image_size_for_attempt,
+    _inspect_generated_image,
+)
 
 
 def _png_bytes(image: Image.Image) -> bytes:
@@ -13,6 +18,33 @@ def _png_bytes(image: Image.Image) -> bytes:
 
 
 class ImageQualityGateTests(unittest.TestCase):
+    def test_image_retry_keeps_the_configured_size(self):
+        self.assertEqual(_image_size_for_attempt("1280x720", 1), "1280x720")
+        self.assertEqual(_image_size_for_attempt("1280x720", 2), "1280x720")
+        self.assertEqual(_image_size_for_attempt("1280x720", 4), "1280x720")
+        self.assertEqual(_image_size_for_attempt("invalid", 2), "1024x1024")
+
+    def test_image_failure_prefers_transient_upstream_history(self):
+        class Response:
+            status_code = 400
+
+        error = RuntimeError("bad request")
+        error.response = Response()
+        message = _image_failure_message(
+            error,
+            model="gpt-image-2",
+            attempts=3,
+            error_history=[
+                {"status_code": 502},
+                {"status_code": 502},
+                {"status_code": 400},
+            ],
+        )
+
+        self.assertIn("上游服务临时不可用", message)
+        self.assertIn("502 → 502 → 400", message)
+        self.assertNotIn("API Key", message)
+
     def test_dense_dark_dashboard_passes_without_long_axis_edges(self):
         image = Image.new("RGB", (1280, 720), "#071b2a")
         draw = ImageDraw.Draw(image)

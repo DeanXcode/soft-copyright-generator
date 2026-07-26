@@ -237,6 +237,7 @@ def _generate_react_frontend_pages(
         component_path = screens_dir / f"{token}.jsx"
         css_path = screens_dir / f"{token}.css"
         meta_path = screens_dir / f"{token}.meta.json"
+        css_scope = _react_css_scope(page_key, index)
         creative_key = _page_creative_key(task, design_brief, item)
         progress = codegen_progress_start + min(4, int(index / max(total, 1) * 4))
         if not _react_component_cache_ready(component_path, css_path, meta_path, creative_key):
@@ -245,7 +246,7 @@ def _generate_react_frontend_pages(
             data = None
             last_error: Exception | None = None
             try:
-                for component_attempt in range(2):
+                for component_attempt in range(3):
                     if stop_event.is_set():
                         raise RuntimeError("React 页面生成已因模型网关错误停止")
                     try:
@@ -263,25 +264,60 @@ def _generate_react_frontend_pages(
                             index=index,
                             total=total,
                             component_name=component_name,
-                            css_scope=_react_css_scope(page_key, index),
+                            css_scope=css_scope,
                             creative_key=creative_key,
+                            validation_feedback=sanitize_error_message(last_error, limit=240) if last_error else "",
                         )
                         break
                     except ValueError as exc:
                         last_error = exc
+                        if _is_empty_frontend_response_error(exc):
+                            retry_budget = _frontend_transient_retry_budget(exc)
+                            if component_attempt < retry_budget:
+                                trace_event(
+                                    "ai_frontend_page_retry",
+                                    page_key=page_key,
+                                    index=index,
+                                    total=total,
+                                    retry_number=component_attempt + 1,
+                                    retry_budget=retry_budget,
+                                    reason=sanitize_error_message(exc, limit=300),
+                                )
+                                _emit(
+                                    emit,
+                                    progress,
+                                    f"{page_key} 模型返回空内容，正在重试当前页面 "
+                                    f"{component_attempt + 1}/{retry_budget}",
+                                )
+                                continue
+                            raise
                         if component_attempt == 0:
                             _emit(emit, progress, f"React 组件格式不合格，重新生成 {page_key}")
+                            continue
+                        raise
                     except Exception as exc:
                         last_error = exc
-                        if component_attempt == 0 and _is_transient_frontend_error(exc):
+                        retry_budget = _frontend_transient_retry_budget(exc)
+                        if component_attempt < retry_budget:
                             trace_event(
                                 "ai_frontend_page_retry",
                                 page_key=page_key,
                                 index=index,
                                 total=total,
+                                retry_number=component_attempt + 1,
+                                retry_budget=retry_budget,
                                 reason=sanitize_error_message(exc, limit=300),
                             )
-                            _emit(emit, progress, f"{page_key} 模型暂时无响应，正在重试当前页面")
+                            if _is_fast_transient_frontend_error(exc):
+                                _emit(
+                                    emit,
+                                    progress,
+                                    f"{page_key} 模型网关连接被提前中断，正在重试当前页面 "
+                                    f"{component_attempt + 1}/{retry_budget}",
+                                )
+                                time.sleep(1.5)
+                            else:
+                                _emit(emit, progress, f"{page_key} 模型暂时无响应，正在重试当前页面")
                             continue
                         raise
                 if data is None:
@@ -309,6 +345,7 @@ def _generate_react_frontend_pages(
                 encoding="utf-8",
             )
         _sanitize_cached_react_component(component_path)
+        _sanitize_cached_react_css(css_path, css_scope)
         return {
             "index": index,
             "import": f'import {component_name} from "./screens/{token}.jsx";',
@@ -409,6 +446,10 @@ def _react_codegen_workers(total: int) -> int:
 
 
 def _is_transient_frontend_error(exc: Exception) -> bool:
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 22:
+        return True
+    if _is_empty_frontend_response_error(exc):
+        return True
     text = str(exc or "").lower()
     if "已因模型网关错误停止" in text:
         return False
@@ -418,12 +459,57 @@ def _is_transient_frontend_error(exc: Exception) -> bool:
         "read timeout",
         "connection reset",
         "connection aborted",
+        "connection closed",
+        "remote end closed connection",
+        "max retries exceeded with url",
+        "ssleoferror",
+        "ssl eof",
+        "eof occurred in violation of protocol",
         "temporarily unavailable",
         "server error",
     )
     if any(marker in text for marker in transient_markers):
         return True
     return bool(re.search(r"\b(?:408|409|425|429|500|502|503|504|520|522|523|524)\b", text))
+
+
+def _is_empty_frontend_response_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "llm response content is empty",
+            "response content is empty",
+            "response body is empty",
+            "model response is empty",
+            "model returned empty content",
+        )
+    )
+
+
+def _is_fast_transient_frontend_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "connection reset",
+            "connection aborted",
+            "connection closed",
+            "remote end closed connection",
+            "max retries exceeded with url",
+            "ssleoferror",
+            "ssl eof",
+            "eof occurred in violation of protocol",
+        )
+    )
+
+
+def _frontend_transient_retry_budget(exc: Exception) -> int:
+    if not _is_transient_frontend_error(exc):
+        return 0
+    if _is_empty_frontend_response_error(exc):
+        return 2
+    return 2 if _is_fast_transient_frontend_error(exc) else 1
 
 
 def _frontend_provider(provider: LLMProvider) -> LLMProvider:
@@ -543,6 +629,7 @@ def _generate_react_component(
     component_name: str,
     css_scope: str,
     creative_key: str,
+    validation_feedback: str = "",
 ) -> dict[str, str]:
     renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
     terminal_rule = (
@@ -581,6 +668,11 @@ def _generate_react_component(
         "reference_style_contract": visual_style_contract,
     }
     operation_rule = _operation_prompt_rule(screenshot)
+    retry_rule = (
+        f"\n上一次返回未通过本地构建门禁，原因：{validation_feedback}。本次必须针对该原因修正，禁止重复同类内容。"
+        if validation_feedback
+        else ""
+    )
     prompt = f"""
 为第 {index}/{total} 个页面生成 React 组件的 JSX 主体和独立 CSS。组件名由系统包装为 {component_name}。
 
@@ -593,19 +685,21 @@ def _generate_react_component(
  - JSX 与 CSS 合计控制在 4500-7500 个字符，其中 CSS 控制在 1800-3200 个字符；用 CSS 类复用样式，不要为每个数据行重复冗长结构，也不要输出解释性注释。
 - JSX 必须完全自包含：不要引用未声明变量、数组 map、自定义组件或图标组件；业务样例直接写成 JSX 节点，保证无需额外上下文即可渲染。
 - JSX 根节点必须包含 className="screen-root {css_scope}" 和 data-page-structure="{creative_key}"。
-- 系统会在组件外层统一渲染共享品牌栏、主导航和当前功能标题；本组件只生成页面内容区，禁止再次生成全局 header、品牌名称、线路/项目切换页签、主导航或重复的系统标题。
+- 系统会按 visual_identity_spec 在组件外层渲染本软件专属的共享外壳；外壳可能是侧栏、顶部页签或紧凑导航轨道，并使用真实模块名。本组件只生成页面内容区，禁止再次生成全局 header、品牌名称、主导航或重复的系统标题。
 - 按随消息附带的 image2 全局参考图继承色彩、控件质感和视觉节奏，但当前页面结构必须由 page_structure_seed 和业务用途独立决定。
 - 页面保持简洁，围绕当前功能设置一个主要工作区和不超过两个辅助区域；指标卡不超过 4 个、主要操作按钮不超过 6 个、示例表格不超过 5 行。
-- 相邻页面只在内容区的主体拓扑、数据呈现和操作路径上体现差异，不得改变共享外壳或重新设计顶栏。
+- 同一软件的相邻页面保持共享外壳一致，但不得假设外壳是通用深蓝顶部导航；内容区必须继续服从当前软件的视觉身份和页面结构种子。
 - 登录、仪表盘、模块工作区、操作页和统计页要像同一产品中的不同真实路由，而不是同一模板换文字。
 - 操作页必须严格服从 interaction_action、interaction_surface 和 requires_confirmation；即时操作不得擅自增加确认弹窗、登记表单或“确认登记”按钮。
 - requires_confirmation=true 时只提供 data-shared-confirm-source 隐藏语义源，不得输出另一套可见弹窗；可见确认框统一由系统公共组件渲染。
-- 使用真实中文业务数据、按钮、状态、表单、表格、图表、流程、时间线、任务板或地图工作区；按当前业务选择，不要求每类控件都出现。
+- 使用真实中文业务数据、按钮、状态、表单、表格、图表、流程、时间线、任务板或地图工作区；按当前业务选择，不要求每类控件都出现。JSX 可见文字中的小于号必须写成 &lt;，例如“P 值 &lt; 0.05”，不能直接写裸字符“<”。
 - CSS 必须以 .{css_scope} 为作用域，不引用 CDN、图片、字体、SVG 或网络资源；首屏铺满且文字不能溢出。
-- 所有样式都写入 css 字段，JSX 中不要使用 style 字符串或 style 对象。
+- CSS 中严禁出现 @import、url(...)、@font-face、http://、https:// 或 data:image；图标和装饰只能使用文字、纯 CSS、渐变、边框与伪元素。
+- 所有样式都写入 css 字段，JSX 中严禁出现 style=、style={{...}} 或 style 字符串；进度条宽度、颜色和定位也必须改用 CSS 类。
 - 保留可供运行数据覆盖的 .table-frame、.runtime-record-panel、.map-pin、.operation-result 中至少一个适合本页的区域。
 - 可见内容禁止出现 AI、GPT、image2、提示词、视觉参考、接口返回、Base URL、API Key、内部文件名。
 - 禁止使用“待填写、待补充、待完善、示例内容、业务记录、记录01”等未完成占位文案；缺省值也要写成自然业务状态，例如“无异常”“未发现冲突”或“正常流转”。
+{retry_rule}
 """.strip()
     # The same large image on every page disables streaming on compatible gateways and
     # can hit their idle timeout. The contract above is extracted from the actual image.
@@ -626,7 +720,29 @@ def _generate_react_component(
     )
     data = _parse_json(content)
     jsx = str(data.get("jsx") or data.get("component_jsx") or "").strip()
-    css = str(data.get("css") or "").strip()
+    jsx, sanitized_text_operator_count = _sanitize_react_text_operators(jsx)
+    if sanitized_text_operator_count:
+        trace_event(
+            "ai_frontend_text_operators_escaped",
+            page_key=str(getattr(screenshot, "key", "") or index),
+            escaped_count=sanitized_text_operator_count,
+        )
+    jsx, sanitized_inline_style_count = _sanitize_inline_react_styles(jsx)
+    if sanitized_inline_style_count:
+        trace_event(
+            "ai_frontend_inline_styles_removed",
+            page_key=str(getattr(screenshot, "key", "") or index),
+            removed_count=sanitized_inline_style_count,
+        )
+    css, sanitized_resource_count = _sanitize_external_css_resources(str(data.get("css") or ""))
+    css = _trim_incomplete_css_tail(css)
+    css = _scope_react_css(css, css_scope)
+    if sanitized_resource_count:
+        trace_event(
+            "ai_frontend_css_external_resources_removed",
+            page_key=str(getattr(screenshot, "key", "") or index),
+            removed_count=sanitized_resource_count,
+        )
     if len(jsx) < 700 or len(css) < 500:
         raise ValueError("模型返回的 React JSX/CSS 过短")
     if re.search(r"(?m)^\s*(?:import|export)\s+", jsx) or re.search(r"dangerouslySetInnerHTML|<script\b", jsx, flags=re.I):
@@ -642,7 +758,7 @@ def _generate_react_component(
         raise ValueError("React 页面缺少页面作用域或独立构图标识")
     if f".{css_scope}" not in css:
         raise ValueError("React 页面 CSS 未按页面作用域隔离")
-    if re.search(r"@import|url\s*\(", css, flags=re.I):
+    if re.search(r"@import|@font-face|url\s*\(|https?://|data:image", css, flags=re.I):
         raise ValueError("React 页面 CSS 引用了外部资源")
     if bool(getattr(screenshot, "requires_confirmation", False)):
         required_markers = ("data-shared-confirm-source", "data-confirm-title", "data-confirm-action")
@@ -678,6 +794,7 @@ def _sanitize_react_visible_terms(value: str) -> str:
         # These phrases are useful while drafting but must not leak into a
         # delivery screenshot as template-like or unfinished content.
         visible = visible.replace("业务记录", "业务对象").replace("待填写", "请选择")
+        visible = re.sub(r"记录(\d{2,})", r"对象\1", visible)
         visible = re.sub(
             r"(?:备注)?(?:内容|说明|文案|描述|信息|资料)待(?:补充|完善)(?:：[^，。；<]*)?",
             "相关信息已核验",
@@ -694,9 +811,255 @@ def _sanitize_cached_react_component(path: Path) -> None:
         source = path.read_text(encoding="utf-8")
     except OSError:
         return
-    sanitized = _sanitize_react_visible_terms(source)
+    sanitized, _escaped_count = _sanitize_react_text_operators(source)
+    sanitized, _removed_count = _sanitize_inline_react_styles(sanitized)
+    sanitized = _sanitize_react_visible_terms(sanitized)
     if sanitized != source:
         path.write_text(sanitized, encoding="utf-8")
+
+
+def _sanitize_cached_react_css(path: Path, css_scope: str = "") -> None:
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    sanitized, _removed_count = _sanitize_external_css_resources(source)
+    sanitized = _trim_incomplete_css_tail(sanitized)
+    if css_scope:
+        sanitized = _scope_react_css(sanitized, css_scope)
+    if sanitized != source:
+        path.write_text(sanitized, encoding="utf-8")
+
+
+def _sanitize_external_css_resources(value: str) -> tuple[str, int]:
+    source = str(value or "")
+    removed_count = 0
+    source, count = re.subn(r"@font-face\s*\{[^{}]*\}", "", source, flags=re.I | re.S)
+    removed_count += count
+    source, count = re.subn(
+        r"@import\s+(?:url\s*\([^;]*\)|['\"][^'\"]+['\"])[^;]*;?",
+        "",
+        source,
+        flags=re.I | re.S,
+    )
+    removed_count += count
+
+    def replace_external_declaration(match: re.Match[str]) -> str:
+        nonlocal removed_count
+        removed_count += 1
+        property_name = str(match.group("property") or "").strip().lower()
+        if property_name == "src":
+            return 'src:local("Arial");'
+        if property_name in {"background", "background-image"}:
+            return "background-image:none;"
+        return f"{property_name}:none;"
+
+    source = re.sub(
+        r"(?P<property>[-\w]+)\s*:[^;{}]*url\s*\([^)]*\)[^;{}]*(?:;|(?=\}))",
+        replace_external_declaration,
+        source,
+        flags=re.I | re.S,
+    )
+    return source.strip(), removed_count
+
+
+def _scope_react_css(value: str, css_scope: str) -> str:
+    source = str(value or "").strip()
+    scope = str(css_scope or "").strip().lstrip(".")
+    if not source or not scope:
+        return source
+    source, keyframes = _extract_css_keyframe_blocks(source)
+    scope_pattern = re.compile(rf"(?<![\w-])\.{re.escape(scope)}(?![\w-])")
+
+    def prefix_rule(match: re.Match[str]) -> str:
+        boundary, spacing, selector_text = match.group(1), match.group(2), match.group(3)
+        stripped = selector_text.strip()
+        if not stripped or stripped.startswith("@") or ":" in stripped and ";" in stripped:
+            return match.group(0)
+        scoped_selectors: list[str] = []
+        for selector in _split_css_selectors(stripped):
+            normalized = selector.strip()
+            if not normalized:
+                continue
+            if scope_pattern.search(normalized):
+                scoped_selectors.append(normalized)
+                continue
+            if normalized in {"html", "body", "#root", ":root"}:
+                scoped_selectors.append(f".{scope}")
+                continue
+            normalized = re.sub(r"^(?:html|body|#root|:root)(?=[\s.#:\[])", f".{scope}", normalized)
+            if not scope_pattern.search(normalized):
+                normalized = f".{scope} {normalized}"
+            scoped_selectors.append(normalized)
+        if not scoped_selectors:
+            return match.group(0)
+        return f"{boundary}{spacing}{','.join(scoped_selectors)}{{"
+
+    source = re.sub(r"(^|[{}])(\s*)([^@{}][^@{}]*?)\{", prefix_rule, source, flags=re.S)
+    for placeholder, block in keyframes:
+        source = source.replace(placeholder, block)
+    return source.strip()
+
+
+def _split_css_selectors(value: str) -> list[str]:
+    selectors: list[str] = []
+    start = 0
+    depth = 0
+    quote = ""
+    escaped = False
+    for index, char in enumerate(str(value or "")):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in {"(", "["}:
+            depth += 1
+        elif char in {")", "]"}:
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            selectors.append(value[start:index])
+            start = index + 1
+    selectors.append(value[start:])
+    return selectors
+
+
+def _extract_css_keyframe_blocks(value: str) -> tuple[str, list[tuple[str, str]]]:
+    source = str(value or "")
+    blocks: list[tuple[str, str]] = []
+    pattern = re.compile(r"@(?:-webkit-)?keyframes\s+[-\w]+\s*\{", flags=re.I)
+    search_from = 0
+    while True:
+        match = pattern.search(source, search_from)
+        if not match:
+            break
+        opening = source.find("{", match.start())
+        closing = _matching_css_brace(source, opening)
+        if closing < 0:
+            break
+        block = source[match.start() : closing + 1]
+        placeholder = f"/*__SOFT_KEYFRAME_{len(blocks)}__*/"
+        blocks.append((placeholder, block))
+        source = source[: match.start()] + placeholder + source[closing + 1 :]
+        search_from = match.start() + len(placeholder)
+    return source, blocks
+
+
+def _matching_css_brace(value: str, opening: int) -> int:
+    depth = 0
+    quote = ""
+    escaped = False
+    in_comment = False
+    index = max(0, opening)
+    while index < len(value):
+        char = value[index]
+        next_char = value[index + 1] if index + 1 < len(value) else ""
+        if in_comment:
+            if char == "*" and next_char == "/":
+                in_comment = False
+                index += 2
+                continue
+        elif quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char == "/" and next_char == "*":
+            in_comment = True
+            index += 2
+            continue
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return -1
+
+
+def _sanitize_inline_react_styles(value: str) -> tuple[str, int]:
+    source = str(value or "")
+    removed_count = 0
+    patterns = (
+        r"\sstyle\s*=\s*\{\{.*?\}\}",
+        r"\sstyle\s*=\s*\{[^{}]*\}",
+        r"\sstyle\s*=\s*(?:\"[^\"]*\"|'[^']*')",
+    )
+    for pattern in patterns:
+        source, count = re.subn(pattern, "", source, flags=re.I | re.S)
+        removed_count += count
+    return source, removed_count
+
+
+def _sanitize_react_text_operators(value: str) -> tuple[str, int]:
+    source = str(value or "")
+    return re.subn(
+        r"<(?=\s*(?:=\s*)?(?:[-+]?(?:\d|\.\d)|LOD\b|LOQ\b))",
+        "&lt;",
+        source,
+        flags=re.I,
+    )
+
+
+def _trim_incomplete_css_tail(value: str) -> str:
+    source = str(value or "").strip()
+    depth = 0
+    last_balanced = 0
+    quote = ""
+    escaped = False
+    in_comment = False
+    index = 0
+    while index < len(source):
+        char = source[index]
+        next_char = source[index + 1] if index + 1 < len(source) else ""
+        if in_comment:
+            if char == "*" and next_char == "/":
+                in_comment = False
+                index += 2
+                continue
+            index += 1
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char == "/" and next_char == "*":
+            in_comment = True
+            index += 2
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                raise ValueError("React 页面 CSS 存在多余的闭合花括号")
+            depth -= 1
+            if depth == 0:
+                last_balanced = index + 1
+        index += 1
+    if quote or in_comment:
+        raise ValueError("React 页面 CSS 字符串或注释未闭合")
+    if depth == 0 and not source[last_balanced:].strip():
+        return source
+    if last_balanced <= 0:
+        raise ValueError("React 页面 CSS 没有完整闭合的样式规则")
+    return source[:last_balanced].rstrip()
 
 
 def _react_component_token(page_key: str, index: int) -> str:
@@ -795,18 +1158,45 @@ def _write_react_app_files(
         for page in pages
         if str(page.get("key") or "")
     }
+    design_brief = dict(getattr(ui_blueprint, "design_brief", {}) or {})
+    identity = design_brief.get("visual_identity_spec") if isinstance(design_brief.get("visual_identity_spec"), dict) else {}
+    nav_model = str(identity.get("nav_model") or design_brief.get("nav_model") or "top_tabs")
+    if renderer in {"mobile_app", "game"}:
+        nav_model = "top_tabs"
+    navigation_limit = 5 if nav_model == "side_menu" else 3
+    dashboard_page = next((page for page in pages if str(page.get("page_kind") or "") == "dashboard"), {})
+    statistics_page = next((page for page in pages if str(page.get("page_kind") or "") == "statistics"), {})
+    navigation = [
+        {"key": "dashboard", "label": _shared_shell_nav_label(str(dashboard_page.get("title") or "业务总览"))}
+    ]
+    navigation.extend(
+        {
+            "key": str(getattr(module, "key", "") or f"module_{index}"),
+            "label": _shared_shell_nav_label(str(getattr(module, "title", "") or f"功能{index}")),
+        }
+        for index, module in enumerate((blueprint.modules or [])[:navigation_limit], start=1)
+    )
+    if statistics_page:
+        navigation.append(
+            {"key": "statistics", "label": _shared_shell_nav_label(str(statistics_page.get("title") or "统计分析"))}
+        )
+    palette = identity.get("palette") if isinstance(identity.get("palette"), dict) else {}
     shell_config = {
         "software_name": task.software_name,
         "version": task.version,
         "industry": blueprint.industry or task.product_type,
         "role": str((blueprint.roles or blueprint.target_users or ["当前用户"])[0]),
-        "navigation": [
-            {"key": "dashboard", "label": "工作首页"},
-            {"key": "business", "label": "功能办理"},
-            {"key": "tracking", "label": "任务跟踪"},
-            {"key": "statistics", "label": "统计分析"},
-            {"key": "settings", "label": "系统设置"},
-        ],
+        "navigation": navigation,
+        "nav_model": nav_model,
+        "layout_variant": str(identity.get("layout_variant") or design_brief.get("layout_variant") or "classic"),
+        "workspace_shape": str(identity.get("workspace_shape") or design_brief.get("workspace_shape") or "ledger_split"),
+        "identity_signature": str(identity.get("identity_signature") or design_brief.get("identity_signature") or ""),
+        "palette": {
+            "accent": str(palette.get("accent") or design_brief.get("accent") or "#0f766e"),
+            "accent_soft": str(palette.get("accent_soft") or design_brief.get("accent_soft") or "#ecfdf5"),
+            "sidebar": str(palette.get("sidebar") or design_brief.get("sidebar") or "#123c40"),
+            "canvas": str(palette.get("canvas") or design_brief.get("canvas") or "#f4fbf8"),
+        },
     }
     (src_dir / "SharedAppShell.jsx").write_text(_shared_app_shell_source(), encoding="utf-8")
     (src_dir / "SharedConfirmDialog.jsx").write_text(_shared_confirm_dialog_source(), encoding="utf-8")
@@ -844,21 +1234,33 @@ def _shared_shell_section(page: dict[str, Any]) -> str:
     return "business"
 
 
+def _shared_shell_nav_label(value: str, limit: int = 8) -> str:
+    label = re.sub(r"(?:管理|平台|系统|界面|页面)$", "", re.sub(r"\s+", "", str(value or ""))).strip()
+    label = label or "功能"
+    return label[: max(2, int(limit or 0))]
+
+
 def _shared_app_shell_source() -> str:
     return '''import React from "react";
 
 export default function SharedAppShell({ renderer, screenKey, screenMeta, config, children }) {
   if (screenMeta?.section === "login" || screenKey === "login") return children;
-  const activeSection = screenMeta?.section || "business";
+  const navModel = config?.nav_model || "top_tabs";
+  const activeSection = screenMeta?.module_key || screenMeta?.section || "dashboard";
   const mark = String(config?.software_name || "软").trim().slice(0, 1) || "软";
-  return <div className={`shared-app-shell shared-app-shell-${renderer || "admin"}`}>
-    <header className="shared-app-header">
-      <div className="shared-app-brand"><span className="shared-app-mark">{mark}</span><div><strong>{config?.software_name}</strong><small>{config?.version} · 业务操作平台</small></div></div>
-      <nav className="shared-app-nav" aria-label="主导航">
-        {(config?.navigation || []).map((item) => <span key={item.key} className={item.key === activeSection ? "active" : ""}>{item.label}</span>)}
-      </nav>
-      <div className="shared-app-context"><span>{config?.industry}</span><strong>{screenMeta?.title || "功能界面"}</strong><em>{config?.role}</em></div>
-    </header>
+  const shellStyle = {
+    "--shell-accent": config?.palette?.accent || "#0f766e",
+    "--shell-accent-soft": config?.palette?.accent_soft || "#ecfdf5",
+    "--shell-sidebar": config?.palette?.sidebar || "#123c40",
+    "--shell-canvas": config?.palette?.canvas || "#f4fbf8",
+  };
+  const brand = <div className="shared-app-brand"><span className="shared-app-mark">{mark}</span><div><strong>{config?.software_name}</strong><small>{config?.version} · {config?.industry}</small></div></div>;
+  const navigation = <nav className="shared-app-nav" aria-label="主导航">
+    {(config?.navigation || []).map((item) => <span key={item.key} className={item.key === activeSection ? "active" : ""}>{item.label}</span>)}
+  </nav>;
+  const context = <div className="shared-app-context"><span>{screenMeta?.title || "功能界面"}</span><strong>{config?.role}</strong><em>{config?.industry}</em></div>;
+  return <div className={`shared-app-shell shared-app-shell-${renderer || "admin"}`} data-nav-model={navModel} data-layout-variant={config?.layout_variant || "classic"} data-identity-signature={config?.identity_signature || ""} style={shellStyle}>
+    {navModel === "side_menu" ? <aside className="shared-app-sidebar">{brand}{navigation}{context}</aside> : <header className="shared-app-header">{brand}{navigation}{context}</header>}
     <main className="shared-app-main">{children}</main>
   </div>;
 }
@@ -978,7 +1380,34 @@ export default function SharedConfirmDialog({ screenKey, screenMeta }) {
 
 
 def _shared_app_shell_css(mobile_css: str) -> str:
-    return f'''*{{box-sizing:border-box}}html,body,#root{{margin:0;width:100%;height:100%;overflow:hidden}}body{{font-family:'Microsoft YaHei','PingFang SC',Arial,sans-serif;background:#eef2f7;color:#172033}}button,input,select,textarea{{font:inherit}}.generated-product{{height:100%;{mobile_css}}}.shared-app-shell{{height:100%;display:grid;grid-template-rows:66px minmax(0,1fr);background:#081a31;overflow:hidden}}.shared-app-header{{display:grid;grid-template-columns:minmax(280px,360px) minmax(420px,1fr) minmax(210px,280px);align-items:center;gap:18px;padding:0 18px;background:linear-gradient(90deg,#0a1c35,#102b4d 58%,#0a203c);border-bottom:1px solid rgba(96,165,250,.28);color:#e8f3ff;box-shadow:0 8px 22px rgba(2,12,27,.24);z-index:20}}.shared-app-brand{{display:flex;align-items:center;gap:11px;min-width:0}}.shared-app-mark{{width:38px;height:38px;flex:0 0 38px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(135deg,#f59e0b,#2563eb);color:white;font-weight:900;box-shadow:0 4px 14px rgba(37,99,235,.35)}}.shared-app-brand div,.shared-app-context{{min-width:0}}.shared-app-brand strong,.shared-app-brand small{{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-brand strong{{font-size:15px}}.shared-app-brand small{{margin-top:4px;color:#93c5fd;font-size:11px}}.shared-app-nav{{display:flex;align-items:center;justify-content:center;gap:6px;min-width:0;overflow:hidden}}.shared-app-nav span{{height:34px;display:inline-flex;align-items:center;padding:0 13px;border:1px solid rgba(147,197,253,.2);border-radius:6px;background:rgba(9,30,57,.62);color:#bfd7f5;font-size:12px;white-space:nowrap}}.shared-app-nav span.active{{background:#2563eb;border-color:#60a5fa;color:white;box-shadow:inset 0 -3px 0 #f59e0b}}.shared-app-context{{display:grid;grid-template-columns:1fr auto;align-items:center;column-gap:9px;text-align:right}}.shared-app-context span{{grid-column:1/3;color:#93c5fd;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-context strong{{margin-top:3px;color:#fef3c7;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-context em{{margin-top:3px;color:#7dd3fc;font-size:10px;font-style:normal;white-space:nowrap}}.shared-app-main{{min-height:0;overflow:hidden;position:relative}}.shared-app-main .screen-root{{width:100%!important;height:100%!important;min-height:0!important;max-height:100%!important;overflow:hidden!important}}.shared-app-main .screen-root>header:first-child,.shared-app-main .screen-root>.topbar:first-child,.shared-app-main .screen-root>.mobile-header:first-child,.shared-app-main .screen-root>.app-header:first-child{{display:none!important}}.shared-app-main .screen-root:has(>.mobile-header:first-child){{grid-template-rows:minmax(0,1fr) 78px!important}}@media(max-width:980px){{.shared-app-header{{grid-template-columns:minmax(220px,1fr) auto;padding:0 14px}}.shared-app-nav{{justify-content:flex-end}}.shared-app-nav span{{padding:0 9px}}.shared-app-context{{display:none}}}}.shared-app-shell-mobile_app{{grid-template-rows:72px minmax(0,1fr)}}.shared-app-shell-mobile_app .shared-app-header{{grid-template-columns:minmax(210px,1fr) minmax(300px,1.4fr);gap:10px;padding:0 16px}}.shared-app-shell-mobile_app .shared-app-context{{display:none}}.shared-app-shell-mobile_app .shared-app-nav{{justify-content:flex-end;overflow:hidden}}.shared-app-shell-mobile_app .shared-app-nav span{{padding:0 9px;font-size:11px}}.screen-root{{width:100%;height:100%;overflow:hidden}}
+    base = f'''*{{box-sizing:border-box}}html,body,#root{{margin:0;width:100%;height:100%;overflow:hidden}}body{{font-family:'Microsoft YaHei','PingFang SC',Arial,sans-serif;background:#eef2f7;color:#172033}}button,input,select,textarea{{font:inherit}}.generated-product{{height:100%;{mobile_css}}}.shared-app-shell{{height:100%;display:grid;grid-template-rows:66px minmax(0,1fr);background:#081a31;overflow:hidden}}.shared-app-header{{display:grid;grid-template-columns:minmax(280px,360px) minmax(420px,1fr) minmax(210px,280px);align-items:center;gap:18px;padding:0 18px;background:linear-gradient(90deg,#0a1c35,#102b4d 58%,#0a203c);border-bottom:1px solid rgba(96,165,250,.28);color:#e8f3ff;box-shadow:0 8px 22px rgba(2,12,27,.24);z-index:20}}.shared-app-brand{{display:flex;align-items:center;gap:11px;min-width:0}}.shared-app-mark{{width:38px;height:38px;flex:0 0 38px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(135deg,#f59e0b,#2563eb);color:white;font-weight:900;box-shadow:0 4px 14px rgba(37,99,235,.35)}}.shared-app-brand div,.shared-app-context{{min-width:0}}.shared-app-brand strong,.shared-app-brand small{{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-brand strong{{font-size:15px}}.shared-app-brand small{{margin-top:4px;color:#93c5fd;font-size:11px}}.shared-app-nav{{display:flex;align-items:center;justify-content:center;gap:6px;min-width:0;overflow:hidden}}.shared-app-nav span{{height:34px;display:inline-flex;align-items:center;padding:0 13px;border:1px solid rgba(147,197,253,.2);border-radius:6px;background:rgba(9,30,57,.62);color:#bfd7f5;font-size:12px;white-space:nowrap}}.shared-app-nav span.active{{background:#2563eb;border-color:#60a5fa;color:white;box-shadow:inset 0 -3px 0 #f59e0b}}.shared-app-context{{display:grid;grid-template-columns:1fr auto;align-items:center;column-gap:9px;text-align:right}}.shared-app-context span{{grid-column:1/3;color:#93c5fd;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-context strong{{margin-top:3px;color:#fef3c7;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-context em{{margin-top:3px;color:#7dd3fc;font-size:10px;font-style:normal;white-space:nowrap}}.shared-app-main{{min-height:0;overflow:hidden;position:relative}}.shared-app-main .screen-root{{width:100%!important;height:100%!important;min-height:0!important;max-height:100%!important;overflow:hidden!important}}.shared-app-main .screen-root>header:first-child,.shared-app-main .screen-root>.topbar:first-child,.shared-app-main .screen-root>.mobile-header:first-child,.shared-app-main .screen-root>.app-header:first-child{{display:none!important}}.shared-app-main .screen-root:has(>.mobile-header:first-child){{grid-template-rows:minmax(0,1fr) 78px!important}}@media(max-width:980px){{.shared-app-header{{grid-template-columns:minmax(220px,1fr) auto;padding:0 14px}}.shared-app-nav{{justify-content:flex-end}}.shared-app-nav span{{padding:0 9px}}.shared-app-context{{display:none}}}}.shared-app-shell-mobile_app{{grid-template-rows:72px minmax(0,1fr)}}.shared-app-shell-mobile_app .shared-app-header{{grid-template-columns:minmax(210px,1fr) minmax(300px,1.4fr);gap:10px;padding:0 16px}}.shared-app-shell-mobile_app .shared-app-context{{display:none}}.shared-app-shell-mobile_app .shared-app-nav{{justify-content:flex-end;overflow:hidden}}.shared-app-shell-mobile_app .shared-app-nav span{{padding:0 9px;font-size:11px}}.screen-root{{width:100%;height:100%;overflow:hidden}}
+'''
+    return base + '''
+.shared-app-shell{background:var(--shell-canvas,#f4fbf8);}
+.shared-app-header{background:var(--shell-sidebar,#123c40);border-bottom-color:color-mix(in srgb,var(--shell-accent,#0f766e) 58%,#fff);box-shadow:0 5px 16px rgba(15,23,42,.18);}
+.shared-app-mark{border-radius:6px;background:var(--shell-accent,#0f766e);box-shadow:none;}
+.shared-app-brand small,.shared-app-context span,.shared-app-context em{color:color-mix(in srgb,var(--shell-accent-soft,#ecfdf5) 78%,#fff);}
+.shared-app-context strong{color:#fff;}
+.shared-app-nav span{border-color:rgba(255,255,255,.22);background:rgba(255,255,255,.06);color:rgba(255,255,255,.78);}
+.shared-app-nav span.active{background:var(--shell-accent,#0f766e);border-color:rgba(255,255,255,.56);box-shadow:inset 0 -3px 0 #fff;color:#fff;}
+.shared-app-shell[data-nav-model="rail"]{grid-template-rows:54px minmax(0,1fr);}
+.shared-app-shell[data-nav-model="rail"] .shared-app-header{grid-template-columns:minmax(260px,330px) minmax(420px,1fr) minmax(180px,240px);padding:0 14px;box-shadow:none;}
+.shared-app-shell[data-nav-model="rail"] .shared-app-mark{width:30px;height:30px;flex-basis:30px;border-radius:4px;}
+.shared-app-shell[data-nav-model="rail"] .shared-app-nav{height:100%;gap:0;justify-content:flex-start;}
+.shared-app-shell[data-nav-model="rail"] .shared-app-nav span{height:100%;padding:0 18px;border:0;border-radius:0;background:transparent;}
+.shared-app-shell[data-nav-model="rail"] .shared-app-nav span.active{background:rgba(255,255,255,.1);box-shadow:inset 0 -4px 0 var(--shell-accent,#0f766e);}
+.shared-app-shell[data-nav-model="side_menu"]{grid-template-columns:188px minmax(0,1fr);grid-template-rows:minmax(0,1fr);}
+.shared-app-sidebar{min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:18px;padding:18px 12px 14px;background:var(--shell-sidebar,#123c40);color:#fff;border-right:1px solid rgba(255,255,255,.12);}
+.shared-app-sidebar .shared-app-brand{align-items:flex-start;}
+.shared-app-sidebar .shared-app-brand strong{font-size:14px;white-space:normal;line-height:1.35;}
+.shared-app-sidebar .shared-app-brand small{font-size:10px;white-space:normal;line-height:1.45;}
+.shared-app-sidebar .shared-app-nav{display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:5px;overflow:hidden;}
+.shared-app-sidebar .shared-app-nav span{height:36px;justify-content:flex-start;padding:0 11px;border:0;border-radius:4px;background:transparent;color:rgba(255,255,255,.76);}
+.shared-app-sidebar .shared-app-nav span.active{background:var(--shell-accent,#0f766e);box-shadow:inset 3px 0 0 #fff;color:#fff;}
+.shared-app-sidebar .shared-app-context{display:block;padding-top:12px;border-top:1px solid rgba(255,255,255,.16);text-align:left;}
+.shared-app-sidebar .shared-app-context span,.shared-app-sidebar .shared-app-context strong,.shared-app-sidebar .shared-app-context em{display:block;margin:0 0 5px;white-space:normal;line-height:1.35;}
+.shared-app-sidebar .shared-app-context em{display:none;}
+.shared-app-shell[data-nav-model="side_menu"]>.shared-app-main{grid-column:2;grid-row:1;}
 '''
 
 
@@ -993,35 +1422,35 @@ def _shared_confirm_dialog_css() -> str:
 .generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[role="dialog"],
 .generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>.confirm-dialog,
 .generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>.confirm-modal{display:none!important;}
-.shared-confirm-layer{position:absolute;inset:0;z-index:120;display:grid;place-items:center;padding:24px;background:rgba(9,24,39,.64);backdrop-filter:blur(1px);}
-.shared-confirm-dialog{width:min(720px,calc(100vw - 48px));height:390px;max-height:calc(100vh - 48px);display:grid;grid-template-rows:104px minmax(0,1fr) 58px;overflow:hidden;background:#fff;border:1px solid #b9c3cc;border-top:4px solid #ea580c;border-radius:6px;box-shadow:0 22px 54px rgba(2,15,27,.38);color:#1c2a36;letter-spacing:0;}
-.shared-confirm-header{display:grid;grid-template-columns:38px minmax(0,1fr);gap:14px;align-items:start;padding:17px 22px 14px;border-bottom:1px solid #dce2e7;background:#fff;}
-.shared-confirm-mark{width:34px;height:34px;display:grid;place-items:center;border:1px solid #f0a06d;border-radius:50%;background:#fff1e8;color:#d94f08;font-size:20px;font-weight:800;line-height:1;}
-.shared-confirm-kicker{display:block;color:#b54708;font-size:10px;font-weight:700;}
+.shared-confirm-layer{position:absolute;inset:0;z-index:120;display:grid;place-items:center;padding:24px;background:color-mix(in srgb,var(--shell-sidebar,#123c40) 68%,transparent);backdrop-filter:blur(2px);}
+.shared-confirm-dialog{width:min(720px,calc(100vw - 48px));height:390px;max-height:calc(100vh - 48px);display:grid;grid-template-rows:104px minmax(0,1fr) 58px;overflow:hidden;background:color-mix(in srgb,var(--shell-canvas,#f4fbf8) 14%,#fff);border:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 24%,#fff);border-top:4px solid var(--shell-accent,#0f766e);border-radius:8px;box-shadow:0 22px 54px color-mix(in srgb,var(--shell-sidebar,#123c40) 42%,transparent);color:color-mix(in srgb,var(--shell-sidebar,#123c40) 84%,#111827);letter-spacing:0;}
+.shared-confirm-header{display:grid;grid-template-columns:38px minmax(0,1fr);gap:14px;align-items:start;padding:17px 22px 14px;border-bottom:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 16%,#fff);background:color-mix(in srgb,var(--shell-canvas,#f4fbf8) 10%,#fff);}
+.shared-confirm-mark{width:34px;height:34px;display:grid;place-items:center;border:1px solid color-mix(in srgb,var(--shell-accent,#0f766e) 55%,#fff);border-radius:50%;background:var(--shell-accent-soft,#ecfdf5);color:var(--shell-accent,#0f766e);font-size:20px;font-weight:800;line-height:1;}
+.shared-confirm-kicker{display:block;color:var(--shell-accent,#0f766e);font-size:10px;font-weight:700;}
 .shared-confirm-header h2{margin:2px 0 3px;font-size:19px;line-height:1.35;letter-spacing:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.shared-confirm-header p{display:-webkit-box;overflow:hidden;margin:0;color:#667482;font-size:11px;line-height:1.5;-webkit-box-orient:vertical;-webkit-line-clamp:2;}
-.shared-confirm-body{min-height:0;display:grid;grid-template-rows:auto auto minmax(48px,1fr);gap:10px;padding:14px 22px;background:#fff;overflow:hidden;}
-.shared-confirm-summary{display:grid;grid-template-columns:1fr 1fr;border:1px solid #dce2e7;background:#dce2e7;gap:1px;min-height:112px;}
-.shared-confirm-summary>div{min-width:0;padding:10px 13px;background:#f6f8f9;}
+.shared-confirm-header p{display:-webkit-box;overflow:hidden;margin:0;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 62%,#fff);font-size:11px;line-height:1.5;-webkit-box-orient:vertical;-webkit-line-clamp:2;}
+.shared-confirm-body{min-height:0;display:grid;grid-template-rows:auto auto minmax(48px,1fr);gap:10px;padding:14px 22px;background:color-mix(in srgb,var(--shell-canvas,#f4fbf8) 8%,#fff);overflow:hidden;}
+.shared-confirm-summary{display:grid;grid-template-columns:1fr 1fr;border:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 16%,#fff);background:color-mix(in srgb,var(--shell-sidebar,#123c40) 16%,#fff);gap:1px;min-height:112px;}
+.shared-confirm-summary>div{min-width:0;padding:10px 13px;background:color-mix(in srgb,var(--shell-canvas,#f4fbf8) 36%,#fff);}
 .shared-confirm-summary span,.shared-confirm-summary strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.shared-confirm-summary span{color:#70808d;font-size:10px;}
-.shared-confirm-summary strong{margin-top:4px;color:#233545;font-size:12px;}
+.shared-confirm-summary span{color:color-mix(in srgb,var(--shell-sidebar,#123c40) 58%,#fff);font-size:10px;}
+.shared-confirm-summary strong{margin-top:4px;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 88%,#111827);font-size:12px;}
 .shared-confirm-evidence{min-height:28px;display:flex;align-items:center;gap:6px;overflow:hidden;white-space:nowrap;}
-.shared-confirm-evidence>span{flex:0 0 auto;color:#667482;font-size:10px;font-weight:700;}
-.shared-confirm-evidence b{min-width:0;padding:4px 7px;border:1px solid #b9dccc;background:#eef8f3;color:#176a48;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.shared-confirm-note{min-height:48px;display:grid;grid-template-columns:64px minmax(0,1fr);gap:10px;align-items:start;padding:9px 11px;border-left:3px solid #ea580c;background:#fff6ef;color:#5b493d;overflow:hidden;}
-.shared-confirm-note strong{color:#b54708;font-size:11px;white-space:nowrap;}
+.shared-confirm-evidence>span{flex:0 0 auto;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 62%,#fff);font-size:10px;font-weight:700;}
+.shared-confirm-evidence b{min-width:0;padding:4px 7px;border:1px solid color-mix(in srgb,var(--shell-accent,#0f766e) 38%,#fff);background:var(--shell-accent-soft,#ecfdf5);color:color-mix(in srgb,var(--shell-accent,#0f766e) 82%,var(--shell-sidebar,#123c40));font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-confirm-note{min-height:48px;display:grid;grid-template-columns:64px minmax(0,1fr);gap:10px;align-items:start;padding:9px 11px;border-left:3px solid var(--shell-accent,#0f766e);background:color-mix(in srgb,var(--shell-accent-soft,#ecfdf5) 72%,#fff);color:color-mix(in srgb,var(--shell-sidebar,#123c40) 76%,#374151);overflow:hidden;}
+.shared-confirm-note strong{color:var(--shell-accent,#0f766e);font-size:11px;white-space:nowrap;}
 .shared-confirm-note span{display:-webkit-box;overflow:hidden;font-size:11px;line-height:1.55;-webkit-box-orient:vertical;-webkit-line-clamp:2;}
-.shared-confirm-actions{display:flex;align-items:center;justify-content:flex-end;gap:9px;padding:10px 22px;border-top:1px solid #dce2e7;background:#fafbfc;}
-.shared-confirm-actions button{height:34px;min-width:94px;padding:0 15px;border:1px solid #bfc8d0;border-radius:3px;background:#fff;color:#354451;font-size:11px;font-weight:700;white-space:nowrap;cursor:pointer;}
-.shared-confirm-actions .shared-confirm-primary{max-width:280px;overflow:hidden;border-color:#d94f08;background:#ea580c;color:#fff;text-overflow:ellipsis;}
+.shared-confirm-actions{display:flex;align-items:center;justify-content:flex-end;gap:9px;padding:10px 22px;border-top:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 16%,#fff);background:color-mix(in srgb,var(--shell-canvas,#f4fbf8) 32%,#fff);}
+.shared-confirm-actions button{height:34px;min-width:94px;padding:0 15px;border:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 26%,#fff);border-radius:5px;background:#fff;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 80%,#1f2937);font-size:11px;font-weight:700;white-space:nowrap;cursor:pointer;}
+.shared-confirm-actions .shared-confirm-primary{max-width:280px;overflow:hidden;border-color:var(--shell-accent,#0f766e);background:var(--shell-accent,#0f766e);color:#fff;text-overflow:ellipsis;}
 @media(max-width:760px){.shared-confirm-layer{padding:16px}.shared-confirm-dialog{width:calc(100vw - 32px);height:480px;grid-template-rows:112px minmax(0,1fr) 62px}.shared-confirm-body{padding:14px 16px}.shared-confirm-header,.shared-confirm-actions{padding-left:16px;padding-right:16px}.shared-confirm-summary{grid-template-columns:1fr}.shared-confirm-summary>div:nth-child(n+4){display:none}.shared-confirm-evidence b:nth-of-type(n+4){display:none}}
 '''
 
 
 def _build_react_vite_bundle(react_dir: Path) -> None:
     electron_node = os.getenv("SOFT_ELECTRON_NODE", "").strip()
-    node = shutil.which("node") or shutil.which("node.exe") or electron_node
+    node = electron_node or shutil.which("node") or shutil.which("node.exe")
     vite_bin = _frontend_node_module_root() / "vite" / "bin" / "vite.js"
     if not node or (not vite_bin.exists() and not os.getenv("SOFT_NODE_MODULE_ROOT", "").strip()):
         raise RuntimeError("缺少随软件提供的 Node/Vite 运行环境，无法构建 React 界面工程")
@@ -1040,8 +1469,27 @@ def _build_react_vite_bundle(react_dir: Path) -> None:
         env=env,
     )
     if result.returncode != 0:
-        detail = "\n".join((result.stdout or "").strip().splitlines()[-8:])
+        detail = _react_build_error_detail(result.stdout or "")
         raise RuntimeError(f"React + Vite 界面工程构建失败：{detail[:900]}")
+
+
+def _react_build_error_detail(output: str) -> str:
+    cleaned = re.sub(r"\x1b\[[0-9;]*m", "", str(output or ""))
+    lines = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
+    important: list[str] = []
+    markers = ("error during build", "ERROR:", "file:", "Expected ", "Unexpected ", "Parse failure")
+    for index, line in enumerate(lines):
+        if any(marker.lower() in line.lower() for marker in markers):
+            start = max(0, index - 1)
+            end = min(len(lines), index + 4)
+            for item in lines[start:end]:
+                if re.match(r"\s*at\s", item):
+                    continue
+                if item not in important:
+                    important.append(item)
+    if important:
+        return "\n".join(important)
+    return "\n".join(lines[-8:])
 
 
 def _frontend_node_module_root() -> Path:
@@ -2831,6 +3279,8 @@ body[data-ai-frontend="true"][data-renderer="admin"] :is(.code,.num,.val,.metric
 body[data-ai-frontend="true"][data-renderer="admin"] :is(.code,.record-title .code,.metric .num,.mcell .val,.val){font-size:20px!important;}
 body[data-ai-frontend="true"][data-renderer="admin"] :is(.runtime-record-panel b,.meta b,.rec .r-line b,.source-list b){min-width:0!important;max-width:100%!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;}
 body[data-ai-frontend="true"][data-renderer="admin"] :is(.operation-result){max-width:100%!important;overflow:hidden!important;text-overflow:ellipsis!important;line-height:1.28!important;}
+body[data-ai-frontend="true"][data-renderer="admin"] :is(.map-pin,.map-node,.relation-node,.flow-node) :is(b,strong,span,em){display:block!important;min-width:0!important;max-width:100%!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
+body[data-ai-frontend="true"][data-renderer="admin"][data-page-kind="login"] :is(.left-console,.login-hero,.login-brand) h1{max-width:none!important;font-size:31px!important;line-height:1.15!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
 """.strip()
     return f"""
 <style id="soft-ai-runtime-guard">

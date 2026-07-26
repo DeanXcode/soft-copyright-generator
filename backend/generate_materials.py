@@ -196,7 +196,17 @@ def _write_failure_report(output_dir: Path, message: str, checks: dict) -> None:
 
 
 def _seed_from_output_dir(output_dir: str) -> str:
-    name = Path(str(output_dir or "")).name
+    output_path = Path(str(output_dir or ""))
+    for filename in ("generation-state.json", "generation-failure.json", "generation_report.json"):
+        try:
+            data = json.loads((output_path / filename).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        task_data = data.get("task") if isinstance(data, dict) else None
+        seed = str(task_data.get("seed") or "").strip() if isinstance(task_data, dict) else ""
+        if seed:
+            return seed
+    name = output_path.name
     match = re.search(r"(\d{8}-\d{6}-\d{4})$", name)
     return match.group(1) if match else ""
 

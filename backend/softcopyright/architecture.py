@@ -108,6 +108,25 @@ ARCHITECTURE_CATALOG: dict[str, dict[str, Any]] = {
         "project_layout": ["React/Vite 用户端", "Spring Boot API 服务", "移动端 UI 原型", "接口与数据脚本"],
         "run_commands": ["npm install && npm start", "mvn spring-boot:run"],
     },
+    "web_service_console": {
+        "name": "React/Vite 与 Spring Boot Web 控制台架构",
+        "languages": ["JavaScript", "Java", "SQL"],
+        "source_language": "JavaScript/Java/SQL",
+        "stack": ["React/Vite", "Spring Boot", "REST API", "MySQL", "静态资源服务"],
+        "source_strategy": "javascript_with_java_api",
+        "dev_environment": {
+            "hardware": "x86_64 开发工作站",
+            "os": "Windows 10/11、Ubuntu 22.04 LTS",
+            "tool": "Node.js、Vite、JDK 17、Maven、数据库管理工具、浏览器调试工具",
+        },
+        "runtime_environment": {
+            "hardware": "Web 服务器、应用服务器、数据库服务器或云主机",
+            "os": "Linux 服务器、Windows Server 或容器运行环境",
+            "support": "React/Vite 静态构建产物、JDK 17、HTTP 服务、关系型数据库、桌面浏览器",
+        },
+        "project_layout": ["React/Vite 管理控制台", "Spring Boot API 服务", "SQL 初始化脚本", "接口与数据脚本"],
+        "run_commands": ["npm install && npm run build", "mvn spring-boot:run"],
+    },
     "data_ai_service": {
         "name": "数据分析服务与 Web 管理架构",
         "languages": ["Python", "JavaScript", "SQL"],
@@ -258,8 +277,13 @@ def select_technical_architecture(task: Any, blueprint: Any | None = None) -> Te
     if category == "操作系统":
         return create_technical_architecture("system_service_shell")
 
-    if any(term in text for term in ["APP", "小程序", "移动", "手机", "用户端", "前端", "H5"]):
+    from .product_experience import build_product_experience_spec, expected_renderer_for_experience
+
+    renderer = expected_renderer_for_experience(build_product_experience_spec(task, blueprint))
+    if renderer == "mobile_app":
         return create_technical_architecture("web_mobile_app")
+    if str(getattr(task, "product_type", "") or "") == "APP":
+        return create_technical_architecture("web_service_console")
 
     if any(term in text for term in ["数据", "人工智能", "算法", "分析", "预测", "识别", "模型"]):
         return create_technical_architecture("data_ai_service")
@@ -267,11 +291,43 @@ def select_technical_architecture(task: Any, blueprint: Any | None = None) -> Te
     return create_technical_architecture("enterprise_web")
 
 
+def normalize_technical_architecture_for_experience(
+    task: Any,
+    blueprint: Any | None,
+    architecture: TechnicalArchitecture,
+) -> TechnicalArchitecture:
+    from .product_experience import build_product_experience_spec, expected_renderer_for_experience
+
+    renderer = expected_renderer_for_experience(build_product_experience_spec(task, blueprint))
+    if renderer == "admin" and architecture.key == "web_mobile_app":
+        return create_technical_architecture(
+            "web_service_console",
+            source="cache-experience-normalized",
+            rationale="当前软件按名称、业务角色和操作链路识别为桌面 Web 工作台，已将旧终端架构缓存升级为同技术栈的 Web 控制台架构。",
+        )
+    if renderer == "admin" and architecture.key == "web_service_console":
+        serialized = str(architecture.to_dict())
+        if any(term in serialized for term in ("移动端", "Android/iOS", "H5/移动端")):
+            return create_technical_architecture(
+                "web_service_console",
+                source="cache-experience-normalized",
+                rationale="当前软件为桌面 Web 工作台，已清理旧缓存中残留的错误终端运行环境和质量检查措辞。",
+            )
+    if renderer == "mobile_app" and architecture.key == "web_service_console":
+        return create_technical_architecture(
+            "web_mobile_app",
+            source="cache-experience-normalized",
+            rationale="当前软件识别为真实移动应用，已将桌面 Web 控制台架构缓存升级为移动端与服务端分离架构。",
+        )
+    return architecture
+
+
 def _best_for_text(key: str) -> str:
     table = {
         "enterprise_web": "后台管理、业务流程、行业管理平台",
         "dotnet_web_api": "Windows 生态、企业内网、C# 业务服务、需要 .NET 项目证据",
         "web_mobile_app": "APP、小程序、H5、移动用户端和服务端分离",
+        "web_service_console": "APP 产品类型但实际为客服、工单、协同、验收等桌面 Web 工作台",
         "data_ai_service": "数据分析、AI、算法、预测、识别、任务调度",
         "middleware_gateway": "接口网关、中间件、集成同步、消息和开放 API",
         "embedded_c_edge": "嵌入式、物联网边缘采集、设备控制",
@@ -285,7 +341,7 @@ def _default_quality_checks(source_strategy: str) -> list[str]:
     strategy_checks = {
         "java_with_web_console": ["Spring Boot 后端结构完整", "Web 控制台静态入口可浏览"],
         "csharp_web_api": ["ASP.NET Core 分层结构完整", "wwwroot 原型入口可浏览"],
-        "javascript_with_java_api": ["前端工程和 Java API 服务边界清晰", "移动端页面与接口对象一致"],
+        "javascript_with_java_api": ["前端工程和 Java API 服务边界清晰", "React 页面与接口对象一致"],
         "python_with_web_console": ["FastAPI 服务结构完整", "数据处理模块与前端看板一致"],
         "java_with_node_gateway": ["Java 核心服务和 Node 网关分层清晰", "接口契约与业务对象一致"],
         "embedded_mixed": ["C/C++ 设备层和 Python 调试脚本职责清晰", "采集/控制流程可追溯"],

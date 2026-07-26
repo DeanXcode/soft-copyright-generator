@@ -59,6 +59,49 @@ SUBTYPE_NUMBERED_KEY_PREFIXES = {
 
 
 KEY_PHRASES: tuple[tuple[str, str], ...] = (
+    ("质量缺陷整改复验", "quality_defect_rectification_reinspection"),
+    ("缺陷整改复验", "defect_rectification_reinspection"),
+    ("构件进场验收", "component_site_acceptance"),
+    ("构件安装定位", "component_installation_positioning"),
+    ("拼装节点", "assembly_joint"),
+    ("连接质量", "connection_quality"),
+    ("灌浆质量", "grouting_quality"),
+    ("焊接质量", "welding_quality"),
+    ("质量缺陷", "quality_defect"),
+    ("整改复验", "rectification_reinspection"),
+    ("装配式建筑", "prefabricated_building"),
+    ("预制构件", "prefabricated_component"),
+    ("构件安装", "component_installation"),
+    ("进场验收", "site_acceptance"),
+    ("整改", "rectification"),
+    ("复验", "reinspection"),
+    ("缺陷", "defect"),
+    ("构件", "component"),
+    ("安装", "installation"),
+    ("灌浆", "grouting"),
+    ("焊接", "welding"),
+    ("服务预约", "service_booking"),
+    ("门店核销", "store_redemption"),
+    ("会员权益", "member_benefit"),
+    ("消息推送", "message_delivery"),
+    ("售后工单", "aftersales_ticket"),
+    ("活动入口", "campaign_entry"),
+    ("订单支付", "order_payment"),
+    ("客户签收与验收结论", "customer_acceptance_conclusion"),
+    ("客户签收", "customer_signoff"),
+    ("验收结论", "acceptance_conclusion"),
+    ("服务评价采集", "service_evaluation"),
+    ("客户咨询", "customer_inquiry"),
+    ("问题受理", "issue_intake"),
+    ("工单派发", "ticket_dispatch"),
+    ("协同处理", "collaborative_resolution"),
+    ("客户投诉", "customer_complaint"),
+    ("沟通记录", "communication_record"),
+    ("服务回访", "service_followup"),
+    ("服务评价", "service_evaluation"),
+    ("评价采集", "evaluation_collection"),
+    ("满意度", "satisfaction"),
+    ("时效监控", "sla_monitoring"),
     ("手术申请", "surgery_request"),
     ("申请受理", "request_intake"),
     ("术前确认", "preop_confirmation"),
@@ -279,7 +322,7 @@ def semantic_module_key(
     key = _compact_tokens(tokens[:4])
     if key in GENERIC_MODULE_KEYS or is_placeholder_module_key(key):
         digest = _title_digest(str(title or "") or "business", index)
-        key = f"domain_{digest}"
+        key = f"capability_{digest}"
     key = _reserved_safe(key[:48])
     if key not in used_keys:
         return key

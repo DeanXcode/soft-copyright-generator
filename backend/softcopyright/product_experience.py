@@ -196,8 +196,8 @@ _SHAPE_PROFILES: dict[str, dict[str, Any]] = {
         "layout_family": "pipeline",
         "nav_model": "top_tabs",
         "workspace_shape": "freeform_grid",
-        "visual_direction": "三维/VR 管控台，突出场景列表、设备/动作状态、训练流程、评估结果和空间对象。",
-        "page_archetypes": ("场景登录", "三维总览", "训练/仿真流程", "对象详情", "评估统计"),
+        "visual_direction": "三维/VR 工作台，突出场景与模型列表、设备或作业状态、空间操作流程、质量结果和分析记录。",
+        "page_archetypes": ("场景登录", "三维总览", "场景/模型流程", "对象详情", "质量与分析统计"),
     },
     "embedded_panel": {
         "terminal": "embedded_device_panel",
@@ -459,11 +459,14 @@ def _shape(name: str, evidence: list[str], reason: str) -> tuple[str, list[str]]
 
 
 def _task_context_text(task: Any) -> str:
+    feature_hint = getattr(task, "input_feature_hint", None)
+    if feature_hint is None:
+        feature_hint = getattr(task, "feature_hint", "")
     parts = [
         str(getattr(task, "software_name", "") or ""),
         str(getattr(task, "product_type", "") or ""),
         str(getattr(task, "software_category", "") or ""),
-        str(getattr(task, "feature_hint", "") or ""),
+        str(feature_hint or ""),
     ]
     return " ".join(part for part in parts if part.strip())
 
@@ -506,7 +509,7 @@ def _has_admin_context(text: str) -> bool:
 def _has_mobile_backend_context(text: str) -> bool:
     return _match(
         text,
-        r"后台|管理后台|运营后台|控制台|工作台|运营台|管理端|商家端|门店端|平台端|PC端|Web端|报表中心|数据看板|审核台",
+        r"后台|管理后台|运营后台|控制台|工作台|运营台|管理端|商家端|门店端|平台端|PC端|Web端|报表中心|数据看板|审核台|客服|客户服务|工单|派单|投诉|协同处理|协同平台|安装验收|验收系统|服务回访|SLA",
     )
 
 

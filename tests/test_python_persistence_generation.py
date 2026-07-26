@@ -9,10 +9,29 @@ import unittest
 
 from backend.softcopyright.blueprint import FeatureModule
 from backend.softcopyright.models import GenerationTask
-from backend.softcopyright.sourcegen import _generate_python_project
+from backend.softcopyright.sourcegen import _generate_python_project, repair_generated_business_record_labels
 
 
 class PythonPersistenceGenerationTests(unittest.TestCase):
+    def test_resume_label_migration_replaces_generic_seed_names_only(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "service.js"
+            source.write_text(
+                'name: payload.name || "生产工单管控业务记录",\n'
+                '"生产工单管控记录01",\n'
+                'throw new Error("业务记录缺少必要字段");',
+                encoding="utf-8",
+            )
+
+            changed = repair_generated_business_record_labels(root)
+            migrated = source.read_text(encoding="utf-8")
+
+        self.assertEqual(changed, 2)
+        self.assertIn('生产工单管控对象', migrated)
+        self.assertNotIn('生产工单管控记录01', migrated)
+        self.assertIn('业务记录缺少必要字段', migrated)
+
     def test_generated_project_persists_records_and_compiles(self) -> None:
         modules = [
             FeatureModule(

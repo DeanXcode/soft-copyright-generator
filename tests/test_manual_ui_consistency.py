@@ -7,8 +7,10 @@ from docx import Document
 
 from backend.softcopyright.blueprint import FeatureModule, ProductBlueprint
 from backend.softcopyright.docgen import (
+    _add_ui_figure,
     _actual_screenshot_action_labels,
     _actual_screenshot_operation_notes,
+    _manual_semantic_term_covered,
     _manual_ui_button_label_match,
     _visible_content_caption,
     _visible_content_intro_paragraphs,
@@ -18,10 +20,104 @@ from backend.softcopyright.screenshots import UiScreenshot
 
 
 class ManualUiConsistencyTests(unittest.TestCase):
+    def test_semantic_aliases_cover_equivalent_visible_field_labels(self):
+        self.assertTrue(_manual_semantic_term_covered("来源计划版本", "来源版本计划版本"))
+        self.assertTrue(_manual_semantic_term_covered("预测范围", "影响范围预测周期"))
+        self.assertTrue(_manual_semantic_term_covered("生产工单进度", "订单完工进度生产进度"))
+        self.assertFalse(_manual_semantic_term_covered("生产工单进度", "物料齐套日期"))
+
     def test_symbol_only_button_labels_match_exact_screenshot_actions(self):
         self.assertTrue(_manual_ui_button_label_match("↻", ["查询计划", "↻"]))
         self.assertTrue(_manual_ui_button_label_match(" ◉ ", ["◉"]))
+        self.assertTrue(_manual_ui_button_label_match("登录按钮", ["登录系统"]))
+        self.assertTrue(_manual_ui_button_label_match("复核", ["审核"]))
         self.assertFalse(_manual_ui_button_label_match("!", ["确认"]))
+
+    def test_login_action_is_recovered_from_visible_text(self):
+        screenshot = UiScreenshot(
+            "login",
+            "登录界面",
+            "登录说明。",
+            "login.html",
+            visible_content_summary={
+                "ready": True,
+                "visible_text": "账号 密码 验证码 登录系统",
+                "actions": [],
+            },
+        )
+
+        self.assertEqual(_actual_screenshot_action_labels(screenshot), ["登录系统"])
+
+        screenshot.visible_content_summary["visible_text"] = "手机号 短信验证码 登录并进入应用"
+        self.assertEqual(_actual_screenshot_action_labels(screenshot), ["登录并进入应用"])
+
+    def test_admin_operation_notes_rewrite_mobile_role_from_blueprint_contract(self):
+        screenshot = UiScreenshot(
+            "order_operation_1",
+            "订单支付筛选界面",
+            "筛选订单支付信息。",
+            "order_operation_1.html",
+            page_kind="operation",
+            interaction_action="筛选订单支付",
+            interaction_role="移动端用户",
+            interaction_trigger="需要筛选订单支付",
+            visible_content_summary={
+                "ready": True,
+                "visible_text": "订单支付 筛选条件 查询",
+                "headings": ["订单支付"],
+                "fields": ["订单编号"],
+                "actions": ["查询"],
+            },
+        )
+        module = FeatureModule(
+            key="order",
+            title="订单支付管理",
+            description="管理订单支付。",
+            entities=["PaymentOrder"],
+        )
+
+        notes = _actual_screenshot_operation_notes(
+            screenshot,
+            module,
+            design_brief={"expected_renderer": "admin"},
+        )
+        text = " ".join(notes)
+
+        self.assertNotIn("移动端", text)
+        self.assertIn("终端用户", text)
+
+    def test_ui_figure_does_not_restore_mobile_role_after_notes_are_sanitized(self):
+        screenshot = UiScreenshot(
+            "service_operation_1",
+            "服务预约筛选界面",
+            "筛选服务预约信息。",
+            "service_operation_1.html",
+            page_kind="operation",
+            interaction_action="筛选服务预约",
+            interaction_role="移动端用户",
+            interaction_trigger="需要筛选服务预约",
+            visible_content_summary={
+                "ready": True,
+                "visible_text": "服务预约 筛选条件 查询",
+                "headings": ["服务预约"],
+                "fields": ["预约编号"],
+                "actions": ["查询"],
+            },
+        )
+        document = Document()
+
+        _add_ui_figure(
+            document,
+            {screenshot.key: screenshot},
+            screenshot.key,
+            screenshot.title,
+            screenshot.caption,
+            design_brief={"expected_renderer": "admin"},
+        )
+        text = " ".join(paragraph.text for paragraph in document.paragraphs)
+
+        self.assertNotIn("移动端", text)
+        self.assertIn("终端用户", text)
 
     def _blueprint(self):
         return ProductBlueprint(
@@ -87,6 +183,34 @@ class ManualUiConsistencyTests(unittest.TestCase):
             self.assertTrue(result["manual_ui_consistency_ready"])
             self.assertEqual(result["manual_ui_title_mismatch_count"], 0)
             self.assertEqual(result["manual_ui_button_mismatch_count"], 0)
+
+    def test_plain_numbered_action_text_counts_when_action_is_visible(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            image = root / "page.png"
+            image.write_bytes(b"png")
+            screenshots = {
+                "quality_plan": UiScreenshot(
+                    "quality_plan",
+                    "质量策划",
+                    "质量策划页面。",
+                    str(root / "main.html"),
+                    page_kind="module",
+                    module_key="quality_plan",
+                    image_path=str(image),
+                    visible_content_summary={"ready": False, "visible_text": "质量策划 审核", "actions": ["审核"]},
+                )
+            }
+            document = Document()
+            document.add_paragraph("图：质量策划，质量策划页面。")
+            document.add_paragraph("1. 质量策划界面提供审核等当前截图可见操作，点击后按页面反馈继续处理。")
+            path = root / "manual.docx"
+            document.save(path)
+
+            result = analyze_manual_ui_consistency(path, self._blueprint(), screenshots)
+
+            self.assertTrue(result["manual_ui_consistency_ready"])
+            self.assertEqual(result["manual_ui_missing_button_coverage_count"], 0)
 
     def test_mismatched_title_and_button_fail_delivery_gate(self):
         with TemporaryDirectory() as temporary_directory:
@@ -300,6 +424,230 @@ class ManualUiConsistencyTests(unittest.TestCase):
         self.assertIn("计划执行率", text)
         self.assertNotIn("策划状态", text)
 
+    def test_operation_notes_explain_each_visible_action(self):
+        module = self._blueprint().modules[0]
+        screenshot = UiScreenshot(
+            "quality_plan_query",
+            "质量策划查询界面",
+            "查询质量策划。",
+            "quality-plan-query.html",
+            page_kind="operation",
+            module_key="quality_plan",
+            action_crops={"查询": "query.png", "导出清单": "export.png", "查看": "view.png"},
+            visible_content_summary={
+                "ready": True,
+                "visible_text": "策划状态 责任岗位 查询 导出清单 查看",
+                "headings": ["质量策划查询结果"],
+                "metrics": [],
+                "fields": ["策划编号", "策划状态"],
+                "statuses": ["待复核"],
+                "filters": ["策划状态", "责任岗位"],
+                "actions": ["查询", "导出清单", "查看"],
+            },
+        )
+
+        notes = _actual_screenshot_operation_notes(screenshot, module)
+        text = "\n".join(notes)
+
+        self.assertIn("【查询】用于应用当前筛选条件并刷新结果列表", text)
+        self.assertIn("【导出清单】用于将当前页面结果生成清单或报表", text)
+        self.assertIn("【查看】用于打开所选记录的详细内容", text)
+        self.assertIn("策划编号、策划状态", text)
+        self.assertNotIn("点击后按页面反馈继续处理", text)
+
+    def test_operation_notes_cover_all_visible_actions_without_summary_report_copy(self):
+        module = self._blueprint().modules[0]
+        screenshot = UiScreenshot(
+            "quality_plan_actions",
+            "质量策划查询界面",
+            "查询质量策划。",
+            "quality-plan-actions.html",
+            page_kind="operation",
+            module_key="quality_plan",
+            visible_content_summary={
+                "ready": True,
+                "visible_text": "策划状态 责任岗位 查询 重置 导出清单 查看 刷新",
+                "headings": ["质量策划查询结果"],
+                "metrics": ["命中策划数"],
+                "fields": ["策划编号", "策划状态"],
+                "statuses": ["待复核"],
+                "filters": ["策划状态", "责任岗位"],
+                "actions": ["查询", "重置", "导出清单", "查看", "刷新"],
+            },
+        )
+
+        text = "\n".join(_actual_screenshot_operation_notes(screenshot, module))
+
+        for label in ["查询", "重置", "导出清单", "查看", "刷新"]:
+            self.assertIn(f"【{label}】", text)
+        self.assertIn("本页用于集中查看质量策划查询结果", text)
+        self.assertNotIn("当前截图的主要业务区域包括", text)
+        self.assertNotIn("当前可见的指标包括", text)
+
+    def test_operation_notes_include_contract_trigger_inputs_state_and_evidence(self):
+        module = self._blueprint().modules[0]
+        screenshot = UiScreenshot(
+            "quality_plan_approval",
+            "质量策划审批界面",
+            "审批质量策划。",
+            "quality-plan-approval.html",
+            page_kind="operation",
+            module_key="quality_plan",
+            interaction_action="批准质量策划",
+            interaction_role="质量主管",
+            interaction_trigger="约束校验全部通过",
+            interaction_input_fields=["策划编号", "审批意见"],
+            interaction_pre_state="待审批",
+            interaction_post_state="已批准并进入执行准备",
+            interaction_result_evidence="审批记录、状态轨迹、执行准备清单",
+            requires_confirmation=True,
+            visible_content_summary={
+                "ready": True,
+                "visible_text": "批准质量策划 策划编号 审批意见 确认批准 取消",
+                "headings": ["批准质量策划"],
+                "metrics": [],
+                "fields": ["策划编号", "审批意见"],
+                "statuses": ["待审批"],
+                "filters": [],
+                "actions": ["确认批准", "取消"],
+            },
+        )
+
+        text = "\n".join(_actual_screenshot_operation_notes(screenshot, module))
+
+        self.assertIn("本页用于批准质量策划，由质量主管在约束校验全部通过时发起", text)
+        self.assertIn("策划编号、审批意见用于在提交前核对", text)
+        self.assertIn("处理前状态为待审批", text)
+        self.assertIn("审批记录、状态轨迹、执行准备清单", text)
+        self.assertIn("业务状态将更新为已批准并进入执行准备", text)
+
+    def test_operation_notes_hide_internal_fields_and_legacy_truncated_contract_text(self):
+        module = self._blueprint().modules[0]
+        screenshot = UiScreenshot(
+            "quality_plan_legacy_contract",
+            "质量策划处置界面",
+            "处置质量策划。",
+            "quality-plan-legacy.html",
+            page_kind="operation",
+            module_key="quality_plan",
+            interaction_action="建立质量处置",
+            interaction_role="生产管理人员、车间主管、生产计划",
+            interaction_trigger="质量风险达到高等级",
+            interaction_input_fields=["quality_plan_id", "action_type", "responsible_role"],
+            interaction_pre_state="延期风险处于待关注或处理中，当前风险来源尚无有效处置任务，或已有",
+            interaction_post_state="生成状态为待处理的交付处置任务，关联风险订单、预测快照、计划版本",
+            interaction_result_evidence="处置任务编号、状态轨迹",
+            visible_content_summary={
+                "ready": True,
+                "visible_text": "建立质量处置 策划编号 处置类型 责任岗位 保存草稿 提交处置",
+                "headings": ["建立质量处置"],
+                "metrics": [],
+                "fields": ["策划编号", "处置类型", "责任岗位"],
+                "statuses": ["待处理"],
+                "filters": [],
+                "actions": ["保存草稿", "提交处置"],
+            },
+        )
+
+        text = "\n".join(_actual_screenshot_operation_notes(screenshot, module))
+
+        self.assertIn("由生产管理人员、车间主管在质量风险达到高等级时发起", text)
+        self.assertIn("操作前需填写或核对策划编号、处置类型、责任岗位", text)
+        self.assertNotIn("quality_plan_id", text)
+        self.assertNotIn("生产计划在", text)
+        self.assertNotIn("或已有", text)
+        self.assertNotIn("关联风险订单、预测快照、计划版本", text)
+
+    def test_confirmation_notes_explain_review_fields_before_actions(self):
+        module = self._blueprint().modules[0]
+        screenshot = UiScreenshot(
+            "quality_plan_confirm",
+            "确认质量策划界面",
+            "确认质量策划。",
+            "quality-plan-confirm.html",
+            page_kind="operation",
+            module_key="quality_plan",
+            requires_confirmation=True,
+            interaction_post_state="质量策划转为待执行",
+            action_crops={"确认质量策划": "confirm.png", "取消": "cancel.png"},
+            visible_content_summary={
+                "ready": True,
+                "visible_text": "确认质量策划 策划编号 责任岗位 确认质量策划 取消",
+                "headings": ["确认质量策划"],
+                "metrics": [],
+                "fields": ["策划编号", "责任岗位"],
+                "statuses": [],
+                "filters": [],
+                "actions": ["确认质量策划", "取消"],
+            },
+        )
+
+        notes = _actual_screenshot_operation_notes(screenshot, module)
+        text = "\n".join(notes)
+
+        self.assertIn("策划编号、责任岗位用于在提交前核对", text)
+        self.assertIn("【确认质量策划】用于提交当前处理结论", text)
+        self.assertIn("【取消】用于关闭当前弹窗", text)
+
+    def test_confirmation_notes_prefer_full_cropped_button_label_over_nested_summary_action(self):
+        module = self._blueprint().modules[0]
+        screenshot = UiScreenshot(
+            "quality_plan_submit_confirm",
+            "提交质量策划结论界面",
+            "提交质量策划结论。",
+            "quality-plan-submit-confirm.html",
+            page_kind="operation",
+            module_key="quality_plan",
+            requires_confirmation=True,
+            interaction_action="提交结论",
+            action_crops={"确认提交结论": "confirm.png", "取消": "cancel.png"},
+            visible_content_summary={
+                "ready": True,
+                "visible_text": "确认提交结论 当前策划 状态变化 取消",
+                "headings": ["确认提交结论"],
+                "metrics": [],
+                "fields": ["当前策划", "状态变化"],
+                "statuses": [],
+                "filters": [],
+                "actions": ["取消", "确认提交结论", "提交结论"],
+            },
+        )
+
+        notes = _actual_screenshot_operation_notes(screenshot, module)
+        text = "\n".join(notes)
+
+        self.assertEqual(text.count("【确认提交结论】"), 1)
+        self.assertNotIn("【提交结论】", text)
+
+    def test_confirmation_notes_prefer_visible_dialog_fields_over_hidden_contract_inputs(self):
+        module = self._blueprint().modules[0]
+        screenshot = UiScreenshot(
+            "quality_plan_confirm_visible",
+            "确认质量策划界面",
+            "确认质量策划。",
+            "quality-plan-confirm-visible.html",
+            page_kind="operation",
+            module_key="quality_plan",
+            requires_confirmation=True,
+            interaction_role="质量主管",
+            interaction_input_fields=["质量策划单编号", "审批意见", "签名标识"],
+            visible_content_summary={
+                "ready": True,
+                "visible_text": "确认质量策划 当前策划 状态变化 影响范围 确认质量策划 取消",
+                "headings": ["确认质量策划"],
+                "metrics": [],
+                "fields": ["当前策划", "状态变化", "影响范围"],
+                "statuses": [],
+                "filters": [],
+                "actions": ["确认质量策划", "取消"],
+            },
+        )
+
+        text = "\n".join(_actual_screenshot_operation_notes(screenshot, module))
+
+        self.assertIn("当前策划、状态变化、影响范围用于在提交前核对", text)
+        self.assertNotIn("质量策划单编号、审批意见、签名标识用于在提交前核对", text)
+
     def test_semantic_gate_rejects_blueprint_field_missing_from_visible_page(self):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -376,6 +724,84 @@ class ManualUiConsistencyTests(unittest.TestCase):
 
             self.assertTrue(result["manual_ui_consistency_ready"])
             self.assertTrue(result["manual_ui_semantic_ready"])
+
+    def test_semantic_gate_accepts_input_placeholder_captured_as_filter(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            image = root / "page.png"
+            image.write_bytes(b"png")
+            screenshots = {
+                "quality_plan": UiScreenshot(
+                    "quality_plan",
+                    "质量策划",
+                    "质量策划页面。",
+                    str(root / "main.html"),
+                    page_kind="module",
+                    module_key="quality_plan",
+                    image_path=str(image),
+                    action_crops={"保存策划": str(root / "save.png")},
+                    visible_content_summary={
+                        "ready": True,
+                        "visible_text": "质量策划结果详情 保存策划",
+                        "headings": ["质量策划结果详情"],
+                        "metrics": [],
+                        "fields": [],
+                        "statuses": [],
+                        "filters": ["输入策划状态"],
+                        "actions": ["保存策划"],
+                    },
+                )
+            }
+            document = Document()
+            document.add_paragraph("图：质量策划，页面展示质量策划结果详情。")
+            document.add_paragraph("1. 可通过输入策划状态限定范围，并提供【保存策划】入口。")
+            path = root / "manual.docx"
+            document.save(path)
+
+            result = analyze_manual_ui_consistency(path, self._blueprint(), screenshots)
+
+            self.assertTrue(result["manual_ui_consistency_ready"])
+            self.assertTrue(result["manual_ui_semantic_ready"])
+
+    def test_semantic_gate_accepts_field_labels_from_label_help_text_summaries(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            image = root / "login.png"
+            image.write_bytes(b"png")
+            screenshots = {
+                "login": UiScreenshot(
+                    "login",
+                    "登录界面",
+                    "登录说明。",
+                    str(root / "login.html"),
+                    page_kind="login",
+                    image_path=str(image),
+                    visible_content_summary={
+                        "ready": True,
+                        "visible_text": "登录账号 登录密码 图形验证码 登录并进入服务运营控制台",
+                        "headings": ["服务运营工作台登录"],
+                        "metrics": [],
+                        "fields": [
+                            "登录账号 支持客服坐席和客服主管账号",
+                            "登录密码 密码需包含大小写字母和数字",
+                            "图形验证码",
+                        ],
+                        "statuses": [],
+                        "filters": [],
+                        "actions": ["登录并进入服务运营控制台"],
+                    },
+                )
+            }
+            document = Document()
+            document.add_paragraph("图：登录界面，页面展示登录账号、登录密码和图形验证码。")
+            document.add_paragraph("1. 填写登录账号和登录密码后完成身份校验。")
+            path = root / "manual.docx"
+            document.save(path)
+
+            result = analyze_manual_ui_consistency(path, self._blueprint(), screenshots)
+
+            self.assertTrue(result["manual_ui_consistency_ready"])
+            self.assertEqual(result["manual_ui_semantic_coverage_missing_count"], 0)
 
     def test_desktop_screenshots_reject_mobile_terminal_description_anywhere_in_manual(self):
         with TemporaryDirectory() as temporary_directory:

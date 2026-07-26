@@ -85,12 +85,8 @@ def validate_materials(
 ) -> dict:
     checks = checks or {}
     local_template_mode = task.model_provider.lower() in {"local", "local-template", "template", ""}
-    blueprint_operation_contract_required = not local_template_mode
-    blueprint_operation_contract_ready = (
-        bool(checks.get("blueprint_operation_contract_ready"))
-        if blueprint_operation_contract_required
-        else True
-    )
+    blueprint_operation_contract_required = True
+    blueprint_operation_contract_ready = bool(checks.get("blueprint_operation_contract_ready"))
     source_dir = Path(source_info.get("source_dir") or output_dir / "generated_source")
     file_manifest = _source_file_manifest(source_dir)
     deliverables = _deliverable_manifest(task, deliverable_files)
@@ -115,6 +111,8 @@ def validate_materials(
         "blueprint_operation_contract_ready": blueprint_operation_contract_ready,
         "blueprint_operation_contract_issues": checks.get("blueprint_operation_contract_issues") or [],
         "blueprint_structured_operation_count": int(checks.get("blueprint_structured_operation_count") or 0),
+        "blueprint_task_domain_ready": bool(checks.get("blueprint_task_domain_ready")),
+        "blueprint_task_domain_issues": checks.get("blueprint_task_domain_issues") or [],
         "ui_screenshot_render_mode": str(checks.get("ui_screenshot_render_mode") or ""),
         "ui_screenshot_base_url": str(checks.get("ui_screenshot_base_url") or ""),
         "ui_project_server_started": bool(checks.get("ui_project_server_started")),
@@ -199,6 +197,7 @@ def validate_materials(
     authenticity["ready"] = (
         authenticity["score"] >= 80
         and bool(authenticity["blueprint_operation_contract_ready"])
+        and bool(authenticity["blueprint_task_domain_ready"])
         and authenticity["ui_screenshot_render_mode"] == "project-server"
         and bool(authenticity["ui_project_server_started"])
         and bool(authenticity["ui_runtime_probe_ready"])
@@ -395,6 +394,8 @@ def validation_checks(validation: dict) -> dict:
         "validation_blueprint_operation_contract_ready": bool(authenticity.get("blueprint_operation_contract_ready")),
         "validation_blueprint_operation_contract_issues": authenticity.get("blueprint_operation_contract_issues", []),
         "validation_blueprint_structured_operation_count": authenticity.get("blueprint_structured_operation_count", 0),
+        "validation_blueprint_task_domain_ready": bool(authenticity.get("blueprint_task_domain_ready")),
+        "validation_blueprint_task_domain_issues": authenticity.get("blueprint_task_domain_issues", []),
         "validation_zip_entries_match_deliverables": bool(normative.get("zip_entries_match_deliverables")),
         "validation_placeholder_hit_count": len(normative.get("placeholder_hits") or []),
         "validation_ui_project_server_started": bool(authenticity.get("ui_project_server_started")),
@@ -969,6 +970,12 @@ def _findings(auth: dict, norm: dict) -> list[dict]:
             "level": "error",
             "code": "blueprint_operation_contract_not_ready",
             "message": "GPT 产品蓝图缺少可核验的结构化操作契约，不能进入正式材料交付。" + detail,
+        })
+    if not auth.get("blueprint_task_domain_ready"):
+        findings.append({
+            "level": "error",
+            "code": "blueprint_task_domain_mismatch",
+            "message": "产品蓝图行业与软件名称或原始业务补充不一致，必须修正蓝图后重新生成材料。",
         })
     if auth.get("source_persistence_required") and not auth.get("source_persistence_ready"):
         findings.append({

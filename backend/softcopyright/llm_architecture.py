@@ -10,6 +10,7 @@ from .architecture import (
     TechnicalArchitecture,
     architecture_catalog_for_prompt,
     create_technical_architecture,
+    normalize_technical_architecture_for_experience,
     select_technical_architecture,
 )
 from .blueprint import ProductBlueprint
@@ -42,7 +43,11 @@ def select_technical_architecture_with_llm(
             max_tokens=1400,
             label="技术架构选择",
         )
-        architecture = _architecture_from_data(data, fallback)
+        architecture = normalize_technical_architecture_for_experience(
+            task,
+            blueprint,
+            _architecture_from_data(data, fallback),
+        )
         trace_event(
             "architecture_selection_success",
             layer="architecture",

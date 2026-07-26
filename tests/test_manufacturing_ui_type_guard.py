@@ -1,10 +1,17 @@
 import json
 import unittest
 
-from backend.softcopyright.blueprint import FeatureModule, ProductBlueprint
+from backend.softcopyright.architecture import (
+    create_technical_architecture,
+    normalize_technical_architecture_for_experience,
+    select_technical_architecture,
+)
+from backend.softcopyright.blueprint import FeatureModule, ProductBlueprint, generate_blueprint
 from backend.softcopyright.industry_subtypes import build_ui_design_brief, select_industry_subtype_for_context
+from backend.softcopyright.generator import _is_transport_operation_context
 from backend.softcopyright.models import GenerationTask
 from backend.softcopyright.product_experience import build_product_experience_spec
+from backend.softcopyright.screenshots import _is_transport_route_context
 from backend.softcopyright.ui_blueprint import build_ui_blueprint, repair_ui_blueprint_contract, ui_matches_software_type
 
 
@@ -52,6 +59,88 @@ def _manufacturing_blueprint(task: GenerationTask) -> ProductBlueprint:
 
 
 class ManufacturingUiTypeGuardTests(unittest.TestCase):
+    def test_customer_service_installation_acceptance_app_uses_admin_workstation(self):
+        task = GenerationTask(
+            software_name="客户服务协同平台正式安装验收系统",
+            product_type="APP",
+            feature_hint="",
+            seed="customer-service-installation-acceptance",
+        )
+        setattr(task, "input_feature_hint", "")
+
+        experience = build_product_experience_spec(task)
+
+        self.assertEqual(experience.experience_shape, "desktop_web")
+        self.assertEqual(experience.renderer, "admin")
+        self.assertEqual(select_technical_architecture(task).key, "web_service_console")
+        normalized = normalize_technical_architecture_for_experience(
+            task,
+            None,
+            create_technical_architecture("web_mobile_app"),
+        )
+        self.assertEqual(normalized.key, "web_service_console")
+        self.assertEqual(normalized.source_strategy, "javascript_with_java_api")
+        self.assertNotIn("移动端", json.dumps(normalized.to_dict(), ensure_ascii=False))
+
+    def test_vr_mapping_product_does_not_use_training_identity(self):
+        task = GenerationTask(
+            software_name="测绘空间三维模型编辑平台",
+            product_type="VR软件",
+            feature_hint="空间模型导入、倾斜摄影、坐标配准、控制点、模型分块、纹理贴合和测绘成果导出",
+            seed="vr-spatial-modeling-regression",
+        )
+
+        subtype = select_industry_subtype_for_context(task)
+        experience = build_product_experience_spec(task)
+        brief = build_ui_design_brief(task)
+        serialized = json.dumps({"experience": experience.to_dict(), "brief": brief}, ensure_ascii=False)
+
+        self.assertEqual(subtype.key, "vr_spatial_modeling")
+        self.assertEqual(experience.industry_subtype_key, "vr_spatial_modeling")
+        self.assertEqual(brief["industry_subtype_key"], "vr_spatial_modeling")
+        for expected in ["空间模型", "坐标配准", "模型分块", "测绘成果"]:
+            self.assertIn(expected, serialized)
+        for forbidden in ["安全培训", "训练任务", "成绩评分", "体验学员"]:
+            self.assertNotIn(forbidden, serialized)
+
+    def test_community_booking_app_does_not_fall_back_to_rail_admin(self):
+        task = GenerationTask(
+            software_name="社区预约服务App二期",
+            product_type="智慧城市软件",
+            feature_hint="",
+            model_provider="local-template",
+            seed="community-booking-regression",
+        )
+        setattr(task, "input_feature_hint", "")
+
+        subtype = select_industry_subtype_for_context(task)
+        blueprint = generate_blueprint(task)
+        experience = build_product_experience_spec(task, blueprint)
+        ui_blueprint = build_ui_blueprint(task, blueprint)
+
+        self.assertEqual(subtype.key, "community_service")
+        self.assertEqual(blueprint.industry_subtype_key, "community_service")
+        self.assertEqual(experience.renderer, "mobile_app")
+        self.assertTrue(ui_matches_software_type(task, blueprint, ui_blueprint))
+        self.assertIn("售后工单", json.dumps(ui_blueprint.to_dict(), ensure_ascii=False))
+        self.assertNotIn("轨道交通", json.dumps(blueprint.to_dict(), ensure_ascii=False))
+
+    def test_generic_smart_city_acceptance_name_does_not_select_rail_quality(self):
+        task = GenerationTask(
+            software_name="安装版零令牌验收系统",
+            product_type="智慧城市软件",
+            feature_hint="用户入口、首页导航、核心工作台、业务表单处理、记录查询、统计分析、消息提醒、系统设置",
+            model_provider="local-template",
+            seed="generic-smart-city-acceptance",
+        )
+
+        subtype = select_industry_subtype_for_context(task)
+        blueprint = generate_blueprint(task)
+
+        self.assertEqual(subtype.key, "business_ops")
+        self.assertEqual(blueprint.industry_subtype_key, "business_ops")
+        self.assertNotIn("轨道交通", json.dumps(blueprint.to_dict(), ensure_ascii=False))
+
     def test_ai_production_platform_uses_consistent_manufacturing_subtype(self):
         task = GenerationTask(
             software_name="智能生产效率提升平台",
@@ -145,6 +234,8 @@ class ManufacturingUiTypeGuardTests(unittest.TestCase):
         self.assertEqual(experience.experience_shape, "industrial_hmi")
         self.assertEqual(ui_blueprint.design_brief["industry_subtype"], "轨道交通施工质量分析系统")
         self.assertTrue(ui_matches_software_type(task, blueprint, ui_blueprint))
+        self.assertFalse(_is_transport_operation_context(" ".join([task.software_name, blueprint.industry, blueprint.summary])))
+        self.assertFalse(_is_transport_route_context(blueprint))
         for forbidden in ["inpatient_monitoring", "surgery_schedule", "住院患者", "手术", "麻醉", "病历"]:
             self.assertNotIn(forbidden, serialized)
 
