@@ -10,17 +10,101 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from generate_materials import _confirmed_outline_from_resume_dir, _seed_from_output_dir
 from softcopyright.generator import (
+    _begin_generation_attempt,
     _delivery_zip_path,
     _load_completed_resume_report,
+    _resume_failure_payload,
     _resume_failure_progress,
+    _resume_failure_progress_from_payload,
     _resume_failure_stage,
     _resume_blueprint_lock_ready,
     _should_defer_pre_render_similarity_for_resume,
     _stage_precedes,
+    _write_generation_failure,
+    _write_generation_state,
 )
+from softcopyright.models import GenerationTask
+from softcopyright.packager import write_json
 
 
 class ResumeConfirmedOutlineTests(unittest.TestCase):
+    def test_generation_state_v2_and_failure_share_one_attempt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "state-v2"
+            task = GenerationTask(software_name="状态恢复测试系统", product_type="APP", seed="state-v2")
+
+            _begin_generation_attempt(output_dir, task, resume_source="new-task")
+            state = json.loads((output_dir / "generation-state.json").read_text(encoding="utf-8"))
+            _write_generation_failure(
+                output_dir,
+                task,
+                stage="screenshots",
+                progress=58,
+                message="模拟界面生成中断",
+            )
+            failure = json.loads((output_dir / "generation-failure.json").read_text(encoding="utf-8"))
+            final_state = json.loads((output_dir / "generation-state.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(state["schema_version"], 2)
+        self.assertTrue(state["attempt_id"])
+        self.assertTrue(state["started_at"])
+        self.assertTrue(state["updated_at"])
+        self.assertEqual(state["resume_source"], "new-task")
+        self.assertEqual(failure["attempt_id"], state["attempt_id"])
+        self.assertEqual(final_state["attempt_id"], state["attempt_id"])
+        self.assertEqual(final_state["status"], "error")
+
+    def test_new_attempt_archives_previous_failure_and_isolates_resume_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "attempt-isolation"
+            output_dir.mkdir()
+            write_json(
+                output_dir / "generation-failure.json",
+                {"schema_version": 2, "attempt_id": "old-attempt", "status": "error", "stage": "screenshots", "progress": 52},
+            )
+            task = GenerationTask(software_name="尝试隔离测试系统", product_type="APP", seed="attempt-isolation")
+
+            _begin_generation_attempt(output_dir, task, resume_source="failure-state")
+            state = json.loads((output_dir / "generation-state.json").read_text(encoding="utf-8"))
+            history = list((output_dir / "attempt-history").glob("generation-failure-old-attempt-*.json"))
+            failure_exists = (output_dir / "generation-failure.json").exists()
+
+        self.assertNotEqual(state["attempt_id"], "old-attempt")
+        self.assertEqual(state["resume_source"], "failure-state")
+        self.assertEqual(len(history), 1)
+        self.assertFalse(failure_exists)
+
+    def test_stale_failure_file_does_not_override_latest_attempt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "stale-failure"
+            output_dir.mkdir()
+            write_json(
+                output_dir / "generation-state.json",
+                {"schema_version": 2, "attempt_id": "latest", "status": "running", "stage": "manual", "progress": 72},
+            )
+            write_json(
+                output_dir / "generation-failure.json",
+                {"schema_version": 2, "attempt_id": "old", "status": "error", "stage": "screenshots", "progress": 50},
+            )
+
+            payload = _resume_failure_payload(output_dir)
+
+        self.assertEqual(payload["attempt_id"], "latest")
+        self.assertEqual(payload["stage"], "manual")
+        self.assertEqual(_resume_failure_progress_from_payload(payload), 72)
+
+    def test_atomic_json_write_leaves_no_partial_temp_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "generation-state.json"
+            for index in range(10):
+                write_json(path, {"schema_version": 2, "attempt_id": f"attempt-{index}", "value": "界面状态" * 200})
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            leftovers = list(path.parent.glob(f".{path.name}.*.tmp"))
+
+        self.assertEqual(payload["attempt_id"], "attempt-9")
+        self.assertEqual(leftovers, [])
+
     def test_completed_resume_returns_existing_material_package(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "测试系统-existing"

@@ -9,7 +9,7 @@ from typing import Any
 
 from .blueprint import ProductBlueprint
 from .errors import sanitize_error_message
-from .llm.provider import LLMProvider, LocalTemplateProvider
+from .llm.provider import LLMProvider, LocalTemplateProvider, TextProviderError, TextRetryPolicy
 from .llm.trace import trace_event
 from .models import GenerationTask
 
@@ -393,6 +393,7 @@ def _generate_section(
         max_tokens=max_tokens,
         response_format={"type": "json_object"},
         trace_label=f"manual:{title}",
+        retry_policy=TextRetryPolicy(max_retries=1),
     )
     data = _parse_json(content)
     paragraphs = _paragraphs(data.get("paragraphs"), min_count=min_count, limit=limit)
@@ -535,6 +536,7 @@ def _generate_module_section(
         max_tokens=900,
         response_format={"type": "json_object"},
         trace_label=f"manual:{module.title}",
+        retry_policy=TextRetryPolicy(max_retries=1),
     )
     data = _parse_json(content)
     paragraphs = _paragraphs(data.get("paragraphs"), min_count=2, limit=150)
@@ -618,8 +620,7 @@ def _chat_json(
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     current_messages = messages
-    provider_retries = int(getattr(getattr(provider, "config", None), "retry_count", 0) or 0)
-    total_attempts = 1 if provider_retries > 0 else max(1, attempts)
+    total_attempts = max(1, min(2, attempts))
     for attempt in range(total_attempts):
         started_at = time.perf_counter()
         trace_event(
@@ -639,6 +640,7 @@ def _chat_json(
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"},
                 trace_label=f"manual:{label}",
+                retry_policy=TextRetryPolicy(max_retries=1),
             )
             data = _parse_json(content)
             trace_event(
@@ -650,6 +652,8 @@ def _chat_json(
                 content_chars=len(content or ""),
             )
             return data
+        except TextProviderError:
+            raise
         except Exception as exc:
             last_error = exc
             safe_error = sanitize_error_message(exc, limit=500)

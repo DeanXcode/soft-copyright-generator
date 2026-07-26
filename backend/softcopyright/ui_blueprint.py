@@ -10,7 +10,7 @@ from typing import Any
 
 from .blueprint import ProductBlueprint
 from .industry_subtypes import build_ui_design_brief
-from .llm.provider import LLMProvider, LocalTemplateProvider
+from .llm.provider import LLMProvider, LocalTemplateProvider, TextProviderError, TextRetryPolicy
 from .llm.trace import trace_event
 from .models import GenerationTask
 from .product_experience import (
@@ -683,12 +683,11 @@ def _chat_json(
     *,
     max_tokens: int,
     label: str,
-    attempts: int = 3,
+    attempts: int = 2,
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     current_messages = messages
-    provider_retries = int(getattr(getattr(provider, "config", None), "retry_count", 0) or 0)
-    total_attempts = 1 if provider_retries > 0 else max(1, attempts)
+    total_attempts = max(1, min(2, attempts))
     for attempt in range(total_attempts):
         started_at = time.perf_counter()
         trace_event(
@@ -708,6 +707,7 @@ def _chat_json(
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"},
                 trace_label=f"ui_blueprint:{label}",
+                retry_policy=TextRetryPolicy(max_retries=1),
             )
             data = _parse_json(content)
             trace_event(
@@ -719,6 +719,8 @@ def _chat_json(
                 content_chars=len(content or ""),
             )
             return data
+        except TextProviderError:
+            raise
         except Exception as exc:
             last_error = exc
             trace_event(

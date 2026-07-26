@@ -9,6 +9,7 @@ from backend.softcopyright.blueprint import FeatureModule, ProductBlueprint, gen
 from backend.softcopyright.industry_subtypes import INDUSTRY_SUBTYPES
 from backend.softcopyright.llm_blueprint import (
     _clean_workflows,
+    _generate_modules,
     _generate_module_batches,
     _expected_plan_terminal,
     _normalize_plan_terminal_semantics,
@@ -489,10 +490,10 @@ class BlueprintOperationContractTests(unittest.TestCase):
         self.assertFalse(local_validation["authenticity"]["blueprint_operation_contract_ready"])
         self.assertIn("blueprint_operation_contract_not_ready", local_codes)
 
-    def test_balanced_module_batches_repair_only_the_failed_batch(self):
+    def test_normal_blueprint_module_path_uses_four_batches_and_six_total_requests(self):
         outline = [
             {"key": f"manufacturing_module_{index}", "title": f"生产执行模块{index}", "focus": "制造现场业务"}
-            for index in range(1, 7)
+            for index in range(1, 9)
         ]
         call_labels = []
 
@@ -517,10 +518,6 @@ class BlueprintOperationContractTests(unittest.TestCase):
         def chat_json(_provider, _messages, *, temperature, max_tokens, label):
             call_labels.append(label)
             batch_index = int(label[-1])
-            if "修复" not in label:
-                invalid = valid_module(batch_index * 2 - 1)
-                invalid["operation_specs"] = []
-                return {"modules": [invalid, invalid]}
             return {"modules": [valid_module(batch_index * 2 - 1), valid_module(batch_index * 2)]}
 
         with patch.dict("os.environ", {"SOFT_GENERATION_PROFILE": "balanced", "SOFT_LLM_BATCH_WORKERS": "1"}), patch(
@@ -535,12 +532,102 @@ class BlueprintOperationContractTests(unittest.TestCase):
                 "",
             )
 
-        self.assertEqual(len(modules), 6)
-        self.assertEqual(call_labels.count("模块明细修复批次1"), 1)
-        self.assertEqual(call_labels.count("模块明细修复批次2"), 1)
-        self.assertEqual(call_labels.count("模块明细修复批次3"), 1)
+        self.assertEqual(len(modules), 8)
+        self.assertEqual(call_labels, [f"模块明细批次{index}" for index in range(1, 5)])
+        self.assertEqual(2 + len(call_labels), 6)
         self.assertEqual([item["key"] for item in modules], [item["key"] for item in outline])
         self.assertEqual([item["title"] for item in modules], [item["title"] for item in outline])
+
+    def test_failed_module_batches_are_combined_into_one_repair_request(self):
+        outline = [
+            {"key": f"manufacturing_module_{index}", "title": f"生产执行模块{index}", "focus": "制造现场业务"}
+            for index in range(1, 9)
+        ]
+        call_labels = []
+
+        def valid_module(index):
+            title = f"生产执行模块{index}"
+            return {
+                "key": f"module_{index}",
+                "title": title,
+                "description": "围绕生产计划、生产工单、产线资源和制造现场状态组织业务处理，校验责任岗位、执行条件和状态流转，完成后输出可核验的任务轨迹、统计结果和审计记录。",
+                "entities": ["ProductionRecord", "ProductionTrace"],
+                "operations": ["筛选生产任务", "下达生产工单", "暂停异常任务", "分析执行偏差", "追踪处理结果"],
+                "operation_specs": [
+                    _operation("filter_production_tasks", "筛选生产任务", "lookup", "计划员", "需要定位待执行任务", ["任务编号", "目标产线"], "全部任务", "显示匹配任务", "筛选条件和结果数量"),
+                    _operation("release_production_order", "下达生产工单", "workflow", "车间主管", "物料和工艺校验通过", ["工单编号", "计划数量"], "待下达", "已下达", "工单状态和下达日志"),
+                    _operation("analyze_execution_gap", "分析执行偏差", "analysis", "生产主管", "实际进度偏离计划", ["计划版本", "统计周期"], "待分析", "已形成偏差结论", "偏差指标和影响范围"),
+                ],
+                "data_fields": ["生产任务编号", "目标产线", "计划数量", "实际数量", "责任岗位", "执行状态", "偏差原因"],
+                "pages": ["生产任务工作台", "执行结果详情"],
+                "rules": ["仅授权岗位可下达任务", "工单状态必须按顺序流转", "关键动作必须写入审计日志"],
+            }
+
+        def chat_json(_provider, _messages, *, temperature, max_tokens, label):
+            call_labels.append(label)
+            if label == "模块明细聚合修复":
+                return {"modules": [valid_module(index) for index in range(1, 9)]}
+            batch_index = int(label[-1])
+            return {"modules": [valid_module(batch_index * 2 - 1), valid_module(batch_index * 2)]}
+
+        quality_calls = {"batch": 0}
+
+        def quality_reasons(_task, _modules, *, expected_count):
+            if expected_count == 2:
+                quality_calls["batch"] += 1
+                return ["模拟模块仍不合格"]
+            return []
+
+        with patch.dict("os.environ", {"SOFT_GENERATION_PROFILE": "balanced", "SOFT_LLM_BATCH_WORKERS": "1"}), patch(
+            "backend.softcopyright.llm_blueprint._chat_json",
+            side_effect=chat_json,
+        ), patch(
+            "backend.softcopyright.llm_blueprint._module_batch_quality_reasons",
+            side_effect=quality_reasons,
+        ):
+            modules = _generate_module_batches(self.task, object(), {"module_outline": outline}, [], "")
+
+        self.assertEqual(len(modules), 8)
+        self.assertEqual(quality_calls["batch"], 4)
+        self.assertEqual(call_labels.count("模块明细聚合修复"), 1)
+        self.assertEqual(len(call_labels), 5)
+        self.assertEqual(2 + len(call_labels) + 1, 8)
+
+    def test_confirmed_operation_contract_skips_all_module_detail_requests(self):
+        task = GenerationTask(
+            software_name=self.task.software_name,
+            product_type=self.task.product_type,
+            feature_hint=self.task.feature_hint,
+            seed="confirmed-contract-zero-module-requests",
+        )
+        contract_blueprint = _valid_blueprint(task)
+        task.semantic_contract = {
+            "feature_hint_blueprint_modules": [
+                {
+                    "key": module.key,
+                    "title": module.title,
+                    "category": "生产执行",
+                    "description": module.description,
+                    "data_objects": module.entities,
+                    "entities": module.entities,
+                    "operations": module.operations,
+                    "operation_specs": module.operation_specs,
+                    "data_fields": module.data_fields,
+                    "pages": module.pages,
+                    "rules": module.rules,
+                }
+                for module in (contract_blueprint.modules * 3)[:6]
+            ]
+        }
+        for index, module in enumerate(task.semantic_contract["feature_hint_blueprint_modules"], start=1):
+            module["key"] = f"confirmed_module_{index}"
+            module["title"] = f"确认生产模块{index}"
+
+        with patch("backend.softcopyright.llm_blueprint._generate_module_batches") as batch_generation:
+            result = _generate_modules(task, object(), {}, [])
+
+        batch_generation.assert_not_called()
+        self.assertEqual(len(result["modules"]), 6)
 
 
 if __name__ == "__main__":

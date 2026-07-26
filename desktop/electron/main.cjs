@@ -305,7 +305,15 @@ function recoverTaskFromOutputDir(outputDir, mtimeMs = 0) {
   const generationFailure = readJsonConfig(path.join(outputDir, "generation-failure.json"));
   const generationReport = readJsonConfig(path.join(outputDir, "generation_report.json"));
   const validationReport = readJsonConfig(path.join(outputDir, "validation_report.json"));
-  const stateStatus = String(generationState.status || generationFailure.status || "").toLowerCase();
+  const latestAttemptId = String(generationState.attempt_id || "").trim();
+  const failureMatchesAttempt = !latestAttemptId || !generationFailure.attempt_id || String(generationFailure.attempt_id) === latestAttemptId;
+  const effectiveFailure = failureMatchesAttempt ? generationFailure : {};
+  const hasActiveChild = Boolean(
+    activeGenerationTask &&
+    !activeGenerationTask.settled &&
+    path.resolve(String(activeGenerationTask.outputDir || "")) === path.resolve(outputDir)
+  );
+  const stateStatus = String(generationState.status || effectiveFailure.status || "").toLowerCase();
   const reportedZipPath = String(
     generationReport.zip_path || generationState.extra?.zip_path || `${outputDir}--材料包.zip`
   ).trim();
@@ -320,11 +328,13 @@ function recoverTaskFromOutputDir(outputDir, mtimeMs = 0) {
   const validationFinding = Array.isArray(validationReport.findings)
     ? validationReport.findings.find((item) => item && item.level === "error")
     : null;
+  const interrupted = stateStatus === "running" && !hasActiveChild;
   const failedStage = String(
-    generationFailure.stage || (stateStatus === "success" && !completedZipReady ? "package" : generationState.stage) || trace.stage || trace.label || ""
+    effectiveFailure.stage || (stateStatus === "success" && !completedZipReady ? "package" : generationState.stage) || trace.stage || trace.label || ""
   );
   const errorSummary = sanitizeErrorMessage(
-    generationFailure.message ||
+    (interrupted ? "检测到上次运行中断，当前没有活动生成进程。可从已确认蓝图和现有参考图继续。" : "") ||
+      effectiveFailure.message ||
       (stateStatus === "success" && !completedZipReady
         ? "上次任务标记完成，但材料包文件不存在，可从已确认蓝图重新生成。"
         : "") ||
@@ -340,6 +350,9 @@ function recoverTaskFromOutputDir(outputDir, mtimeMs = 0) {
     seed,
     recoveredAt: new Date().toLocaleString("zh-CN", { hour12: false }),
     updatedAtMs: mtimeMs,
+    attemptId: latestAttemptId,
+    resumeSource: String(generationState.resume_source || effectiveFailure.resume_source || ""),
+    interrupted,
     failedStage,
     errorSummary,
     visualReferenceReady: fs.existsSync(visualReferencePath),
@@ -606,9 +619,11 @@ function outlineTimeoutSeconds() {
 }
 
 function frontendWorkerCount() {
-  const value = Number.parseInt(process.env.SOFT_LLM_AI_FRONTEND_WORKERS || "1", 10);
-  if (!Number.isFinite(value)) return 1;
-  return Math.min(3, Math.max(1, value));
+  const raw = String(process.env.SOFT_LLM_AI_FRONTEND_WORKERS || "auto").trim().toLowerCase();
+  if (!raw || raw === "auto") return "auto";
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value)) return "auto";
+  return String(Math.min(3, Math.max(1, value)));
 }
 
 function normalizeReasoningEffort(value) {
@@ -1177,7 +1192,7 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
         SOFT_MODEL_IMAGE_NAME: process.env.SOFT_MODEL_IMAGE_NAME || process.env.SOFT_MODEL_GPT_IMAGE_NAME || "gpt-image-2",
         SOFT_GENERATION_PROFILE: process.env.SOFT_GENERATION_PROFILE || "balanced",
         SOFT_LLM_BATCH_WORKERS: process.env.SOFT_LLM_BATCH_WORKERS || "2",
-        SOFT_LLM_AI_FRONTEND_WORKERS: process.env.SOFT_LLM_AI_FRONTEND_WORKERS || "1",
+        SOFT_LLM_AI_FRONTEND_WORKERS: process.env.SOFT_LLM_AI_FRONTEND_WORKERS || "auto",
         SOFT_LLM_RETRY_COUNT: process.env.SOFT_LLM_RETRY_COUNT || "3",
         SOFT_LLM_IMAGE_RETRY_COUNT: process.env.SOFT_LLM_IMAGE_RETRY_COUNT || process.env.SOFT_IMAGE_RETRY_COUNT || "3",
         SOFT_LLM_IMAGE_TIMEOUT_SECONDS: process.env.SOFT_LLM_IMAGE_TIMEOUT_SECONDS || process.env.SOFT_IMAGE_TIMEOUT_SECONDS || "220",
@@ -1636,7 +1651,10 @@ ipcMain.handle("save-model-config", async (_event, payload) => {
   const modelName = String(payload?.modelName || existingProvider.modelName || preset.defaultModel).trim();
   const outlineModel = String(payload?.outlineModelName || payload?.outlineModel || "").trim();
   const frontendModel = String(payload?.frontendModelName || payload?.frontendModel || "").trim();
-  const frontendWorkers = Math.min(3, Math.max(1, Number.parseInt(payload?.frontendWorkers || "1", 10) || 1));
+  const frontendWorkersRaw = String(payload?.frontendWorkers || "auto").trim().toLowerCase();
+  const frontendWorkers = frontendWorkersRaw === "auto"
+    ? "auto"
+    : String(Math.min(3, Math.max(1, Number.parseInt(frontendWorkersRaw, 10) || 1)));
   const outlineTimeout = Math.min(120, Math.max(10, Number.parseInt(payload?.outlineTimeoutSeconds || "60", 10) || 60));
   const reasoningEffort = normalizeReasoningEffort(payload?.reasoningEffort);
   const apiBaseUrl = String(

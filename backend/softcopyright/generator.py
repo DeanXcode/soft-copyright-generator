@@ -7,6 +7,7 @@ import shutil
 import time
 import json
 import re
+from uuid import uuid4
 
 from .docgen import (
     analyze_docx_layout,
@@ -82,9 +83,32 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     if output_dir.exists() and not resume_existing_output:
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    resume_payload = _resume_failure_payload(output_dir) if resume_existing_output else {}
+    resume_stage = _resume_failure_stage_from_payload(resume_payload) if resume_existing_output else ""
+    resume_progress = _resume_failure_progress_from_payload(resume_payload) if resume_existing_output else 0
+    completed_report = _load_completed_resume_report(output_dir) if resume_existing_output else None
+    _begin_generation_attempt(
+        output_dir,
+        task,
+        resume_source=("completed-report" if completed_report else "failure-state" if resume_stage else "existing-output")
+        if resume_existing_output
+        else "new-task",
+    )
     if resume_existing_output:
-        completed_report = _load_completed_resume_report(output_dir)
         if completed_report:
+            completed_report = dict(completed_report)
+            completed_report["attempt_id"] = str(getattr(task, "attempt_id", "") or "")
+            completed_report["task"] = dict(completed_report.get("task") or {})
+            completed_report["task"]["attempt_id"] = completed_report["attempt_id"]
+            _write_generation_state(
+                output_dir,
+                task,
+                "success",
+                "done",
+                100,
+                "检测到已完成材料包，返回现有交付结果",
+                {"zip_path": completed_report.get("zip_path", "")},
+            )
             if emit:
                 emit(
                     {
@@ -98,8 +122,6 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
                 )
             return completed_report
     _ensure_llm_trace_path(task, output_dir)
-    resume_stage = _resume_failure_stage(output_dir) if resume_existing_output else ""
-    resume_progress = _resume_failure_progress(output_dir) if resume_existing_output else 0
 
     def send(stage: str, progress: int, message: str, **extra) -> None:
         if resume_stage and _stage_precedes(stage, resume_stage):
@@ -164,6 +186,8 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     send("prepare", 5, "准备输出目录")
 
     report: dict = {
+        "schema_version": 2,
+        "attempt_id": str(getattr(task, "attempt_id", "") or ""),
         "task": task.to_dict(),
         "warnings": [],
         "files": [],
@@ -258,6 +282,7 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         mode_label = "GPT" if require_llm_generation else "Default Template"
         raise RuntimeError(f"{mode_label} 产品蓝图未通过结构化操作与终端语义门禁：" + "；".join(contract_issues[:5]))
     quality_score = int(getattr(blueprint, "quality_score", 0) or 0)
+    report["checks"]["blueprint_request_count"] = int(getattr(blueprint, "request_count", 0) or 0)
     if quality_score < _blueprint_quality_target():
         raise RuntimeError(f"产品蓝图质量分 {quality_score}，未达到当前阈值 {_blueprint_quality_target()}。")
     domain_issues = _blueprint_task_domain_issues(task, blueprint, blueprint_source)
@@ -297,6 +322,8 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         for item in ARCHITECTURE_CATALOG.values()
         if str(item.get("name") or "").strip()
     }
+    report["task"]["attempt_id"] = report["attempt_id"]
+    report["task"]["resume_source"] = str(getattr(task, "resume_source", "") or "")
     existing_technical_features = [
         feature
         for feature in list(blueprint.technical_features or [])
@@ -647,6 +674,14 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     report["checks"]["ui_frontend_build_tool"] = str(ai_frontend_report.get("build_tool") or "")
     report["checks"]["ui_frontend_source_dir"] = str(source_info.get("ui_frontend_source_dir") or ai_frontend_report.get("source_dir") or "")
     report["checks"]["ui_ai_frontend_page_count"] = int(ai_frontend_report.get("page_count") or len(ai_frontend_report.get("pages") or []))
+    report["checks"]["page_spec_count"] = int(ai_frontend_report.get("page_spec_count") or 0)
+    report["checks"]["legacy_react_page_count"] = int(ai_frontend_report.get("legacy_react_page_count") or report["checks"]["ui_ai_frontend_page_count"])
+    report["checks"]["frontend_effective_workers"] = int(ai_frontend_report.get("frontend_effective_workers") or 1)
+    report["checks"]["frontend_concurrency_degraded"] = bool(ai_frontend_report.get("frontend_concurrency_degraded"))
+    report["checks"]["frontend_concurrency_degrade_reason"] = str(ai_frontend_report.get("frontend_concurrency_degrade_reason") or "")
+    report["checks"]["frontend_cancelled_page_count"] = int(ai_frontend_report.get("frontend_cancelled_page_count") or 0)
+    report["checks"]["frontend_page_request_timing"] = ai_frontend_report.get("frontend_page_request_timing") or {}
+    report["checks"]["provider_retry_summary"] = ai_frontend_report.get("provider_retry_summary") or {}
     report["checks"]["ui_shared_confirmation_contract"] = str(ai_frontend_report.get("shared_confirmation_contract") or "")
     report["checks"]["ui_shared_confirmation_page_count"] = int(ai_frontend_report.get("shared_confirmation_page_count") or 0)
     report["checks"]["ui_shared_confirmation_ready"] = bool(ai_frontend_report.get("shared_confirmation_ready"))
@@ -1977,14 +2012,16 @@ def _should_defer_pre_render_similarity_for_resume(
 
 
 def _resume_failure_payload(output_dir: Path) -> dict:
-    for name in ("generation-failure.json", "generation-state.json"):
-        path = output_dir / name
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
+    state = _read_json_object(output_dir / "generation-state.json")
+    failure = _read_json_object(output_dir / "generation-failure.json")
+    state_attempt = str(state.get("attempt_id") or "").strip()
+    failure_attempt = str(failure.get("attempt_id") or "").strip()
+    candidates: list[dict] = []
+    if failure and (not state_attempt or not failure_attempt or failure_attempt == state_attempt):
+        candidates.append(failure)
+    if state:
+        candidates.append(state)
+    for payload in candidates:
         if str(payload.get("status") or "").lower() == "success":
             continue
         if payload.get("stage"):
@@ -1993,13 +2030,21 @@ def _resume_failure_payload(output_dir: Path) -> dict:
 
 
 def _resume_failure_stage(output_dir: Path) -> str:
-    stage = str(_resume_failure_payload(output_dir).get("stage") or "").strip()
+    return _resume_failure_stage_from_payload(_resume_failure_payload(output_dir))
+
+
+def _resume_failure_stage_from_payload(payload: dict) -> str:
+    stage = str((payload or {}).get("stage") or "").strip()
     return stage if stage in _RESUME_STAGE_ORDER else ""
 
 
 def _resume_failure_progress(output_dir: Path) -> int:
+    return _resume_failure_progress_from_payload(_resume_failure_payload(output_dir))
+
+
+def _resume_failure_progress_from_payload(payload: dict) -> int:
     try:
-        return max(0, min(99, int(_resume_failure_payload(output_dir).get("progress") or 0)))
+        return max(0, min(99, int((payload or {}).get("progress") or 0)))
     except (TypeError, ValueError):
         return 0
 
@@ -2113,6 +2158,38 @@ def _load_resume_source_info(output_dir: Path, blueprint, visual_reference_repor
     }
 
 
+def _read_json_object(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _begin_generation_attempt(output_dir: Path, task: GenerationTask, *, resume_source: str) -> None:
+    now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    setattr(task, "attempt_id", uuid4().hex)
+    setattr(task, "attempt_started_at", now)
+    setattr(task, "resume_source", str(resume_source or "new-task"))
+    _archive_previous_failure(output_dir)
+    _write_generation_state(output_dir, task, "running", "prepare", 0, "准备生成任务", {})
+
+
+def _archive_previous_failure(output_dir: Path) -> None:
+    failure_path = output_dir / "generation-failure.json"
+    if not failure_path.is_file():
+        return
+    payload = _read_json_object(failure_path)
+    attempt = re.sub(r"[^A-Za-z0-9_-]+", "-", str(payload.get("attempt_id") or "legacy"))[:64] or "legacy"
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    archive_dir = output_dir / "attempt-history"
+    try:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        failure_path.replace(archive_dir / f"generation-failure-{attempt}-{timestamp}.json")
+    except OSError:
+        return
+
+
 def _write_generation_state(
     output_dir: Path,
     task: GenerationTask,
@@ -2122,12 +2199,17 @@ def _write_generation_state(
     message: str,
     extra: dict | None = None,
 ) -> None:
+    updated_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     payload = {
+        "schema_version": 2,
+        "attempt_id": str(getattr(task, "attempt_id", "") or ""),
+        "started_at": str(getattr(task, "attempt_started_at", "") or updated_at),
+        "resume_source": str(getattr(task, "resume_source", "") or "new-task"),
         "status": status,
         "stage": stage,
         "progress": int(progress or 0),
         "message": sanitize_error_message(message or "", limit=1000),
-        "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "updated_at": updated_at,
         "task": {
             "software_name": task.software_name,
             "version": task.version,
@@ -2141,10 +2223,7 @@ def _write_generation_state(
     }
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / "generation-state.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        write_json(output_dir / "generation-state.json", payload)
     except OSError:
         return
 
@@ -2160,6 +2239,11 @@ def _write_generation_failure(
     validation: dict | None = None,
 ) -> None:
     payload = {
+        "schema_version": 2,
+        "attempt_id": str(getattr(task, "attempt_id", "") or ""),
+        "started_at": str(getattr(task, "attempt_started_at", "") or ""),
+        "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "resume_source": str(getattr(task, "resume_source", "") or "new-task"),
         "status": "error",
         "stage": stage,
         "progress": int(progress or 0),
@@ -2170,10 +2254,7 @@ def _write_generation_failure(
     }
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / "generation-failure.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        write_json(output_dir / "generation-failure.json", payload)
     except OSError:
         pass
     _write_generation_state(

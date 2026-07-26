@@ -6,7 +6,7 @@
 
 - [当前进度与交付说明](docs/current-progress-and-delivery.md)
 
-当前开发版本：`0.1.10`。
+当前开发版本：`0.1.11`。
 
 ## 安装依赖
 
@@ -401,13 +401,13 @@ PDF 转换探测优先级：
 当前提供便携 zip 打包脚本：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\package-windows-portable.ps1 -Version 0.1.10
+powershell -ExecutionPolicy Bypass -File scripts\package-windows-portable.ps1 -Version 0.1.11
 ```
 
 输出：
 
 ```text
-release/soft-copyright-generator-0.1.10-portable.zip
+release/soft-copyright-generator-0.1.11-portable.zip
 ```
 
 包内包含：
@@ -433,7 +433,7 @@ npm run pack:win
 输出：
 
 ```text
-release/installer/Soft Copyright Generator Setup 0.1.10.exe
+release/installer/Soft Copyright Generator Setup 0.1.11.exe
 release/installer/win-unpacked/
 ```
 
@@ -448,7 +448,7 @@ npm run pack:win:customer
 输出：
 
 ```text
-release/customer-installer/Soft Copyright Generator Setup 0.1.10.exe
+release/customer-installer/Soft Copyright Generator Setup 0.1.11.exe
 release/customer-installer/win-unpacked/
 ```
 

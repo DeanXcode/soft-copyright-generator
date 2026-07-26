@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import base64
+from enum import Enum
 import io
 import json
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any
 import urllib.error
@@ -20,6 +22,69 @@ from .trace import trace_event
 
 class GeneratedImageQualityError(ValueError):
     """Raised when an image API returns a decodable but unusable placeholder."""
+
+
+class TextErrorCategory(str, Enum):
+    CONFIGURATION = "configuration_error"
+    RATE_LIMIT = "rate_limit"
+    GATEWAY = "gateway_error"
+    CONNECTION = "connection_error"
+    TIMEOUT = "timeout"
+    EMPTY_RESPONSE = "empty_response"
+    FORMAT = "format_error"
+    QUALITY = "quality_error"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class TextRetryPolicy:
+    """Provider-owned retry budget for one logical text request."""
+
+    max_retries: int = 0
+    base_delay_seconds: float = 1.5
+    max_delay_seconds: float = 12.0
+    retryable_categories: tuple[TextErrorCategory, ...] = (
+        TextErrorCategory.RATE_LIMIT,
+        TextErrorCategory.GATEWAY,
+        TextErrorCategory.CONNECTION,
+        TextErrorCategory.TIMEOUT,
+        TextErrorCategory.EMPTY_RESPONSE,
+    )
+    on_attempt: Any | None = None
+    on_error: Any | None = None
+    on_success: Any | None = None
+
+    def normalized_retries(self) -> int:
+        return max(0, min(5, int(self.max_retries or 0)))
+
+    def should_retry(self, category: TextErrorCategory) -> bool:
+        return category in self.retryable_categories
+
+    def delay_seconds(self, attempt: int) -> float:
+        return min(float(self.max_delay_seconds), float(self.base_delay_seconds) * (2 ** max(0, attempt - 1)))
+
+
+class TextProviderError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: TextErrorCategory,
+        attempts: int,
+        retry_budget: int,
+        stop_reason: str,
+        status_code: int | None = None,
+    ):
+        super().__init__(message)
+        self.category = category
+        self.attempts = int(attempts)
+        self.retry_budget = int(retry_budget)
+        self.stop_reason = str(stop_reason)
+        self.status_code = status_code
+
+
+class TextRequestCancelled(RuntimeError):
+    pass
 
 
 @dataclass
@@ -51,6 +116,8 @@ class LLMProvider:
         response_format: dict[str, Any] | None = None,
         trace_label: str = "",
         timeout: int | None = None,
+        retry_policy: TextRetryPolicy | None = None,
+        cancel_event: Any | None = None,
     ) -> str:
         raise NotImplementedError
 
@@ -74,6 +141,8 @@ class LocalTemplateProvider(LLMProvider):
         response_format: dict[str, Any] | None = None,
         trace_label: str = "",
         timeout: int | None = None,
+        retry_policy: TextRetryPolicy | None = None,
+        cancel_event: Any | None = None,
     ) -> str:
         return ""
 
@@ -87,6 +156,8 @@ class OpenAICompatibleProvider(LLMProvider):
         response_format: dict[str, Any] | None = None,
         trace_label: str = "",
         timeout: int | None = None,
+        retry_policy: TextRetryPolicy | None = None,
+        cancel_event: Any | None = None,
     ) -> str:
         base_url = self.config.base_url.rstrip("/")
         if not base_url:
@@ -112,11 +183,15 @@ class OpenAICompatibleProvider(LLMProvider):
 
         headers = _auth_headers(self.config.api_key)
         last_error: Exception | None = None
-        total_attempts = max(1, self.config.retry_count + 1)
+        policy = retry_policy or TextRetryPolicy(max_retries=self.config.retry_count)
+        retry_budget = policy.normalized_retries()
+        total_attempts = retry_budget + 1
         effective_timeout = max(10, int(timeout or self.config.timeout or 120))
         stream_hard_timeout = _stream_hard_timeout_seconds(effective_timeout) if payload["stream"] else 0
         for attempt in range(1, total_attempts + 1):
+            _raise_if_text_cancelled(cancel_event)
             started_at = time.perf_counter()
+            _notify_retry_policy(policy.on_attempt, attempt, retry_budget)
             trace_event(
                 "provider_request_begin",
                 label=trace_label,
@@ -130,17 +205,21 @@ class OpenAICompatibleProvider(LLMProvider):
                 response_format=bool(response_format),
                 multimodal=_messages_include_image(messages),
                 stream_hard_timeout=stream_hard_timeout,
+                retry_budget=retry_budget,
             )
             try:
                 session = _new_requests_session()
+                cancellation = _ResponseCancellation(cancel_event, session)
                 try:
                     response = session.post(url, json=payload, headers=headers, timeout=effective_timeout, stream=True)
+                    cancellation.bind(response)
                     response.raise_for_status()
                     stream_deadline = time.perf_counter() + stream_hard_timeout if stream_hard_timeout else None
-                    content = _extract_chat_content(response, deadline=stream_deadline)
+                    content = _extract_chat_content(response, deadline=stream_deadline, cancel_event=cancel_event)
                     if not content:
                         raise ValueError("LLM response content is empty")
                 finally:
+                    cancellation.close()
                     session.close()
                 trace_event(
                     "provider_request_success",
@@ -150,10 +229,18 @@ class OpenAICompatibleProvider(LLMProvider):
                     status_code=response.status_code,
                     content_chars=len(content or ""),
                 )
+                _notify_retry_policy(policy.on_success, attempt, retry_budget)
                 return content
             except Exception as exc:
                 last_error = exc
                 status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                category = (
+                    TextErrorCategory.CANCELLED
+                    if cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set()
+                    else classify_text_error(exc)
+                )
+                will_retry = attempt < total_attempts and policy.should_retry(category)
+                stop_reason = "retrying" if will_retry else _text_stop_reason(category, attempt, total_attempts)
                 safe_error = sanitize_error_message(exc, limit=500)
                 trace_event(
                     "provider_request_error",
@@ -163,11 +250,24 @@ class OpenAICompatibleProvider(LLMProvider):
                     status_code=status_code,
                     error_type=type(exc).__name__,
                     error=safe_error,
+                    error_category=category.value,
+                    retry_budget=retry_budget,
+                    will_retry=will_retry,
+                    stop_reason=stop_reason,
                 )
-                if attempt < total_attempts and _should_retry_provider_error(exc):
-                    time.sleep(_retry_delay_seconds(attempt))
+                _notify_retry_policy(policy.on_error, category, attempt, retry_budget, will_retry, stop_reason)
+                if will_retry:
+                    _wait_retry_delay(policy.delay_seconds(attempt), cancel_event)
                     continue
-                break
+                raise _text_provider_failure(
+                    "LLM",
+                    exc,
+                    category=category,
+                    attempts=attempt,
+                    retry_budget=retry_budget,
+                    stop_reason=stop_reason,
+                    status_code=status_code,
+                ) from exc
         raise RuntimeError(f"LLM 请求失败：{sanitize_error_message(last_error)}")
 
     def generate_image(
@@ -280,6 +380,8 @@ class AnthropicProvider(LLMProvider):
         response_format: dict[str, Any] | None = None,
         trace_label: str = "",
         timeout: int | None = None,
+        retry_policy: TextRetryPolicy | None = None,
+        cancel_event: Any | None = None,
     ) -> str:
         base_url = self.config.base_url.rstrip("/")
         if not base_url:
@@ -315,10 +417,14 @@ class AnthropicProvider(LLMProvider):
             "Content-Type": "application/json",
         }
         last_error: Exception | None = None
-        total_attempts = max(1, self.config.retry_count + 1)
+        policy = retry_policy or TextRetryPolicy(max_retries=self.config.retry_count)
+        retry_budget = policy.normalized_retries()
+        total_attempts = retry_budget + 1
         effective_timeout = max(10, int(timeout or self.config.timeout or 120))
         for attempt in range(1, total_attempts + 1):
+            _raise_if_text_cancelled(cancel_event)
             started_at = time.perf_counter()
+            _notify_retry_policy(policy.on_attempt, attempt, retry_budget)
             trace_event(
                 "provider_request_begin",
                 label=trace_label,
@@ -332,16 +438,21 @@ class AnthropicProvider(LLMProvider):
                 response_format=bool(response_format),
                 multimodal=_messages_include_image(messages),
                 stream_hard_timeout=0,
+                retry_budget=retry_budget,
             )
             try:
                 session = _new_requests_session()
+                cancellation = _ResponseCancellation(cancel_event, session)
                 try:
                     response = session.post(url, json=payload, headers=headers, timeout=effective_timeout)
+                    cancellation.bind(response)
                     response.raise_for_status()
+                    _raise_if_text_cancelled(cancel_event)
                     content = _extract_anthropic_content(response.json())
                     if not content:
                         raise ValueError("Claude response content is empty")
                 finally:
+                    cancellation.close()
                     session.close()
                 trace_event(
                     "provider_request_success",
@@ -351,10 +462,18 @@ class AnthropicProvider(LLMProvider):
                     status_code=response.status_code,
                     content_chars=len(content),
                 )
+                _notify_retry_policy(policy.on_success, attempt, retry_budget)
                 return content
             except Exception as exc:
                 last_error = exc
                 status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                category = (
+                    TextErrorCategory.CANCELLED
+                    if cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set()
+                    else classify_text_error(exc)
+                )
+                will_retry = attempt < total_attempts and policy.should_retry(category)
+                stop_reason = "retrying" if will_retry else _text_stop_reason(category, attempt, total_attempts)
                 trace_event(
                     "provider_request_error",
                     label=trace_label,
@@ -363,11 +482,24 @@ class AnthropicProvider(LLMProvider):
                     status_code=status_code,
                     error_type=type(exc).__name__,
                     error=sanitize_error_message(exc, limit=500),
+                    error_category=category.value,
+                    retry_budget=retry_budget,
+                    will_retry=will_retry,
+                    stop_reason=stop_reason,
                 )
-                if attempt < total_attempts and _should_retry_provider_error(exc):
-                    time.sleep(_retry_delay_seconds(attempt))
+                _notify_retry_policy(policy.on_error, category, attempt, retry_budget, will_retry, stop_reason)
+                if will_retry:
+                    _wait_retry_delay(policy.delay_seconds(attempt), cancel_event)
                     continue
-                break
+                raise _text_provider_failure(
+                    "Claude",
+                    exc,
+                    category=category,
+                    attempts=attempt,
+                    retry_budget=retry_budget,
+                    stop_reason=stop_reason,
+                    status_code=status_code,
+                ) from exc
         raise RuntimeError(f"Claude 请求失败：{sanitize_error_message(last_error)}")
 
     def generate_image(
@@ -642,6 +774,145 @@ def _messages_include_image(messages: list[dict[str, Any]]) -> bool:
                 ):
                     return True
     return False
+
+
+class _ResponseCancellation:
+    """Close a requests response when the owning task is cancelled."""
+
+    def __init__(self, cancel_event: Any | None, session: requests.Session):
+        self.cancel_event = cancel_event
+        self.session = session
+        self.response: requests.Response | None = None
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        if cancel_event is not None and hasattr(cancel_event, "is_set"):
+            self.thread = threading.Thread(target=self._watch, name="llm-request-cancel", daemon=True)
+            self.thread.start()
+
+    def bind(self, response: requests.Response) -> None:
+        self.response = response
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            response.close()
+
+    def _watch(self) -> None:
+        while not self.stop_event.wait(0.05):
+            try:
+                if self.cancel_event is not None and self.cancel_event.is_set():
+                    if self.response is not None:
+                        self.response.close()
+                    self.session.close()
+                    return
+            except Exception:
+                return
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=0.2)
+
+
+def _raise_if_text_cancelled(cancel_event: Any | None) -> None:
+    if cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set():
+        raise TextRequestCancelled("文本请求已取消")
+
+
+def _wait_retry_delay(delay: float, cancel_event: Any | None) -> None:
+    if cancel_event is not None and hasattr(cancel_event, "wait"):
+        if cancel_event.wait(max(0.0, float(delay))):
+            raise TextRequestCancelled("文本请求已取消")
+        return
+    time.sleep(max(0.0, float(delay)))
+
+
+def _notify_retry_policy(callback: Any | None, *args: Any) -> None:
+    if not callable(callback):
+        return
+    try:
+        callback(*args)
+    except Exception:
+        return
+
+
+def classify_text_error(exc: Exception) -> TextErrorCategory:
+    if isinstance(exc, TextProviderError):
+        return exc.category
+    if isinstance(exc, TextRequestCancelled):
+        return TextErrorCategory.CANCELLED
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 22:
+        # Windows can surface a closed/invalid socket as WinError 22 while a
+        # streaming request is being torn down. Treat it as a connection
+        # interruption so the provider-owned policy gets a safe retry.
+        return TextErrorCategory.CONNECTION
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code is not None:
+        try:
+            status_code = int(status_code)
+        except (TypeError, ValueError):
+            status_code = None
+    if status_code in {400, 401, 403, 404, 405, 410, 422}:
+        return TextErrorCategory.CONFIGURATION
+    if status_code == 429:
+        return TextErrorCategory.RATE_LIMIT
+    if status_code in {408}:
+        return TextErrorCategory.TIMEOUT
+    if status_code is not None and (500 <= status_code <= 599 or status_code in {520, 522, 523, 524}):
+        return TextErrorCategory.GATEWAY
+    text = str(exc or "").lower()
+    if any(marker in text for marker in ("response content is empty", "response body is empty", "returned empty", "empty content")):
+        return TextErrorCategory.EMPTY_RESPONSE
+    if isinstance(exc, (requests.Timeout, TimeoutError)) or any(marker in text for marker in ("timed out", "timeout")):
+        return TextErrorCategory.TIMEOUT
+    if isinstance(exc, (requests.ConnectionError, urllib.error.URLError)) or any(
+        marker in text
+        for marker in (
+            "connection reset",
+            "connection aborted",
+            "connection closed",
+            "remote end closed",
+            "max retries exceeded",
+            "ssleoferror",
+            "ssl eof",
+            "eof occurred in violation",
+            "name or service not known",
+        )
+    ):
+        return TextErrorCategory.CONNECTION
+    if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)) or "json" in text or "parse" in text:
+        return TextErrorCategory.FORMAT
+    if isinstance(exc, ValueError):
+        return TextErrorCategory.QUALITY
+    return TextErrorCategory.GATEWAY
+
+
+def _text_stop_reason(category: TextErrorCategory, attempt: int, total_attempts: int) -> str:
+    if category is TextErrorCategory.CONFIGURATION:
+        return "configuration_error_no_retry"
+    if category is TextErrorCategory.CANCELLED:
+        return "cancelled"
+    if attempt >= total_attempts:
+        return "retry_budget_exhausted"
+    return "non_retryable_error"
+
+
+def _text_provider_failure(
+    provider_name: str,
+    exc: Exception,
+    *,
+    category: TextErrorCategory,
+    attempts: int,
+    retry_budget: int,
+    stop_reason: str,
+    status_code: int | None,
+) -> TextProviderError:
+    detail = sanitize_error_message(exc)
+    return TextProviderError(
+        f"{provider_name} 请求失败：{detail}（错误类别 {category.value}，已请求 {attempts} 次，重试预算 {retry_budget}，停止原因 {stop_reason}）",
+        category=category,
+        attempts=attempts,
+        retry_budget=retry_budget,
+        stop_reason=stop_reason,
+        status_code=status_code,
+    )
 
 
 def _should_retry_provider_error(exc: Exception) -> bool:
@@ -937,17 +1208,28 @@ def _write_rejected_image(output_path: Path, raw: bytes) -> None:
         return
 
 
-def _extract_chat_content(response: requests.Response, deadline: float | None = None) -> str:
+def _extract_chat_content(
+    response: requests.Response,
+    deadline: float | None = None,
+    cancel_event: Any | None = None,
+) -> str:
+    _raise_if_text_cancelled(cancel_event)
     content_type = str(response.headers.get("content-type", "")).lower()
     if "text/event-stream" in content_type:
-        return _extract_sse_content(response, deadline=deadline)
+        return _extract_sse_content(response, deadline=deadline, cancel_event=cancel_event)
     data = response.json()
+    _raise_if_text_cancelled(cancel_event)
     return _extract_message_content(data)
 
 
-def _extract_sse_content(response: requests.Response, deadline: float | None = None) -> str:
+def _extract_sse_content(
+    response: requests.Response,
+    deadline: float | None = None,
+    cancel_event: Any | None = None,
+) -> str:
     pieces: list[str] = []
     for raw_line in response.iter_lines(decode_unicode=False):
+        _raise_if_text_cancelled(cancel_event)
         if deadline is not None and time.perf_counter() > deadline:
             raise TimeoutError("LLM streaming response exceeded configured timeout")
         if isinstance(raw_line, bytes):

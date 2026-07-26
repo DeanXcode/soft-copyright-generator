@@ -122,7 +122,7 @@ function App() {
     modelName: "gpt-5.5",
     outlineModelName: "gpt-5.5",
     frontendModelName: "gpt-5.5",
-    frontendWorkers: 1,
+    frontendWorkers: "auto",
     outlineTimeoutSeconds: 60,
     reasoningEffort: "medium",
     apiBaseUrl: "",
@@ -352,7 +352,7 @@ function App() {
         modelName: config.modelName || "gpt-5.5",
         outlineModelName: config.outlineModelName || config.modelName || "gpt-5.5",
         frontendModelName: config.frontendModelName || config.modelName || "gpt-5.5",
-        frontendWorkers: Number(config.frontendWorkers || 1),
+        frontendWorkers: String(config.frontendWorkers || "auto"),
         outlineTimeoutSeconds: Number(config.outlineTimeoutSeconds || 60),
         reasoningEffort: config.reasoningEffort || "medium",
         apiBaseUrl: "",
@@ -869,7 +869,7 @@ function App() {
       modelName: modelConfig.modelName,
       outlineModelName: modelConfig.outlineModelName || modelConfig.modelName,
       frontendModelName: modelConfig.frontendModelName || modelConfig.modelName,
-      frontendWorkers: modelConfig.frontendWorkers || 1,
+      frontendWorkers: modelConfig.frontendWorkers || "auto",
       outlineTimeoutSeconds: modelConfig.outlineTimeoutSeconds || 60,
       reasoningEffort: modelConfig.reasoningEffort || "medium",
       apiBaseUrl: modelConfig.apiBaseUrl,
@@ -899,7 +899,7 @@ function App() {
       modelName: response.modelName || current.modelName,
       outlineModelName: response.outlineModelName || current.outlineModelName || response.modelName || current.modelName,
       frontendModelName: response.frontendModelName || current.frontendModelName || response.modelName || current.modelName,
-      frontendWorkers: Number(response.frontendWorkers || current.frontendWorkers || 1),
+      frontendWorkers: String(response.frontendWorkers || current.frontendWorkers || "auto"),
       outlineTimeoutSeconds: Number(response.outlineTimeoutSeconds || current.outlineTimeoutSeconds || 60),
       reasoningEffort: response.reasoningEffort || current.reasoningEffort || "medium",
       apiBaseUrl: "",
@@ -2642,11 +2642,12 @@ function SettingsDrawer({
             <label>
               <span>界面并发数</span>
               <select
-                value={String(modelConfig.frontendWorkers || 1)}
-                onChange={(event) => onUpdateModelConfig("frontendWorkers", Number(event.target.value))}
+                value={String(modelConfig.frontendWorkers || "auto")}
+                onChange={(event) => onUpdateModelConfig("frontendWorkers", event.target.value)}
               >
+                <option value="auto">自动（推荐，初始 2，遇限流降为 1）</option>
                 <option value="1">1（最稳）</option>
-                <option value="2">2（推荐，更快）</option>
+                <option value="2">2（固定并发）</option>
                 <option value="3">3（需要较高限流额度）</option>
               </select>
             </label>

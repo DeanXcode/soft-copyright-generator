@@ -14,7 +14,7 @@ from .architecture import (
     select_technical_architecture,
 )
 from .blueprint import ProductBlueprint
-from .llm.provider import LLMProvider, LocalTemplateProvider
+from .llm.provider import LLMProvider, LocalTemplateProvider, TextProviderError, TextRetryPolicy
 from .llm.trace import trace_event
 from .models import GenerationTask
 
@@ -163,8 +163,7 @@ def _chat_json(
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     current_messages = messages
-    provider_retries = int(getattr(getattr(provider, "config", None), "retry_count", 0) or 0)
-    total_attempts = 1 if provider_retries > 0 else 2
+    total_attempts = 2
     for attempt in range(total_attempts):
         started_at = time.perf_counter()
         trace_event(
@@ -184,6 +183,7 @@ def _chat_json(
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"},
                 trace_label=f"architecture:{label}",
+                retry_policy=TextRetryPolicy(max_retries=1),
             )
             data = _parse_json(content)
             trace_event(
@@ -195,6 +195,8 @@ def _chat_json(
                 content_chars=len(content or ""),
             )
             return data
+        except TextProviderError:
+            raise
         except Exception as exc:
             last_error = exc
             trace_event(

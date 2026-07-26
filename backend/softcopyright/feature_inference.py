@@ -5,7 +5,7 @@ import re
 import time
 from typing import Any
 
-from .llm.provider import LLMProvider, LocalTemplateProvider
+from .llm.provider import LLMProvider, LocalTemplateProvider, TextRetryPolicy
 from .llm.trace import trace_event
 
 
@@ -245,6 +245,7 @@ def _infer_detailed_feature_hint_with_llm(
         max_tokens=6000,
         response_format={"type": "json_object"},
         trace_label="feature_hint:infer_full",
+        retry_policy=TextRetryPolicy(max_retries=1),
     )
     return _normalize_llm_result(_parse_json(content))
 
@@ -274,6 +275,7 @@ def _infer_lightweight_feature_hint_two_step(
             max_tokens=700,
             response_format={"type": "json_object"},
             trace_label="feature_hint:profile",
+            retry_policy=TextRetryPolicy(max_retries=1),
         )
         profile = _normalize_domain_profile(_parse_json(profile_content))
     except Exception as exc:
@@ -300,6 +302,7 @@ def _infer_lightweight_feature_hint_two_step(
             max_tokens=1400,
             response_format={"type": "json_object"},
             trace_label="feature_hint:modules",
+            retry_policy=TextRetryPolicy(max_retries=1),
         )
         modules_data = _parse_json(modules_content)
     except Exception as exc:

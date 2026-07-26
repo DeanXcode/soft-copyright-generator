@@ -78,8 +78,17 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertIn('各文本供应商的 API Key 独立保存且不回显', renderer_source)
         self.assertIn('SOFT_LLM_AI_FRONTEND_WORKERS: String(frontendWorkers)', save_block)
         self.assertIn('界面并发数', renderer_source)
-        self.assertIn('2（推荐，更快）', renderer_source)
+        self.assertIn('自动（推荐，初始 2，遇限流降为 1）', renderer_source)
         self.assertIn('["grok", "claude", "gemini", "deepseek"].includes(accountProvider)', main_source)
+
+    def test_recovery_is_attempt_isolated_and_marks_orphaned_running_tasks_interrupted(self):
+        source = MAIN_CJS.read_text(encoding="utf-8")
+
+        self.assertIn('const latestAttemptId = String(generationState.attempt_id || "").trim();', source)
+        self.assertIn('const failureMatchesAttempt = !latestAttemptId || !generationFailure.attempt_id || String(generationFailure.attempt_id) === latestAttemptId;', source)
+        self.assertIn('const interrupted = stateStatus === "running" && !hasActiveChild;', source)
+        self.assertIn('检测到上次运行中断，当前没有活动生成进程', source)
+        self.assertIn('上次任务标记完成，但材料包文件不存在', source)
 
     def test_default_name_only_flow_auto_confirms_blueprint_and_keeps_review_option(self):
         renderer_source = MAIN_JSX.read_text(encoding="utf-8")

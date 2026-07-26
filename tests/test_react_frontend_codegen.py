@@ -10,8 +10,7 @@ import unittest
 
 from backend.softcopyright.ai_frontend_codegen import (
     _build_react_vite_bundle,
-    _frontend_transient_retry_budget,
-    _is_transient_frontend_error,
+    _react_codegen_worker_setting,
     _runtime_guard_style,
     _sanitize_cached_react_component,
     _sanitize_cached_react_css,
@@ -26,7 +25,15 @@ from backend.softcopyright.ai_frontend_codegen import (
 )
 from backend.softcopyright.blueprint import FeatureModule, ProductBlueprint
 from backend.softcopyright.generator import _ui_placeholder_hits, _ui_screenshot_html_quality
-from backend.softcopyright.llm.provider import LLMConfig, OpenAICompatibleProvider, _stream_hard_timeout_seconds
+from backend.softcopyright.llm.provider import (
+    LLMConfig,
+    OpenAICompatibleProvider,
+    TextErrorCategory,
+    TextProviderError,
+    TextRetryPolicy,
+    _stream_hard_timeout_seconds,
+    classify_text_error,
+)
 from backend.softcopyright.models import GenerationTask
 from backend.softcopyright.screenshots import (
     UiScreenshot,
@@ -88,10 +95,17 @@ class _ReactProvider:
 
 
 class ReactVisibleTermSanitizerTests(unittest.TestCase):
+    def test_frontend_worker_setting_defaults_to_auto_two_and_keeps_legacy_numbers(self):
+        with patch.dict("os.environ", {}, clear=False):
+            with patch("os.getenv", return_value="auto"):
+                self.assertEqual(_react_codegen_worker_setting(35), ("auto", 2))
+            with patch("os.getenv", return_value="3"):
+                self.assertEqual(_react_codegen_worker_setting(35), ("fixed", 3))
+
     def test_windows_invalid_argument_is_retryable_for_current_page(self):
         error = OSError(22, "Invalid argument")
 
-        self.assertTrue(_is_transient_frontend_error(error))
+        self.assertEqual(classify_text_error(error), TextErrorCategory.CONNECTION)
 
     def test_ssl_eof_is_a_fast_transient_error_with_two_page_retries(self):
         error = RuntimeError(
@@ -100,19 +114,17 @@ class ReactVisibleTermSanitizerTests(unittest.TestCase):
             "(Caused by SSLError(SSLEOFError(8, 'EOF occurred in violation of protocol')))"
         )
 
-        self.assertTrue(_is_transient_frontend_error(error))
-        self.assertEqual(_frontend_transient_retry_budget(error), 2)
+        self.assertEqual(classify_text_error(error), TextErrorCategory.CONNECTION)
 
     def test_read_timeout_keeps_one_current_page_retry(self):
         error = RuntimeError("LLM 请求失败：Read timed out. (read timeout=120)")
 
-        self.assertEqual(_frontend_transient_retry_budget(error), 1)
+        self.assertEqual(classify_text_error(error), TextErrorCategory.TIMEOUT)
 
     def test_empty_model_response_is_transient_with_two_current_page_retries(self):
         error = ValueError("LLM 请求失败：LLM response content is empty")
 
-        self.assertTrue(_is_transient_frontend_error(error))
-        self.assertEqual(_frontend_transient_retry_budget(error), 2)
+        self.assertEqual(classify_text_error(error), TextErrorCategory.EMPTY_RESPONSE)
 
     def test_unfinished_placeholder_phrases_are_replaced_with_business_state(self):
         source = "<div><p>备注说明待补充：异常原因为空</p><span>资料待完善</span><b>产线智能排程记录01</b></div>"
@@ -181,20 +193,74 @@ class UiVisibleLeakDetectionTests(unittest.TestCase):
         self.assertNotIn("内部角色标识", _ui_placeholder_hits("成果文件 texture_manifest.json 已校验"))
 
 
+def _mock_provider_chat(operation, kwargs):
+    """Exercise the provider-owned retry contract without test-time sleeps."""
+    policy = kwargs.get("retry_policy") or TextRetryPolicy()
+    retry_budget = policy.normalized_retries()
+    total_attempts = retry_budget + 1
+    cancel_event = kwargs.get("cancel_event")
+    for attempt in range(1, total_attempts + 1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise TextProviderError(
+                "文本请求已取消",
+                category=TextErrorCategory.CANCELLED,
+                attempts=attempt,
+                retry_budget=retry_budget,
+                stop_reason="cancelled",
+            )
+        if callable(policy.on_attempt):
+            policy.on_attempt(attempt, retry_budget)
+        try:
+            value = operation()
+        except Exception as exc:
+            category = classify_text_error(exc)
+            will_retry = attempt < total_attempts and policy.should_retry(category)
+            if will_retry:
+                stop_reason = "retrying"
+            elif category is TextErrorCategory.CONFIGURATION:
+                stop_reason = "configuration_error_no_retry"
+            elif attempt >= total_attempts:
+                stop_reason = "retry_budget_exhausted"
+            else:
+                stop_reason = "non_retryable_error"
+            if callable(policy.on_error):
+                policy.on_error(category, attempt, retry_budget, will_retry, stop_reason)
+            if will_retry:
+                continue
+            raise TextProviderError(
+                str(exc),
+                category=category,
+                attempts=attempt,
+                retry_budget=retry_budget,
+                stop_reason=stop_reason,
+            ) from exc
+        if callable(policy.on_success):
+            policy.on_success(attempt, retry_budget)
+        return value
+    raise AssertionError("mock retry loop exhausted without a result")
+
+
 class _FailingReactProvider:
     def __init__(self):
         self.config = LLMConfig(provider="custom", model="slow-model", retry_count=3, timeout=220)
         self.call_events = []
+        self.page_calls = {}
         self.lock = threading.Lock()
 
     @property
     def calls(self):
         return len(self.call_events)
 
-    def chat(self, _messages, **_kwargs):
-        with self.lock:
-            self.call_events.append(1)
-        raise RuntimeError("LLM 请求失败：524 Server Error")
+    def chat(self, _messages, **kwargs):
+        trace_label = str(kwargs.get("trace_label") or "unknown")
+
+        def fail():
+            with self.lock:
+                self.call_events.append(1)
+                self.page_calls[trace_label] = self.page_calls.get(trace_label, 0) + 1
+            raise RuntimeError("LLM 请求失败：524 Server Error")
+
+        return _mock_provider_chat(fail, kwargs)
 
 
 class _TransientReactProvider(_ReactProvider):
@@ -203,10 +269,13 @@ class _TransientReactProvider(_ReactProvider):
         self.calls = 0
 
     def chat(self, messages, **kwargs):
-        self.calls += 1
-        if self.calls == 1:
-            raise RuntimeError("LLM 请求失败：Read timed out. (read timeout=90)")
-        return super().chat(messages, **kwargs)
+        def operation():
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("LLM 请求失败：Read timed out. (read timeout=90)")
+            return super(_TransientReactProvider, self).chat(messages, **kwargs)
+
+        return _mock_provider_chat(operation, kwargs)
 
 
 class _EmptyThenSuccessReactProvider(_ReactProvider):
@@ -215,10 +284,13 @@ class _EmptyThenSuccessReactProvider(_ReactProvider):
         self.calls = 0
 
     def chat(self, messages, **kwargs):
-        self.calls += 1
-        if self.calls <= 2:
-            raise ValueError("LLM 请求失败：LLM response content is empty")
-        return super().chat(messages, **kwargs)
+        def operation():
+            self.calls += 1
+            if self.calls <= 2:
+                raise ValueError("LLM 请求失败：LLM response content is empty")
+            return super(_EmptyThenSuccessReactProvider, self).chat(messages, **kwargs)
+
+        return _mock_provider_chat(operation, kwargs)
 
 
 class _QuietHandler(SimpleHTTPRequestHandler):
@@ -439,7 +511,7 @@ class ReactFrontendCodegenTests(unittest.TestCase):
                 for index in range(1, 7)
             ]
             provider = _FailingReactProvider()
-            with self.assertRaisesRegex(RuntimeError, "停止剩余页面"):
+            with self.assertRaisesRegex(RuntimeError, "停止剩余页面") as raised:
                 generate_ai_frontend_pages(
                     task=task,
                     blueprint=blueprint,
@@ -456,7 +528,15 @@ class ReactFrontendCodegenTests(unittest.TestCase):
                         "style_reference": {"ready": True},
                     },
                 )
-            self.assertEqual(provider.calls, 2)
+            self.assertLessEqual(provider.calls, 6)
+            self.assertLessEqual(len(provider.page_calls), 2)
+            self.assertTrue(all(count <= 3 for count in provider.page_calls.values()))
+            stats = getattr(raised.exception, "frontend_stats")
+            self.assertEqual(stats["frontend_effective_workers"], 2)
+            self.assertTrue(stats["frontend_concurrency_degraded"])
+            self.assertEqual(stats["frontend_concurrency_degrade_reason"], "gateway_error")
+            self.assertGreaterEqual(stats["frontend_cancelled_page_count"], 4)
+            self.assertLessEqual(stats["provider_retry_summary"]["logical_requests"], 2)
 
     def test_transient_frontend_timeout_retries_only_current_page(self):
         temp_root = Path("tmp")

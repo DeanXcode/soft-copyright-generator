@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from hashlib import sha256
 from html import escape
 import io
@@ -18,7 +18,16 @@ from typing import Any
 
 from .blueprint import FeatureModule, ProductBlueprint
 from .errors import sanitize_error_message
-from .llm.provider import LLMProvider, LocalTemplateProvider, image_model_name, _inspect_generated_image
+from .llm.provider import (
+    LLMProvider,
+    LocalTemplateProvider,
+    TextErrorCategory,
+    TextProviderError,
+    TextRetryPolicy,
+    classify_text_error,
+    image_model_name,
+    _inspect_generated_image,
+)
 from .llm.trace import trace_event
 from .models import GenerationTask
 from .ui_blueprint import UiBlueprint
@@ -211,6 +220,74 @@ def _generate_react_frontend_pages(
         palette_count=len(visual_style_contract.get("dominant_colors") or []),
     )
     stop_event = threading.Event()
+    worker_mode, initial_workers = _react_codegen_worker_setting(total)
+    runtime_lock = threading.Lock()
+    runtime_state: dict[str, Any] = {
+        "configured_workers": initial_workers,
+        "active_limit": initial_workers,
+        "max_inflight": 0,
+        "degraded": False,
+        "degrade_reason": "",
+        "logical_requests": 0,
+        "request_attempts": 0,
+        "provider_retries": 0,
+        "error_categories": {},
+        "stop_reasons": {},
+    }
+
+    def record_attempt(attempt: int, retry_budget: int) -> None:
+        with runtime_lock:
+            runtime_state["request_attempts"] += 1
+            if int(attempt) == 1:
+                runtime_state["logical_requests"] += 1
+
+    def record_error(
+        category: TextErrorCategory,
+        attempt: int,
+        retry_budget: int,
+        will_retry: bool,
+        stop_reason: str,
+    ) -> None:
+        category_value = category.value if isinstance(category, TextErrorCategory) else str(category)
+        with runtime_lock:
+            categories = runtime_state["error_categories"]
+            categories[category_value] = int(categories.get(category_value, 0)) + 1
+            if will_retry:
+                runtime_state["provider_retries"] += 1
+            else:
+                stops = runtime_state["stop_reasons"]
+                stops[str(stop_reason)] = int(stops.get(str(stop_reason), 0)) + 1
+            should_degrade = (
+                worker_mode == "auto"
+                and category in {TextErrorCategory.RATE_LIMIT, TextErrorCategory.GATEWAY, TextErrorCategory.CONNECTION}
+                and not runtime_state["degraded"]
+            )
+            if should_degrade:
+                runtime_state["active_limit"] = 1
+                runtime_state["degraded"] = True
+                runtime_state["degrade_reason"] = category_value
+        if should_degrade:
+            trace_event(
+                "ai_frontend_concurrency_degraded",
+                from_workers=initial_workers,
+                to_workers=1,
+                reason=category_value,
+                attempt=attempt,
+                retry_budget=retry_budget,
+            )
+            _emit(emit, codegen_progress_start, f"检测到 {category_value}，当前任务界面并发已降为 1")
+
+    def record_success(attempt: int, retry_budget: int) -> None:
+        return None
+
+    def page_retry_policy() -> TextRetryPolicy:
+        return TextRetryPolicy(
+            max_retries=2,
+            on_attempt=record_attempt,
+            on_error=record_error,
+            on_success=record_success,
+        )
+
     pending_indexes: list[int] = []
     for pending_index, pending_item in enumerate(screenshots, start=1):
         pending_key = str(getattr(pending_item, "key", "") or f"page_{pending_index}")
@@ -229,6 +306,7 @@ def _generate_react_frontend_pages(
         _emit(emit, codegen_progress_start, f"复用全部 React 页面组件 {total}/{total}")
 
     def build_page(index: int, item: Any) -> dict[str, Any]:
+        page_started_at = time.perf_counter()
         if stop_event.is_set():
             raise RuntimeError("React 页面生成已因模型网关错误停止")
         page_key = str(getattr(item, "key", "") or f"page_{index}")
@@ -240,13 +318,14 @@ def _generate_react_frontend_pages(
         css_scope = _react_css_scope(page_key, index)
         creative_key = _page_creative_key(task, design_brief, item)
         progress = codegen_progress_start + min(4, int(index / max(total, 1) * 4))
-        if not _react_component_cache_ready(component_path, css_path, meta_path, creative_key):
+        reused = _react_component_cache_ready(component_path, css_path, meta_path, creative_key)
+        if not reused:
             _emit(emit, progress, f"生成 React 界面组件 {index}/{total}")
             module = module_by_key.get(str(getattr(item, "module_key", "") or ""))
             data = None
             last_error: Exception | None = None
             try:
-                for component_attempt in range(3):
+                for quality_attempt in range(2):
                     if stop_event.is_set():
                         raise RuntimeError("React 页面生成已因模型网关错误停止")
                     try:
@@ -267,57 +346,33 @@ def _generate_react_frontend_pages(
                             css_scope=css_scope,
                             creative_key=creative_key,
                             validation_feedback=sanitize_error_message(last_error, limit=240) if last_error else "",
+                            retry_policy=page_retry_policy(),
+                            cancel_event=stop_event,
                         )
                         break
                     except ValueError as exc:
                         last_error = exc
-                        if _is_empty_frontend_response_error(exc):
-                            retry_budget = _frontend_transient_retry_budget(exc)
-                            if component_attempt < retry_budget:
-                                trace_event(
-                                    "ai_frontend_page_retry",
-                                    page_key=page_key,
-                                    index=index,
-                                    total=total,
-                                    retry_number=component_attempt + 1,
-                                    retry_budget=retry_budget,
-                                    reason=sanitize_error_message(exc, limit=300),
-                                )
-                                _emit(
-                                    emit,
-                                    progress,
-                                    f"{page_key} 模型返回空内容，正在重试当前页面 "
-                                    f"{component_attempt + 1}/{retry_budget}",
-                                )
-                                continue
+                        category = classify_text_error(exc)
+                        if category in {
+                            TextErrorCategory.RATE_LIMIT,
+                            TextErrorCategory.GATEWAY,
+                            TextErrorCategory.CONNECTION,
+                            TextErrorCategory.TIMEOUT,
+                            TextErrorCategory.EMPTY_RESPONSE,
+                        }:
                             raise
-                        if component_attempt == 0:
-                            _emit(emit, progress, f"React 组件格式不合格，重新生成 {page_key}")
-                            continue
-                        raise
-                    except Exception as exc:
-                        last_error = exc
-                        retry_budget = _frontend_transient_retry_budget(exc)
-                        if component_attempt < retry_budget:
+                        if quality_attempt == 0:
                             trace_event(
-                                "ai_frontend_page_retry",
+                                "ai_frontend_quality_repair",
                                 page_key=page_key,
                                 index=index,
                                 total=total,
-                                retry_number=component_attempt + 1,
-                                retry_budget=retry_budget,
+                                error_category=category.value,
+                                repair_number=1,
+                                repair_budget=1,
                                 reason=sanitize_error_message(exc, limit=300),
                             )
-                            if _is_fast_transient_frontend_error(exc):
-                                _emit(
-                                    emit,
-                                    progress,
-                                    f"{page_key} 模型网关连接被提前中断，正在重试当前页面 "
-                                    f"{component_attempt + 1}/{retry_budget}",
-                                )
-                                time.sleep(1.5)
-                            else:
-                                _emit(emit, progress, f"{page_key} 模型暂时无响应，正在重试当前页面")
+                            _emit(emit, progress, f"React 组件格式或质量不合格，定向修复 {page_key} 1/1")
                             continue
                         raise
                 if data is None:
@@ -373,34 +428,79 @@ def _generate_react_frontend_pages(
                 "creative_key": creative_key,
                 "visual_reference": _report_reference_summary(style_reference),
             },
+            "elapsed_seconds": round(time.perf_counter() - page_started_at, 3),
+            "reused": reused,
         }
 
-    workers = _react_codegen_workers(total)
     results: list[dict[str, Any]] = []
-    if workers == 1:
-        results = [build_page(index, item) for index, item in enumerate(screenshots, start=1)]
-    else:
-        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="react-codegen")
-        try:
-            futures = {
-                executor.submit(build_page, index, item): index
-                for index, item in enumerate(screenshots, start=1)
-            }
-            for future in as_completed(futures):
+    first_error: Exception | None = None
+    futures: dict[Any, int] = {}
+    next_position = 0
+    executor = ThreadPoolExecutor(max_workers=initial_workers, thread_name_prefix="react-codegen")
+    try:
+        while next_position < total or futures:
+            with runtime_lock:
+                active_limit = int(runtime_state["active_limit"])
+            while not stop_event.is_set() and next_position < total and len(futures) < active_limit:
+                index = next_position + 1
+                future = executor.submit(build_page, index, screenshots[next_position])
+                futures[future] = index
+                next_position += 1
+                with runtime_lock:
+                    runtime_state["max_inflight"] = max(int(runtime_state["max_inflight"]), len(futures))
+            if not futures:
+                break
+            completed, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            failures: list[Exception] = []
+            for future in completed:
+                futures.pop(future, None)
                 try:
                     results.append(future.result())
-                except Exception:
-                    stop_event.set()
-                    for pending in futures:
-                        pending.cancel()
-                    raise
-        finally:
-            executor.shutdown(wait=True, cancel_futures=True)
+                except Exception as exc:
+                    failures.append(exc)
+            if failures:
+                stop_event.set()
+                first_error = next(
+                    (
+                        exc
+                        for exc in failures
+                        if "前端模型请求失败" in str(exc)
+                    ),
+                    next(
+                        (
+                            exc
+                            for exc in failures
+                            if not isinstance(exc, TextProviderError)
+                            or exc.category is not TextErrorCategory.CANCELLED
+                        ),
+                        failures[0],
+                    ),
+                )
+                for pending in futures:
+                    pending.cancel()
+                break
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    if first_error is not None:
+        cancelled_page_count = max(0, total - len(results) - 1)
+        with runtime_lock:
+            failure_stats = _frontend_runtime_summary(runtime_state, cancelled_page_count=cancelled_page_count)
+        trace_event("ai_frontend_bounded_queue_stopped", **failure_stats)
+        if isinstance(first_error, RuntimeError):
+            setattr(first_error, "frontend_stats", failure_stats)
+        raise first_error
     results.sort(key=lambda item: int(item["index"]))
     imports = [str(item["import"]) for item in results]
     registrations = [str(item["registration"]) for item in results]
     pages = [dict(item["page"]) for item in results]
     shared_confirmation_page_count = sum(1 for page in pages if bool(page.get("requires_confirmation")))
+    request_timings = [
+        float(item.get("elapsed_seconds") or 0.0)
+        for item in results
+        if not item.get("reused") and float(item.get("elapsed_seconds") or 0.0) > 0
+    ]
+    with runtime_lock:
+        runtime_summary = _frontend_runtime_summary(runtime_state, cancelled_page_count=0)
     _write_react_app_files(
         task=task,
         blueprint=blueprint,
@@ -432,84 +532,56 @@ def _generate_react_frontend_pages(
         "shared_confirmation_ready": (react_dir / "src" / "SharedConfirmDialog.jsx").is_file(),
         "source_dir": str(react_dir),
         "visual_references": visual_reference_report,
+        **runtime_summary,
+        "frontend_page_request_timing": _frontend_timing_summary(request_timings),
         "pages": pages,
     }
 
 
 def _react_codegen_workers(total: int) -> int:
-    raw = os.getenv("SOFT_LLM_AI_FRONTEND_WORKERS", "1").strip()
+    return _react_codegen_worker_setting(total)[1]
+
+
+def _react_codegen_worker_setting(total: int) -> tuple[str, int]:
+    raw = os.getenv("SOFT_LLM_AI_FRONTEND_WORKERS", "auto").strip().lower()
+    if raw == "auto" or not raw:
+        return "auto", max(1, min(2, int(total or 1)))
     try:
         configured = int(raw)
     except ValueError:
-        configured = 1
-    return max(1, min(4, int(total or 1), configured))
+        return "auto", max(1, min(2, int(total or 1)))
+    return "fixed", max(1, min(3, int(total or 1), configured))
 
 
-def _is_transient_frontend_error(exc: Exception) -> bool:
-    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 22:
-        return True
-    if _is_empty_frontend_response_error(exc):
-        return True
-    text = str(exc or "").lower()
-    if "已因模型网关错误停止" in text:
-        return False
-    transient_markers = (
-        "timed out",
-        "timeout",
-        "read timeout",
-        "connection reset",
-        "connection aborted",
-        "connection closed",
-        "remote end closed connection",
-        "max retries exceeded with url",
-        "ssleoferror",
-        "ssl eof",
-        "eof occurred in violation of protocol",
-        "temporarily unavailable",
-        "server error",
-    )
-    if any(marker in text for marker in transient_markers):
-        return True
-    return bool(re.search(r"\b(?:408|409|425|429|500|502|503|504|520|522|523|524)\b", text))
+def _frontend_runtime_summary(state: dict[str, Any], *, cancelled_page_count: int) -> dict[str, Any]:
+    return {
+        "frontend_configured_workers": int(state.get("configured_workers") or 1),
+        "frontend_effective_workers": int(state.get("max_inflight") or 1),
+        "frontend_concurrency_degraded": bool(state.get("degraded")),
+        "frontend_concurrency_degrade_reason": str(state.get("degrade_reason") or ""),
+        "frontend_cancelled_page_count": int(cancelled_page_count),
+        "provider_retry_summary": {
+            "logical_requests": int(state.get("logical_requests") or 0),
+            "request_attempts": int(state.get("request_attempts") or 0),
+            "provider_retries": int(state.get("provider_retries") or 0),
+            "error_categories": dict(state.get("error_categories") or {}),
+            "stop_reasons": dict(state.get("stop_reasons") or {}),
+        },
+    }
 
 
-def _is_empty_frontend_response_error(exc: Exception) -> bool:
-    text = str(exc or "").lower()
-    return any(
-        marker in text
-        for marker in (
-            "llm response content is empty",
-            "response content is empty",
-            "response body is empty",
-            "model response is empty",
-            "model returned empty content",
-        )
-    )
-
-
-def _is_fast_transient_frontend_error(exc: Exception) -> bool:
-    text = str(exc or "").lower()
-    return any(
-        marker in text
-        for marker in (
-            "connection reset",
-            "connection aborted",
-            "connection closed",
-            "remote end closed connection",
-            "max retries exceeded with url",
-            "ssleoferror",
-            "ssl eof",
-            "eof occurred in violation of protocol",
-        )
-    )
-
-
-def _frontend_transient_retry_budget(exc: Exception) -> int:
-    if not _is_transient_frontend_error(exc):
-        return 0
-    if _is_empty_frontend_response_error(exc):
-        return 2
-    return 2 if _is_fast_transient_frontend_error(exc) else 1
+def _frontend_timing_summary(values: list[float]) -> dict[str, Any]:
+    clean = sorted(round(float(value), 3) for value in values if float(value) >= 0)
+    if not clean:
+        return {"count": 0, "min_seconds": 0, "max_seconds": 0, "avg_seconds": 0, "p95_seconds": 0}
+    p95_index = min(len(clean) - 1, max(0, int(round((len(clean) - 1) * 0.95))))
+    return {
+        "count": len(clean),
+        "min_seconds": clean[0],
+        "max_seconds": clean[-1],
+        "avg_seconds": round(sum(clean) / len(clean), 3),
+        "p95_seconds": clean[p95_index],
+    }
 
 
 def _frontend_provider(provider: LLMProvider) -> LLMProvider:
@@ -521,7 +593,10 @@ def _frontend_provider(provider: LLMProvider) -> LLMProvider:
     frontend_model = os.getenv("SOFT_MODEL_GPT_FRONTEND_NAME", "").strip()
     if frontend_model:
         cloned_config.model = frontend_model
-    cloned_config.retry_count = _ai_frontend_retry_count()
+    # Text retries are owned by the per-request TextRetryPolicy. Keeping the
+    # cloned provider retry count at zero prevents page-level repair loops from
+    # multiplying a second hidden provider retry budget.
+    cloned_config.retry_count = 0
     cloned_config.timeout = _ai_frontend_timeout_seconds(provider)
     cloned_provider.config = cloned_config
     trace_event(
@@ -534,12 +609,7 @@ def _frontend_provider(provider: LLMProvider) -> LLMProvider:
 
 
 def _ai_frontend_retry_count() -> int:
-    raw = os.getenv("SOFT_LLM_AI_FRONTEND_RETRY_COUNT", "0").strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 0
-    return max(0, min(1, value))
+    return 0
 
 
 def _react_component_max_tokens() -> int:
@@ -630,6 +700,8 @@ def _generate_react_component(
     css_scope: str,
     creative_key: str,
     validation_feedback: str = "",
+    retry_policy: TextRetryPolicy | None = None,
+    cancel_event: Any | None = None,
 ) -> dict[str, str]:
     renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
     terminal_rule = (
@@ -717,6 +789,8 @@ def _generate_react_component(
         response_format={"type": "json_object"},
         trace_label=f"react_frontend:{getattr(screenshot, 'key', index)}",
         timeout=_ai_frontend_timeout_seconds(provider),
+        retry_policy=retry_policy or TextRetryPolicy(max_retries=2),
+        cancel_event=cancel_event,
     )
     data = _parse_json(content)
     jsx = str(data.get("jsx") or data.get("component_jsx") or "").strip()
@@ -2004,6 +2078,7 @@ def _generate_page_html(
         response_format={"type": "json_object"},
         trace_label=f"ai_frontend:{page_key}",
         timeout=_ai_frontend_timeout_seconds(provider),
+        retry_policy=TextRetryPolicy(max_retries=2),
     )
     data = _parse_json(content)
     html = str(data.get("html") or "").strip()
@@ -2692,6 +2767,7 @@ def _generate_visual_prompt(
         max_tokens=1800,
         response_format={"type": "json_object"},
         trace_label=f"ui_visual_prompt:{page_key}",
+        retry_policy=TextRetryPolicy(max_retries=1),
     )
     data = _parse_json(content)
     prompt = str(data.get("visual_prompt") or "").strip()

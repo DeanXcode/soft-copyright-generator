@@ -5,11 +5,12 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from typing import Any
 
 from .blueprint import FeatureModule, ProductBlueprint, _environment_for_language, _runtime_for_language
-from .llm.provider import LLMProvider, LocalTemplateProvider
+from .llm.provider import LLMProvider, LocalTemplateProvider, TextProviderError, TextRetryPolicy
 from .llm.trace import trace_event
 from .models import GenerationTask
 from .module_keys import normalize_entity_names, semantic_module_key
@@ -26,6 +27,7 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
     best_score = 0
     quality_floor = _blueprint_quality_floor(task)
     attempt_count = _blueprint_attempt_count(task)
+    setattr(provider, "_blueprint_request_budget", {"count": 0, "limit": 8, "lock": threading.Lock()})
     for _attempt in range(attempt_count):
         started_at = time.perf_counter()
         trace_event(
@@ -68,6 +70,7 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
                 best_blueprint = blueprint
                 best_score = score
             if score >= quality_floor:
+                setattr(blueprint, "request_count", _blueprint_request_count(provider))
                 trace_event(
                     "blueprint_attempt_success",
                     attempt=_attempt + 1,
@@ -98,6 +101,7 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
                 error=str(exc)[:500],
             )
     if best_blueprint and not _authenticity_first(task) and best_score >= 72:
+        setattr(best_blueprint, "request_count", _blueprint_request_count(provider))
         return best_blueprint
     if last_error:
         raise last_error
@@ -217,7 +221,9 @@ def _generate_module_batches(
         raise ValueError(f"LLM 模块轮廓不足，无法分批生成模块{detail}")
 
     modules: list[dict[str, Any]] = []
-    batch_size = 1 if _authenticity_first(task) else 2
+    # Four two-module requests keep the normal blueprint request contract at
+    # identity + business details + 4 module batches = 6 requests.
+    batch_size = 2
     batch_count = (min(len(outline), 8) + batch_size - 1) // batch_size
     batches: list[tuple[int, list[Any]]] = []
     for start in range(0, min(len(outline), 8), batch_size):
@@ -225,7 +231,7 @@ def _generate_module_batches(
         batch_index = start // batch_size + 1
         batches.append((batch_index, batch))
 
-    def run_batch(batch_index: int, batch: list[Any]) -> list[dict[str, Any]]:
+    def run_batch(batch_index: int, batch: list[Any]) -> dict[str, Any]:
         title = _batch_title(batch)
         _emit(emit, 17 + batch_index, f"细分功能模块 {batch_index}/{batch_count}：{title}")
         data = _chat_json(
@@ -241,35 +247,21 @@ def _generate_module_batches(
         batch_modules = data.get("modules")
         if not isinstance(batch_modules, list):
             raise ValueError("LLM 分批模块方案不是 modules 数组")
-        modules = _align_modules_to_outline(
+        batch_modules = _align_modules_to_outline(
             [item for item in batch_modules if isinstance(item, dict)],
             batch,
         )
-        reasons = _module_batch_quality_reasons(task, modules, expected_count=len(batch))
-        if reasons:
-            _emit(emit, 17 + batch_index, f"修复功能模块 {batch_index}/{batch_count}：{title}")
-            repair_data = _chat_json(
-                provider,
-                [
-                    {"role": "system", "content": _system_prompt()},
-                    {"role": "user", "content": _build_module_repair_prompt(task, core_plan, batch, modules, reasons)},
-                ],
-                temperature=min(_temperature(task.randomness) + 0.03, 0.85),
-                max_tokens=1500,
-                label=f"模块明细修复批次{batch_index}",
-            )
-            repaired_modules = repair_data.get("modules")
-            if isinstance(repaired_modules, list):
-                modules = _align_modules_to_outline(
-                    [item for item in repaired_modules if isinstance(item, dict)],
-                    batch,
-                )
-        reasons = _module_batch_quality_reasons(task, modules, expected_count=len(batch))
-        if reasons:
-            raise ValueError("模块明细质量不足：" + "；".join(reasons[:4]))
-        return modules
+        batch_modules = _locally_complete_generated_modules(
+            task,
+            core_plan,
+            batch_modules,
+            batch,
+            start_index=(batch_index - 1) * batch_size + 1,
+        )
+        reasons = _module_batch_quality_reasons(task, batch_modules, expected_count=len(batch))
+        return {"outline": batch, "modules": batch_modules, "reasons": reasons}
 
-    batch_results: dict[int, list[dict[str, Any]]] = {}
+    batch_results: dict[int, dict[str, Any]] = {}
     workers = 1 if _authenticity_first(task) else _llm_batch_workers()
     if workers <= 1 or len(batches) <= 1:
         for batch_index, batch in batches:
@@ -281,8 +273,56 @@ def _generate_module_batches(
                 batch_index = futures[future]
                 batch_results[batch_index] = future.result()
 
+    failed_outline: list[Any] = []
+    failed_modules: list[dict[str, Any]] = []
+    failed_reasons: list[str] = []
     for batch_index in sorted(batch_results):
-        modules.extend(batch_results[batch_index])
+        result = batch_results[batch_index]
+        batch_modules = list(result.get("modules") or [])
+        modules.extend(batch_modules)
+        reasons = list(result.get("reasons") or [])
+        if reasons:
+            failed_outline.extend(list(result.get("outline") or []))
+            failed_modules.extend(batch_modules)
+            failed_reasons.extend(f"批次{batch_index}：{reason}" for reason in reasons)
+    if failed_outline:
+        _emit(emit, 22, f"聚合修复 {len(failed_outline)} 个不合格模块")
+        repair_data = _chat_json(
+            provider,
+            [
+                {"role": "system", "content": _system_prompt()},
+                {
+                    "role": "user",
+                    "content": _build_module_repair_prompt(
+                        task,
+                        core_plan,
+                        failed_outline,
+                        failed_modules,
+                        failed_reasons,
+                    ),
+                },
+            ],
+            temperature=min(_temperature(task.randomness) + 0.03, 0.85),
+            max_tokens=2600,
+            label="模块明细聚合修复",
+        )
+        repaired_modules = repair_data.get("modules")
+        if isinstance(repaired_modules, list):
+            repaired = _locally_complete_generated_modules(
+                task,
+                core_plan,
+                _align_modules_to_outline(
+                    [item for item in repaired_modules if isinstance(item, dict)],
+                    failed_outline,
+                ),
+                failed_outline,
+                start_index=1,
+            )
+            repaired_by_key = {str(item.get("key") or ""): item for item in repaired}
+            modules = [repaired_by_key.get(str(item.get("key") or ""), item) for item in modules]
+    final_reasons = _module_batch_quality_reasons(task, modules, expected_count=min(len(outline), 8))
+    if final_reasons:
+        raise ValueError("模块明细质量不足：" + "；".join(final_reasons[:6]))
     if len(modules) < 6:
         raise ValueError(f"LLM 分批模块方案数量不足：{len(modules)}")
     return modules[:8]
@@ -301,6 +341,130 @@ def _align_modules_to_outline(modules: list[dict[str, Any]], outline_batch: list
             item["title"] = outline_title
         aligned.append(item)
     return aligned
+
+
+def _locally_complete_generated_modules(
+    task: GenerationTask,
+    core_plan: dict[str, Any],
+    modules: list[dict[str, Any]],
+    outline_batch: list[Any],
+    *,
+    start_index: int,
+) -> list[dict[str, Any]]:
+    completed: list[dict[str, Any]] = []
+    for offset, raw_outline in enumerate(outline_batch):
+        outline = raw_outline if isinstance(raw_outline, dict) else {}
+        source = dict(modules[offset]) if offset < len(modules) and isinstance(modules[offset], dict) else {}
+        index = start_index + offset
+        title = _clean_text(str(outline.get("title") or source.get("title") or f"业务模块{index}"), 28)
+        category = _clean_text(str(source.get("category") or outline.get("focus") or title), 24)
+        key = str(outline.get("key") or source.get("key") or "").strip()
+        if not key:
+            key = semantic_module_key(title, index, context_terms=[category, task.software_name, task.feature_hint])
+        entities = _ensure_min_strings(
+            [_safe_entity(_entity_name_from_item(item)) for item in (source.get("entities") or []) if _entity_name_from_item(item)],
+            _contract_entities(key),
+            minimum=2,
+            limit=4,
+        )
+        operations = _ensure_min_strings(
+            _clean_list(source.get("operations"), 7, 28),
+            _contract_operations(title, category, []),
+            minimum=5,
+            limit=7,
+        )
+        data_fields = _ensure_min_strings(
+            _clean_list(source.get("data_fields") or source.get("dataFields"), 10, 24),
+            _contract_data_fields(title, category, entities),
+            minimum=7,
+            limit=10,
+        )
+        pages = _ensure_min_strings(
+            _clean_list(source.get("pages"), 4, 28),
+            _contract_pages(title, []),
+            minimum=2,
+            limit=4,
+        )
+        rules = _ensure_min_strings(
+            _clean_list(source.get("rules"), 5, 80),
+            _contract_rules(title, category, entities, operations),
+            minimum=3,
+            limit=5,
+        )
+        operation_specs = _clean_operation_specs(source.get("operation_specs") or source.get("operationSpecs"))
+        if len(operation_specs) < 3:
+            operation_specs = _complete_local_operation_specs(
+                task,
+                title=title,
+                module_key=key,
+                operations=operations,
+                data_fields=data_fields,
+                existing=operation_specs,
+            )
+        data_objects = _clean_list(source.get("data_objects") or source.get("dataObjects"), 6, 26) or entities
+        completed.append(
+            {
+                **source,
+                "key": key,
+                "title": title,
+                "description": _contract_description(source, title, category, data_objects, operations, pages, core_plan),
+                "entities": entities,
+                "operations": operations,
+                "operation_specs": operation_specs[:5],
+                "data_fields": data_fields,
+                "pages": pages,
+                "rules": rules,
+            }
+        )
+    return completed
+
+
+def _complete_local_operation_specs(
+    task: GenerationTask,
+    *,
+    title: str,
+    module_key: str,
+    operations: list[str],
+    data_fields: list[str],
+    existing: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    specs = list(existing)
+    labels = [str(item.get("label") or "") for item in specs]
+    candidates = list(operations)
+    if not any(operation_category(label) == "lookup" for label in labels + candidates):
+        candidates.insert(0, f"筛选{title}记录")
+    role = "当前用户" if _is_consumer_app_text(f"{task.software_name} {task.product_type}") else "业务经办人员"
+    for label in candidates:
+        if len(specs) >= 3:
+            break
+        label = _clean_text(label, 28)
+        if not label or label in labels:
+            continue
+        category = operation_category(label)
+        action_key = semantic_module_key(
+            label,
+            len(specs) + 1,
+            raw_key=f"{module_key}_{len(specs) + 1}",
+            context_terms=[title, label],
+        )
+        high_risk = any(term in label for term in ("删除", "作废", "失效", "覆盖", "正式发布", "清空"))
+        input_fields = data_fields[:2] or [f"{title}编号", f"{title}状态"]
+        specs.append(
+            {
+                "action_key": action_key,
+                "label": label,
+                "category": category,
+                "role": role,
+                "trigger": f"需要执行{label}时",
+                "input_fields": input_fields,
+                "pre_state": f"{title}处于待处理状态",
+                "post_state": f"{label}结果已更新",
+                "result_evidence": f"页面显示{label}结果、更新时间和处理状态",
+                "requires_confirmation": high_risk,
+            }
+        )
+        labels.append(label)
+    return specs
 
 
 def _llm_batch_workers() -> int:
@@ -325,12 +489,10 @@ def _authenticity_first(task: GenerationTask) -> bool:
 
 
 def _blueprint_attempt_count(task: GenerationTask) -> int:
-    profile = _generation_quality_profile(task)
-    if profile == "authenticity-first":
-        return 5
-    if profile == "fast":
-        return 2
-    return 3
+    # Successful subrequests are retained within one attempt. Network retries
+    # happen inside provider.chat and format/quality repair is limited to one
+    # targeted request, so the whole six-request plan is never restarted.
+    return 1
 
 
 def _blueprint_quality_floor(task: GenerationTask) -> int:
@@ -1473,12 +1635,11 @@ def _chat_json(
     temperature: float,
     max_tokens: int,
     label: str,
-    attempts: int = 3,
+    attempts: int = 2,
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     current_messages = messages
-    provider_retries = int(getattr(getattr(provider, "config", None), "retry_count", 0) or 0)
-    total_attempts = 1 if provider_retries > 0 else max(1, attempts)
+    total_attempts = max(1, min(2, attempts))
     for attempt in range(total_attempts):
         started_at = time.perf_counter()
         trace_event(
@@ -1492,12 +1653,14 @@ def _chat_json(
             message_count=len(current_messages),
         )
         try:
+            request_number = _consume_blueprint_request(provider, label)
             content = provider.chat(
                 current_messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"},
                 trace_label=f"blueprint:{label}",
+                retry_policy=TextRetryPolicy(max_retries=1),
             )
             data = _parse_json(content)
             trace_event(
@@ -1507,8 +1670,12 @@ def _chat_json(
                 attempt=attempt + 1,
                 elapsed_seconds=round(time.perf_counter() - started_at, 3),
                 content_chars=len(content or ""),
+                request_number=request_number,
+                request_limit=8,
             )
             return data
+        except TextProviderError:
+            raise
         except Exception as exc:
             last_error = exc
             trace_event(
@@ -1531,6 +1698,29 @@ def _chat_json(
                     }
                 ]
     raise RuntimeError(f"{label}请求失败：{last_error}")
+
+
+def _consume_blueprint_request(provider: LLMProvider, label: str) -> int:
+    budget = getattr(provider, "_blueprint_request_budget", None)
+    if not isinstance(budget, dict):
+        budget = {"count": 0, "limit": 8, "lock": threading.Lock()}
+        setattr(provider, "_blueprint_request_budget", budget)
+    lock = budget.get("lock")
+    if not hasattr(lock, "__enter__"):
+        lock = threading.Lock()
+        budget["lock"] = lock
+    with lock:
+        next_count = int(budget.get("count") or 0) + 1
+        limit = int(budget.get("limit") or 8)
+        if next_count > limit:
+            raise RuntimeError(f"产品蓝图请求预算已用尽：{label} 将超过 {limit} 次请求上限")
+        budget["count"] = next_count
+        return next_count
+
+
+def _blueprint_request_count(provider: LLMProvider) -> int:
+    budget = getattr(provider, "_blueprint_request_budget", None)
+    return int(budget.get("count") or 0) if isinstance(budget, dict) else 0
 
 
 def _parse_json(content: str) -> dict[str, Any]:

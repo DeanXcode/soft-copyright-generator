@@ -12,6 +12,7 @@ from softcopyright.errors import sanitize_error_message
 from softcopyright.generator import generate_materials
 from softcopyright.llm.provider import build_provider, config_from_env
 from softcopyright.models import GenerationTask, PRODUCT_TYPES, SOFTWARE_CATEGORIES, SUPPORTED_LANGUAGES
+from softcopyright.packager import write_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,12 +173,21 @@ def _write_failure_report(output_dir: Path, message: str, checks: dict) -> None:
                 existing_failure = {}
         else:
             existing_failure = {}
+        state_attempt = str(state.get("attempt_id") or "").strip()
+        failure_attempt = str(existing_failure.get("attempt_id") or "").strip()
+        if state_attempt and failure_attempt and state_attempt != failure_attempt:
+            existing_failure = {}
         merged_checks = {}
         if isinstance(existing_failure.get("checks"), dict):
             merged_checks.update(existing_failure.get("checks") or {})
         merged_checks.update(checks or {})
         payload = {
             **existing_failure,
+            "schema_version": 2,
+            "attempt_id": state_attempt,
+            "started_at": str(state.get("started_at") or ""),
+            "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "resume_source": str(state.get("resume_source") or ""),
             "status": "error",
             "stage": str(state.get("stage") or existing_failure.get("stage") or "error"),
             "progress": int(state.get("progress") or existing_failure.get("progress") or 0),
@@ -185,12 +195,9 @@ def _write_failure_report(output_dir: Path, message: str, checks: dict) -> None:
             "message": sanitize_error_message(message, limit=1000),
             "checks": merged_checks,
         }
-        failure_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        write_json(failure_path, payload)
         state.update(payload)
-        state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json(state_path, state)
     except OSError:
         return
 
