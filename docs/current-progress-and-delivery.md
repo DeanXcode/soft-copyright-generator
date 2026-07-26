@@ -2,6 +2,16 @@
 
 更新日期：2026-07-27
 
+## 2026-07-27 0.1.10 发布稳定工程门禁
+
+- 已先把当前约 40 个文件的既有改进整理为独立源码检查点 `7711e82`，检查点创建前 194 项 Python 回归、核心模块编译、Electron 主进程与 preload 语法检查、Vite 生产构建全部通过。当前仍在执行的旧 35 页生成任务保持原进程和原缓存运行，不参与本阶段缓存迁移或产物清理。
+- 项目版本提升为 `0.1.10`，`electron-builder` 固定升级到 `26.15.3`；升级后的官方 `npm audit` 为 critical 0、high 0。新增带原因和到期时间的审计允许清单机制，只有明确列入且未过期的项目可被接受，critical 始终禁止放行。
+- 新增 `requirements-lock.txt`，固定 Python 直接和传递依赖并记录哈希；内置 Python 运行时改为 `pip install --require-hashes`，安装包资源同步包含锁文件，避免不同客户机器解析到不同依赖版本。
+- 新增统一 `npm run verify:release` 门禁，依次执行完整 Python 回归、核心模块编译、Electron 检查、Vite 构建、npm 安全审计、示例配置和跟踪文件密钥扫描、版本与安装包资源一致性检查、Python 锁文件 dry-run。客户 NSIS 打包脚本会先执行该门禁，任一步失败即禁止打包。
+- 浏览器测试新增 Chromium 安全端口分配器并替换原随机端口，明确排除 `2049` 等浏览器禁止端口，消除完整回归偶发 `ERR_UNSAFE_PORT`。相关 React 和运行接口聚焦回归 40 项通过。
+- 新增 `npm run cleanup:artifacts` 产物清理脚本，默认只预览；显式传入 `-Apply` 时仅处理 `tmp` 内容、两个 `win-unpacked` 和超过保留数量的旧 `release/smoke-*`。脚本不扫描或删除 `output`、客户输出、正式 ZIP、本地真实配置和正式安装器。
+- README 已同步多文本供应商、请求地址和已保存 Key 只写不回显、独立图片 API、`/api/usage/token/` 尾斜杠、`0.1.10` 安装器路径和发布门禁说明；本计划明确排除服务端授权代理、API Key 分发方式改造和代码签名改造。
+
 ## 2026-07-27 前端模型空响应自动恢复
 
 - “装配式建筑构件安装质量智能校验与管理平台”在生成第 17/35 个 React 页面 `archive_flow_operation_3_3` 时，模型请求约 40 秒后返回 HTTP 成功但没有可提取内容，错误为 `LLM response content is empty`。旧逻辑未把该错误识别为临时故障，并且会先进入普通 `ValueError` 格式错误分支，导致当前页无法按网络临时错误预算恢复。

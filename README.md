@@ -6,10 +6,12 @@
 
 - [当前进度与交付说明](docs/current-progress-and-delivery.md)
 
+当前开发版本：`0.1.10`。
+
 ## 安装依赖
 
 ```powershell
-python -m pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements-lock.txt
 ```
 
 ## 生成样例
@@ -75,9 +77,9 @@ start-desktop.bat
 
 ## 模型配置
 
-桌面端客户界面当前只支持 `GPT` 生成模式。生成流程会通过 OpenAI-compatible / NewAPI 网关完成名称理解、产品蓝图、技术架构选择、说明书正文和界面蓝图生成；任一关键 GPT 阶段失败都会明确提示重试，不再切换到默认模板生成。
+桌面端支持 OpenAI-compatible / NewAPI、Grok（xAI）、Claude（Anthropic）、Gemini（Google）和 DeepSeek 文本供应商。生成流程会完成名称理解、产品蓝图、技术架构选择、说明书正文和界面蓝图生成；任一关键文本阶段失败都会明确提示重试，不再静默切换到默认模板。`Default Template` 是显式选择的零 Token 模式。
 
-客户交付版安装包会预置 GPT 请求地址、模型名称和 API Key；客户安装后可在高级设置里直接查看和修改这三项配置。
+客户交付版安装包可预置请求地址、模型名称和 API Key。请求地址与已保存 Key 采用只写不回显：高级设置只显示配置状态，只有主动输入新值并保存时才会替换。图片模型可以复用文本 API，也可以使用独立的图片请求地址、API Key 和模型 ID；正式 image2 流程失败时不会使用模板图或静态图兜底。
 
 生成客户交付版安装包：
 
@@ -155,7 +157,7 @@ $env:SOFT_MODEL_GATEWAY_IMAGE_MODEL="gpt-image-2"
 如果 `SOFT_ACCOUNT_PROVIDER` 设置为 `newapi`，桌面端会根据 `SOFT_MODEL_GPT_BASE_URL` 自动读取 NewAPI 额度接口：
 
 ```http
-GET /api/usage/token
+GET /api/usage/token/
 Authorization: Bearer sk-你的NewAPI调用Token
 ```
 
@@ -399,13 +401,13 @@ PDF 转换探测优先级：
 当前提供便携 zip 打包脚本：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\package-windows-portable.ps1 -Version 0.1.0
+powershell -ExecutionPolicy Bypass -File scripts\package-windows-portable.ps1 -Version 0.1.10
 ```
 
 输出：
 
 ```text
-release/soft-copyright-generator-0.1.0-portable.zip
+release/soft-copyright-generator-0.1.10-portable.zip
 ```
 
 包内包含：
@@ -431,7 +433,7 @@ npm run pack:win
 输出：
 
 ```text
-release/installer/Soft Copyright Generator Setup 0.1.0.exe
+release/installer/Soft Copyright Generator Setup 0.1.10.exe
 release/installer/win-unpacked/
 ```
 
@@ -446,14 +448,14 @@ npm run pack:win:customer
 输出：
 
 ```text
-release/customer-installer/Soft Copyright Generator Setup 0.1.0.exe
+release/customer-installer/Soft Copyright Generator Setup 0.1.10.exe
 release/customer-installer/win-unpacked/
 ```
 
-客户预制安装器会把本机 `config/production.json` 注入到安装包资源目录，并写入 `SOFT_MODEL_MODE=gpt` 和 `SOFT_CUSTOMER_PRESET_CONFIG=true`。同时会内置 LibreOffice 运行时。客户安装后可在界面高级设置里修改请求地址、模型名称和 API Key，并可直接生成高保真 PDF。
+客户预制安装器会把本机 `config/production.json` 注入到安装包资源目录，并写入 `SOFT_MODEL_MODE=gpt` 和 `SOFT_CUSTOMER_PRESET_CONFIG=true`。同时会内置 LibreOffice 运行时。客户安装后可在界面高级设置里用只写方式替换请求地址和 API Key、修改模型名称，并可直接生成高保真 PDF。
 
-注意：当前预制配置属于客户端随包配置，API Key 客户界面可见可改；如果后续要避免暴露 API Key，应使用服务端授权代理，由桌面端只持有客户授权码。
+构建客户安装器前会自动执行 `npm run verify:release`。Python 回归、核心模块编译、Electron 检查、Vite 构建、npm 安全审计、示例配置密钥扫描或安装包资源/版本一致性检查任一失败时都会停止打包。
 
 ## 后续开发
 
-下一阶段建议做干净 Windows 环境端到端验收，并补齐服务端授权代理或激活码绑定流程，让客户包不再内置模型 API Key。
+下一阶段建议继续完善统一文本重试、自适应页面并发、任务状态恢复和混合 PageSpec 页面引擎，并在每个版本完成后执行干净 Windows 用户目录端到端验收。

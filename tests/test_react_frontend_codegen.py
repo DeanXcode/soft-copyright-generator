@@ -1,6 +1,6 @@
 import json
 from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import SimpleHTTPRequestHandler
 from pathlib import Path
 import re
 from tempfile import TemporaryDirectory
@@ -36,6 +36,7 @@ from backend.softcopyright.screenshots import (
     runtime_api_script,
 )
 from backend.softcopyright.ui_blueprint import UiBlueprint, UiScreenBlueprint
+from tests.http_test_utils import create_safe_threading_http_server
 
 
 class _ReactProvider:
@@ -689,7 +690,7 @@ class ReactFrontendCodegenTests(unittest.TestCase):
             self.assertNotIn("待填写", quality_text)
             self.assertEqual(quality_hits, [])
             handler = partial(_QuietHandler, directory=str(root))
-            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            server = create_safe_threading_http_server("127.0.0.1", handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
@@ -811,7 +812,7 @@ class ReactFrontendCodegenTests(unittest.TestCase):
             app_source = (root / "react-app" / "src" / "App.jsx").read_text(encoding="utf-8")
             self.assertIn('"nav_model": "side_menu"', app_source)
             handler = partial(_QuietHandler, directory=str(root))
-            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            server = create_safe_threading_http_server("127.0.0.1", handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:

@@ -1,7 +1,7 @@
 import json
 import os
 from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import SimpleHTTPRequestHandler
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
@@ -14,6 +14,7 @@ from backend.softcopyright.screenshots import (
     _inject_runtime_script_into_ai_page,
     runtime_api_script,
 )
+from tests.http_test_utils import create_safe_threading_http_server
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -147,7 +148,7 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}.operation-result{width:
             )
             _inject_runtime_script_into_ai_page(page_path, module_keys=["inventory"])
             handler = partial(_RuntimeApiHandler, directory=str(root))
-            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            server = create_safe_threading_http_server("127.0.0.1", handler)
             thread = Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
@@ -208,7 +209,7 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}
             )
             _inject_runtime_script_into_ai_page(page_path, module_keys=["inventory"])
             handler = partial(_RuntimeApiHandler, directory=str(root))
-            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            server = create_safe_threading_http_server("127.0.0.1", handler)
             thread = Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
@@ -271,7 +272,7 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}
             )
             _inject_runtime_script_into_ai_page(page_path, module_keys=["inventory"])
             handler = partial(_RuntimeApiHandler, directory=str(root))
-            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            server = create_safe_threading_http_server("127.0.0.1", handler)
             thread = Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
@@ -326,7 +327,7 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}
             )
             _inject_runtime_script_into_ai_page(page_path, module_keys=["inventory"])
             handler = partial(_RuntimeApiHandler, directory=str(root))
-            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            server = create_safe_threading_http_server("127.0.0.1", handler)
             thread = Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
@@ -389,7 +390,7 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}
             self.assertNotIn("trunk_route_catalog", html)
 
             handler = partial(_RuntimeApiHandler, directory=str(root))
-            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            server = create_safe_threading_http_server("127.0.0.1", handler)
             thread = Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
@@ -444,7 +445,7 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}.stable-card{width:900px
             self.assertNotIn("data-runtime-operation-evidence-style", html)
 
             handler = partial(_RuntimeApiHandler, directory=str(root))
-            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            server = create_safe_threading_http_server("127.0.0.1", handler)
             thread = Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:

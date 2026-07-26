@@ -1,0 +1,10 @@
+{
+  "entries": [
+    {
+      "id": "GHSA-mh99-v99m-4gvg",
+      "package": "brace-expansion",
+      "expires": "2026-10-31",
+      "reason": "electron-builder 26.15.3 still depends on older minimatch majors; the affected archive glob path is build-time only and is not exposed to customer input"
+    }
+  ]
+}

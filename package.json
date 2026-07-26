@@ -1,12 +1,16 @@
 {
   "name": "soft-copyright-generator-desktop",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "private": true,
   "type": "module",
   "main": "desktop/electron/main.cjs",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "test": "python -m unittest discover -s tests",
     "build": "vite build",
+    "verify:audit": "node scripts/verify-npm-audit.mjs",
+    "verify:release": "powershell -ExecutionPolicy Bypass -File scripts\\verify-release.ps1",
+    "cleanup:artifacts": "powershell -ExecutionPolicy Bypass -File scripts\\cleanup-artifacts.ps1",
     "pack:dir": "npm run prepare:runtime && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --dir",
     "pack:win": "npm run prepare:runtime && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --win nsis",
     "pack:win:customer": "powershell -ExecutionPolicy Bypass -File scripts\\package-customer-nsis.ps1",
@@ -23,13 +27,13 @@
     "@vitejs/plugin-react": "^5.1.1",
     "cross-env": "^10.1.0",
     "lucide-react": "^0.556.0",
-    "vite": "^7.2.7",
     "react": "^19.2.3",
-    "react-dom": "^19.2.3"
+    "react-dom": "^19.2.3",
+    "vite": "^7.2.7"
   },
   "devDependencies": {
     "electron": "39.8.10",
-    "electron-builder": "^26.0.12"
+    "electron-builder": "26.15.3"
   },
   "build": {
     "appId": "com.softcopyright.generator",
@@ -67,6 +71,10 @@
       {
         "from": "requirements.txt",
         "to": "requirements.txt"
+      },
+      {
+        "from": "requirements-lock.txt",
+        "to": "requirements-lock.txt"
       }
     ],
     "win": {

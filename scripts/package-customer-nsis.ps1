@@ -26,6 +26,11 @@ Push-Location $root
 try {
   New-Item -ItemType Directory -Force -Path $customerBuildDir | Out-Null
 
+  npm run verify:release
+  if ($LASTEXITCODE -ne 0) {
+    throw "npm run verify:release failed with exit code $LASTEXITCODE"
+  }
+
   $customerConfig = Get-Content -LiteralPath $sourceConfigPath -Encoding UTF8 -Raw | ConvertFrom-Json
   if (-not $customerConfig.SOFT_MODEL_GPT_BASE_URL) {
     throw "SOFT_MODEL_GPT_BASE_URL is required in $sourceConfigPath"

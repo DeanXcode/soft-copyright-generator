@@ -117,8 +117,13 @@ $pythonExe = Join-Path $runtimePath "python.exe"
 Write-Host "Installing pip into embedded Python"
 Invoke-Checked $pythonExe @($getPipPath, "--no-warn-script-location")
 
-Write-Host "Installing project Python dependencies"
-Invoke-Checked $pythonExe @("-m", "pip", "install", "--no-warn-script-location", "-r", (Join-Path $root "requirements.txt"))
+$requirementsLock = Join-Path $root "requirements-lock.txt"
+if (-not (Test-Path -LiteralPath $requirementsLock)) {
+  throw "Missing locked Python dependencies: $requirementsLock"
+}
+
+Write-Host "Installing locked project Python dependencies"
+Invoke-Checked $pythonExe @("-m", "pip", "install", "--no-warn-script-location", "--require-hashes", "-r", $requirementsLock)
 
 Write-Host "Verifying embedded Python"
 Invoke-Checked $pythonExe @("-c", "import sys, docx, reportlab, playwright, pypdf; print(sys.version); print('embedded-python-ok')")
