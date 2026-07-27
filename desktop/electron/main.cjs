@@ -49,6 +49,7 @@ let activeGenerationTask = null;
 let activeOutlineTask = null;
 let lastGenerationResult = null;
 const RECOVERY_DISMISSED_FILE = "generation-recovery-dismissed.json";
+const FRONTEND_ENGINE_VERSION = "pagespec-hybrid-v1";
 
 const modelPlans = {
   template: {
@@ -324,6 +325,12 @@ function recoverTaskFromOutputDir(outputDir, mtimeMs = 0) {
   if (!businessPlan.modules.length) return null;
   const trace = latestTraceFailure(tracePath);
   const visualReferencePath = path.join(outputDir, "generated_source", "ui-prototype", "visual-references", "style_reference.png");
+  const frontendEnginePath = path.join(outputDir, "generated_source", "ui-prototype", "react-app", ".frontend-engine.json");
+  const frontendScreensPath = path.join(outputDir, "generated_source", "ui-prototype", "react-app", "src", "screens");
+  const frontendEngine = readJsonConfig(frontendEnginePath);
+  const pageEngineUpgradeRequired = Boolean(
+    fs.existsSync(frontendScreensPath) && String(frontendEngine.frontend_engine_version || "") !== FRONTEND_ENGINE_VERSION
+  );
   const seed = seedFromOutputDir(outputDir);
   const validationFinding = Array.isArray(validationReport.findings)
     ? validationReport.findings.find((item) => item && item.level === "error")
@@ -356,6 +363,7 @@ function recoverTaskFromOutputDir(outputDir, mtimeMs = 0) {
     failedStage,
     errorSummary,
     visualReferenceReady: fs.existsSync(visualReferencePath),
+    pageEngineUpgradeRequired,
     promptText: businessPlan.softwareName,
     formSnapshot: {
       name: businessPlan.softwareName,

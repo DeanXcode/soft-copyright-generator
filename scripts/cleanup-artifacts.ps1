@@ -21,7 +21,9 @@ if (Test-Path -LiteralPath $tmpPath) {
   Get-ChildItem -LiteralPath $tmpPath -Force | ForEach-Object { Add-Candidate $_.FullName }
 }
 Add-Candidate (Join-Path $root "release\installer\win-unpacked")
+Add-Candidate (Join-Path $root "release\installer\win-unpacked.tmp")
 Add-Candidate (Join-Path $root "release\customer-installer\win-unpacked")
+Add-Candidate (Join-Path $root "release\customer-installer\win-unpacked.tmp")
 
 $smokeDirectories = Get-ChildItem -LiteralPath (Join-Path $root "release") -Directory -Filter "smoke-*" -ErrorAction SilentlyContinue |
   Sort-Object LastWriteTime -Descending

@@ -6,7 +6,7 @@
 
 - [当前进度与交付说明](docs/current-progress-and-delivery.md)
 
-当前开发版本：`0.1.11`。
+当前开发版本：`0.2.0`。
 
 ## 安装依赖
 
@@ -78,6 +78,10 @@ start-desktop.bat
 ## 模型配置
 
 桌面端支持 OpenAI-compatible / NewAPI、Grok（xAI）、Claude（Anthropic）、Gemini（Google）和 DeepSeek 文本供应商。生成流程会完成名称理解、产品蓝图、技术架构选择、说明书正文和界面蓝图生成；任一关键文本阶段失败都会明确提示重试，不再静默切换到默认模板。`Default Template` 是显式选择的零 Token 模式。
+
+从 `0.2.0` 开始，标准后台、移动端和常规操作页默认由模型返回 `page-spec-v1` 结构化页面规范，本地 `PageRenderer` 负责生成 React DOM 与受控 CSS。地图页继续使用 PageSpec；游戏、三维和虚拟仿真等组件库暂时无法表达的页面逐页使用 legacy React fallback。页面缓存写入 `*.page-spec.json` 与 `*.meta.json`，材料内部清单包含 PageSpec schema 和组件库版本，但不会写入客户可见说明书正文。
+
+升级后恢复旧失败任务时会保留产品蓝图、技术架构、说明书内容、源码和 image2 参考图，并从界面阶段重新生成全部页面；已经完成的历史材料包和 ZIP 不会自动迁移或重建。
 
 客户交付版安装包可预置请求地址、模型名称和 API Key。请求地址与已保存 Key 采用只写不回显：高级设置只显示配置状态，只有主动输入新值并保存时才会替换。图片模型可以复用文本 API，也可以使用独立的图片请求地址、API Key 和模型 ID；正式 image2 流程失败时不会使用模板图或静态图兜底。
 
@@ -401,13 +405,13 @@ PDF 转换探测优先级：
 当前提供便携 zip 打包脚本：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\package-windows-portable.ps1 -Version 0.1.11
+powershell -ExecutionPolicy Bypass -File scripts\package-windows-portable.ps1 -Version 0.2.0
 ```
 
 输出：
 
 ```text
-release/soft-copyright-generator-0.1.11-portable.zip
+release/soft-copyright-generator-0.2.0-portable.zip
 ```
 
 包内包含：
@@ -433,7 +437,7 @@ npm run pack:win
 输出：
 
 ```text
-release/installer/Soft Copyright Generator Setup 0.1.11.exe
+release/installer/Soft Copyright Generator Setup 0.2.0.exe
 release/installer/win-unpacked/
 ```
 
@@ -448,7 +452,7 @@ npm run pack:win:customer
 输出：
 
 ```text
-release/customer-installer/Soft Copyright Generator Setup 0.1.11.exe
+release/customer-installer/Soft Copyright Generator Setup 0.2.0.exe
 release/customer-installer/win-unpacked/
 ```
 
@@ -458,4 +462,4 @@ release/customer-installer/win-unpacked/
 
 ## 后续开发
 
-下一阶段建议继续完善统一文本重试、自适应页面并发、任务状态恢复和混合 PageSpec 页面引擎，并在每个版本完成后执行干净 Windows 用户目录端到端验收。
+统一文本重试、自适应页面并发、状态恢复和混合 PageSpec 页面引擎已在 `0.1.11` / `0.2.0` 落地。下一阶段重点是使用同一供应商、同一 35 页样本完成耗时基准对比，在干净 Windows 用户或快照环境验证最终 NSIS 安装器，并继续扩大 PageSpec 在游戏、三维、嵌入式和少见行业页面上的组件覆盖。

@@ -2,6 +2,19 @@
 
 更新日期：2026-07-27
 
+## 2026-07-27 0.2.0 混合 PageSpec 页面引擎
+
+- 标准后台、移动端、确认操作、表格、流程、图表、地图和关系页面默认改为 `page-spec-v1`：模型只返回受控页面规范，本地 `PageRenderer` 统一生成 React DOM 与 CSS。请求输出上限固定为 1600 tokens、6000 字符；超长、未知组件或缺少交互契约只允许一次定向修复。游戏、三维、虚拟仿真和 WebGL 等暂未覆盖页面逐页使用 legacy React fallback，不影响其他页面继续使用 PageSpec。
+- PageSpec 组件库覆盖筛选栏、指标组、数据表、表单、详情、工作流、时间线、看板、图表、地图面板、关系图、移动列表和操作结果。缓存升级为 `*.page-spec.json + *.meta.json`，cache key 同时包含 PageSpec schema、组件库和前端引擎版本；旧 JSX/CSS 页面缓存不兼容并会在恢复旧失败任务时失效。
+- 材料内部新增 `page-spec-manifest.json`，记录 `page-spec-v1`、组件库版本、PageSpec 页数和 legacy fallback 页数；这些字段同时写入生成报告，但不会进入客户可见说明书正文。报告新增 `page_spec_count`、`legacy_react_page_count`，并继续保留 0.1.11 的实际并发、降级、取消页数、请求耗时和 provider 重试统计。
+- 旧失败任务迁移会保留产品蓝图、技术架构、说明书内容、源码和 image2 风格参考图，只删除旧 React 页面缓存与截图检查点并从界面阶段重新生成。Electron 恢复卡明确提示“页面生成引擎已升级，将复用蓝图和参考图并重新生成全部界面”；已完成历史材料包和 ZIP 不自动迁移或重建。
+- 前端生成模块已拆为 PageSpec schema、模型请求、组件渲染、legacy fallback 和 Vite 构建。截图模块已拆为检查点、项目页面运行、截图采集、布局质量和运行时注入；`screenshots.py` 保留旧导入兼容面。桌面主页面已抽出任务队列、模型设置、结果报告组件和队列持久化 hook，IPC 名称与现有模型配置字段保持兼容。
+- 新增 PageSpec schema/渲染/缓存/fallback、旧任务迁移、桌面拆分、截图长标题恢复和英文安全文件名识别回归；完整 Python 回归现为 219 项并全部通过。Python 核心模块编译、Electron 主进程与 preload 语法检查、Vite `0.2.0` 生产构建均通过；唯一提示仍是 Pillow `Image.getdata()` 面向 2027 年的弃用警告，不影响当前运行。
+- `Default Template` 继续保持零 Token；UI 继续只显示请求地址和已保存 Key 的配置状态，不回显真实值；正式 image2 流程仍不使用模板图或静态图兜底。服务端授权代理、API Key 分发方式和代码签名改造未纳入本版本。
+- 修复 Default Template 恢复任务的两个真实阻塞：截图摘要现在允许 72 字符页面标题，并在恢复旧检查点时重新规范化和原子回写；校验器使用 `task.safe_name` 识别带空格英文软件名生成的连字符文件名，说明书 DOCX/PDF 不再被误判为 `unknown`。原失败任务已从截图和校验节点恢复到 100%，21 张截图摘要全部就绪并成功生成 ZIP。
+- `npm run verify:release` 在最终源码上完整通过：219 项 Python 回归、Python 核心编译、Electron/preload 检查、Vite 构建、npm audit、配置/密钥扫描和 Python 哈希锁 dry-run 均正常，npm audit 为 critical 0、high 0。最终客户安装器为 `release\customer-installer\Soft Copyright Generator Setup 0.2.0.exe`，大小 `595,072,382` 字节，SHA-256 为 `492EE17337AB10384BABC7510E730CFE2701E79E8774D7FFCDEC98F507DEB6E6`。
+- 最终 `win-unpacked` 包内 Python、Chromium、LibreOffice 26.2.3.2、PageSpec/截图拆分模块和生产配置资源均存在，Electron 隐藏启动 8 秒后保持 4 个进程运行。使用包内 Python、Chromium 与 LibreOffice 完成 `Final Packaged Zero Token System` 全生成：LLM 记录 0、21/21 张截图、21 张手册配图、25 页说明书 PDF、60 页源码 PDF、`validation_ready_for_delivery=true`、校验问题 0；材料包位于 `release\smoke-0.2.0-final-20260727-103454\package-zero-token-output\Final-Packaged-Zero-Token-System-20260727-110000-0200--材料包.zip`，大小 `3,410,499` 字节，SHA-256 为 `FBD792A0EA673023F91197050894C061F07B888244366D819F2F000C49A9C0C6`。
+
 ## 2026-07-27 0.1.11 可靠性与耗时优化
 
 - 文本模型请求统一为 provider 单层重试：错误分为配置/权限、限流、网关、连接、超时、空响应、格式、质量和取消。React 页面临时故障最多重试 2 次，蓝图、说明书、架构和 UI 蓝图最多重试 1 次；400/401/403/404 等配置错误立即失败。上层仅保留一次 JSON、格式或业务质量定向修复，避免网络重试与业务修复相乘；图片模型继续使用独立重试策略。
@@ -819,11 +832,12 @@ validation_finding_count: 0
 12. 截图级 `visible_content_summary` 和图文语义门禁已经接入正式链路；当前剩余风险是不同前端命名习惯可能影响 DOM 分类质量，例如自定义组件没有 `metric`、`field-label`、`filter-block` 等语义类名。后续需要继续用手机 APP、小程序、游戏和自由 React 页面抽样，确保标题、指标、字段、筛选项和即时操作均能稳定分类。
 13. 模块级操作覆盖矩阵和结构化蓝图契约已接入正式链路，后台默认 3 个操作页、移动端默认 2 个，并按真实业务语义选择动作；后续风险转为更多软件类型的契约质量与动作分类抽样，尤其是只读看板、媒体播放、移动端即时操作和少见行业流程。
 14. `客户安装版零令牌冒烟系统` 的历史 GPT 蓝图按桌面后台生成，但任务 `product_type=APP` 且原始业务补充为空，当前产品体验推导会默认移动端；screenshots/done 断点已通过视觉身份锁安全保留既有 admin 输出并记录 raw/deferred 证据。后续应把“APP 产品类型 + 系统名称 + 已批准桌面 UI”终端选择做成显式契约，减少对恢复例外的依赖。
+15. 当前 Windows 用户已登记一套同产品 ID、同版本 `0.2.0` 的旧 smoke 安装。最终安装器再次静默安装时，NSIS 会优先尝试覆盖旧目录并提示 `Failed to uninstall old application files`；为避免卸载器删除旧目录中的零 Token 输出，本轮没有清除该安装记录。最终安装内容已改用同一次构建产生的 `win-unpacked` 完成资源、启动和零 Token 全生成验证；正式 NSIS 的全新用户安装需在干净 Windows 用户或系统快照中补做。
 
-## 下一步建议
+## 下一阶段建议
 
 优先级从高到低：
 
-1. 在新安装目录执行一次 UI 级 Default Template 零 token 生成，并点击打开材料包和输出目录；静态资源与应用启动已通过，本轮尚未重复生成零 token 材料。
-2. 使用安装版核对 GPT 余额/模型目录、请求地址替换后隐藏，并在需要时做一次新的 GPT/image2 正式生成；该步骤会消耗文本和图片额度。
-3. 人工复核轨道施工 37 页正式手册和 v18b 21 页零令牌手册，重点查看权限与安全软通过页、操作说明密度和所有确认弹窗按钮裁图。
+1. 使用同一文本供应商和同一 35 页正式样本，对比 `0.1.x` JSX/CSS 与 `0.2.0` PageSpec 的前端模型阶段耗时、请求次数和失败数，确认总耗时至少降低 40%；该验收会消耗文本和 image2 额度。
+2. 在干净 Windows 用户、Windows Sandbox 或系统快照中安装最终 `0.2.0` NSIS，验证 Default Template UI 生成、GPT 模型目录/余额、请求地址和已保存 Key 不回显、材料包打开与输出目录打开。
+3. 扩大 PageSpec 真实抽样到游戏、三维、嵌入式、地图和少见行业流程，并逐步替换 legacy fallback；同时处理 Pillow `Image.getdata()` 的未来弃用提示。

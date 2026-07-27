@@ -198,6 +198,59 @@ class ScreenshotCheckpointResumeTests(unittest.TestCase):
         self.assertIn("预约编号", summary["fields"])
         self.assertIn("查询服务预约", summary["actions"])
 
+    def test_visible_content_summary_keeps_long_page_title_as_heading(self):
+        item = UiScreenshot(
+            "statistics",
+            "PageSpec Zero Token Acceptance System个人中心界面",
+            "",
+            "statistics.html",
+        )
+
+        summary = _normalize_visible_content_summary(
+            {"visible_text": "PageSpec Zero Token Acceptance System个人中心界面 用户资料 已同步"},
+            item,
+        )
+
+        self.assertTrue(summary["ready"])
+        self.assertIn(item.title, summary["headings"])
+
+    def test_checkpoint_restore_repairs_long_title_summary(self):
+        with TemporaryDirectory() as tmp:
+            ui_dir = Path(tmp)
+            html_path = ui_dir / "statistics.html"
+            html_path.write_text("<html><body>profile</body></html>", encoding="utf-8")
+            image_path = ui_dir / "statistics.png"
+            image_path.write_bytes(b"png")
+            item = UiScreenshot(
+                "statistics",
+                "PageSpec Zero Token Acceptance System个人中心界面",
+                "",
+                str(html_path),
+                visible_content_summary={
+                    "visible_text": "PageSpec Zero Token Acceptance System个人中心界面 用户资料 已同步",
+                    "headings": [],
+                    "ready": False,
+                },
+                image_path=str(image_path),
+                width=ADMIN_VIEWPORT["width"],
+                height=ADMIN_VIEWPORT["height"],
+            )
+            checkpoint = {"version": SCREENSHOT_CHECKPOINT_VERSION, "pages": {}}
+            _save_screenshot_checkpoint_page(ui_dir, checkpoint, item, "admin", ADMIN_VIEWPORT)
+
+            restored_item = UiScreenshot("statistics", item.title, "", str(html_path))
+            restored_checkpoint, restored_count = _restore_screenshot_checkpoint_prefix(
+                ui_dir,
+                [restored_item],
+                "admin",
+                ADMIN_VIEWPORT,
+            )
+
+            self.assertEqual(restored_count, 1)
+            self.assertTrue(restored_item.visible_content_summary["ready"])
+            self.assertIn(item.title, restored_item.visible_content_summary["headings"])
+            self.assertTrue(restored_checkpoint["pages"]["statistics"]["visible_content_summary"]["ready"])
+
 
 if __name__ == "__main__":
     unittest.main()

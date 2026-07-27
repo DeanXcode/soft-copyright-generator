@@ -26,6 +26,7 @@ from .docgen import (
 from .architecture import ARCHITECTURE_CATALOG, normalize_technical_architecture_for_experience
 from .errors import sanitize_error_message
 from .feature_inference import harmonize_feature_hint
+from .frontend_codegen.page_spec import FRONTEND_ENGINE_VERSION
 from .industry_subtypes import select_industry_subtype_for_context
 from .llm_architecture import select_technical_architecture_with_llm
 from .llm_blueprint import blueprint_contract_issues, generate_blueprint_with_llm, normalize_cached_blueprint_candidate
@@ -567,6 +568,14 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         _emit_source_file_events(send, source_info, output_dir)
     mark("source")
 
+    page_engine_migration = _invalidate_legacy_frontend_cache_for_pagespec(output_dir) if resume_existing_output else {}
+    report["checks"]["page_engine_cache_migrated"] = bool(page_engine_migration.get("migrated"))
+    report["checks"]["page_engine_previous_version"] = str(page_engine_migration.get("previous_version") or "")
+    report["checks"]["page_engine_invalidated_file_count"] = int(page_engine_migration.get("invalidated_file_count") or 0)
+    if page_engine_migration.get("migrated"):
+        message = "页面生成引擎已升级，将复用蓝图和参考图并重新生成全部界面"
+        report["warnings"].append(message)
+        send("screenshots", 49, message, material_type="PageSpec v1")
     send("screenshots", 50, "根据参考图生成界面代码并运行源码截图")
     ui_screenshots, screenshot_warnings, ui_blueprint = generate_ui_screenshots(
         task,
@@ -675,13 +684,22 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     report["checks"]["ui_frontend_source_dir"] = str(source_info.get("ui_frontend_source_dir") or ai_frontend_report.get("source_dir") or "")
     report["checks"]["ui_ai_frontend_page_count"] = int(ai_frontend_report.get("page_count") or len(ai_frontend_report.get("pages") or []))
     report["checks"]["page_spec_count"] = int(ai_frontend_report.get("page_spec_count") or 0)
-    report["checks"]["legacy_react_page_count"] = int(ai_frontend_report.get("legacy_react_page_count") or report["checks"]["ui_ai_frontend_page_count"])
+    legacy_page_count = ai_frontend_report.get("legacy_react_page_count")
+    report["checks"]["legacy_react_page_count"] = int(
+        legacy_page_count if legacy_page_count is not None else report["checks"]["ui_ai_frontend_page_count"]
+    )
     report["checks"]["frontend_effective_workers"] = int(ai_frontend_report.get("frontend_effective_workers") or 1)
     report["checks"]["frontend_concurrency_degraded"] = bool(ai_frontend_report.get("frontend_concurrency_degraded"))
     report["checks"]["frontend_concurrency_degrade_reason"] = str(ai_frontend_report.get("frontend_concurrency_degrade_reason") or "")
     report["checks"]["frontend_cancelled_page_count"] = int(ai_frontend_report.get("frontend_cancelled_page_count") or 0)
     report["checks"]["frontend_page_request_timing"] = ai_frontend_report.get("frontend_page_request_timing") or {}
     report["checks"]["provider_retry_summary"] = ai_frontend_report.get("provider_retry_summary") or {}
+    report["page_spec_count"] = report["checks"]["page_spec_count"]
+    report["legacy_react_page_count"] = report["checks"]["legacy_react_page_count"]
+    report["frontend_effective_workers"] = report["checks"]["frontend_effective_workers"]
+    report["frontend_concurrency_degraded"] = report["checks"]["frontend_concurrency_degraded"]
+    report["frontend_cancelled_page_count"] = report["checks"]["frontend_cancelled_page_count"]
+    report["provider_retry_summary"] = report["checks"]["provider_retry_summary"]
     report["checks"]["ui_shared_confirmation_contract"] = str(ai_frontend_report.get("shared_confirmation_contract") or "")
     report["checks"]["ui_shared_confirmation_page_count"] = int(ai_frontend_report.get("shared_confirmation_page_count") or 0)
     report["checks"]["ui_shared_confirmation_ready"] = bool(ai_frontend_report.get("shared_confirmation_ready"))
@@ -2164,6 +2182,71 @@ def _read_json_object(path: Path) -> dict:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _invalidate_legacy_frontend_cache_for_pagespec(output_dir: Path) -> dict:
+    prototype_dir = output_dir / "generated_source" / "ui-prototype"
+    react_dir = prototype_dir / "react-app"
+    screens_dir = react_dir / "src" / "screens"
+    if not react_dir.is_dir() or not screens_dir.is_dir():
+        return {"migrated": False, "previous_version": "", "invalidated_file_count": 0}
+    marker = _read_json_object(react_dir / ".frontend-engine.json")
+    previous_version = str(marker.get("frontend_engine_version") or "legacy-react-cache")
+    if previous_version == FRONTEND_ENGINE_VERSION:
+        return {"migrated": False, "previous_version": previous_version, "invalidated_file_count": 0}
+    cached_files = [
+        path
+        for path in screens_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in {".jsx", ".css", ".json"}
+    ]
+    if not cached_files:
+        return {"migrated": False, "previous_version": previous_version, "invalidated_file_count": 0}
+    invalidated = 0
+    for path in cached_files:
+        try:
+            path.unlink()
+            invalidated += 1
+        except OSError:
+            continue
+    for path in (react_dir / "dist", prototype_dir / "assets"):
+        if path.exists():
+            try:
+                shutil.rmtree(path)
+                invalidated += 1
+            except OSError:
+                continue
+    for html_path in prototype_dir.glob("*.html"):
+        try:
+            html_path.unlink()
+            invalidated += 1
+        except OSError:
+            continue
+    ui_dir = output_dir / "ui_screenshots"
+    if ui_dir.is_dir():
+        for pattern in ("*.png", "*.jpg", "*.jpeg"):
+            for image_path in ui_dir.glob(pattern):
+                try:
+                    image_path.unlink()
+                    invalidated += 1
+                except OSError:
+                    continue
+        for name in ("screenshot-checkpoint.json", "action-crops"):
+            path = ui_dir / name
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                    invalidated += 1
+                elif path.is_file():
+                    path.unlink()
+                    invalidated += 1
+            except OSError:
+                continue
+    return {
+        "migrated": True,
+        "previous_version": previous_version,
+        "invalidated_file_count": invalidated,
+        "preserved": ["product-blueprint", "technical-architecture", "manual-content", "generated-source", "image2-style-reference"],
+    }
 
 
 def _begin_generation_attempt(output_dir: Path, task: GenerationTask, *, resume_source: str) -> None:

@@ -93,9 +93,9 @@ def validate_materials(
     zip_summary = _zip_summary(zip_path) if zip_path else {"exists": False, "entries": []}
     source_lines = read_source_lines(source_dir) if source_dir.exists() else []
     source_text = "\n".join(source_lines)
-    manual_text = _docx_text(_find_deliverable(deliverable_files, task.software_name, ".docx", source=False))
+    manual_text = _docx_text(_find_deliverable(deliverable_files, task.safe_name, ".docx", source=False))
     source_doc_text = _docx_text(_find_deliverable(deliverable_files, "_代码-", ".docx", source=True))
-    info_text = _read_text(_find_deliverable(deliverable_files, task.software_name, ".txt", source=False))
+    info_text = _read_text(_find_deliverable(deliverable_files, task.safe_name, ".txt", source=False))
     ui_text = _ui_text(ui_blueprint, ui_screenshots)
 
     module_terms = _terms([module.title for module in blueprint.modules[:8]])
@@ -718,7 +718,7 @@ def _deliverable_kind(task: GenerationTask, path: Path) -> str:
         return "info_txt"
     if is_source:
         return "source_pdf" if suffix == ".pdf" else "source_docx"
-    if task.software_name in name:
+    if task.software_name in name or task.safe_name in name:
         return "manual_pdf" if suffix == ".pdf" else "manual_docx"
     return "unknown"
 

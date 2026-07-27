@@ -10,7 +10,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -18,6 +17,22 @@ from typing import Any
 
 from .blueprint import FeatureModule, ProductBlueprint
 from .errors import sanitize_error_message
+from .frontend_codegen.legacy_fallback import LEGACY_FALLBACK_VERSION, legacy_cache_key, requires_legacy_fallback
+from .frontend_codegen.page_spec import (
+    COMPONENT_LIBRARY_VERSION,
+    FRONTEND_ENGINE_VERSION,
+    PAGE_SPEC_SCHEMA_VERSION,
+    PageSpecValidationError,
+    page_spec_cache_key,
+    page_spec_manifest,
+)
+from .frontend_codegen.page_spec_renderer import render_page_spec
+from .frontend_codegen.page_spec_request import request_page_spec
+from .frontend_codegen.vite_build import (
+    build_react_vite_bundle as _build_react_vite_bundle,
+    frontend_node_module_root as _frontend_node_module_root,
+    react_build_error_detail as _react_build_error_detail,
+)
 from .llm.provider import (
     LLMProvider,
     LocalTemplateProvider,
@@ -30,6 +45,7 @@ from .llm.provider import (
 )
 from .llm.trace import trace_event
 from .models import GenerationTask
+from .packager import write_json
 from .ui_blueprint import UiBlueprint
 
 
@@ -209,6 +225,7 @@ def _generate_react_frontend_pages(
     react_dir = prototype_dir / "react-app"
     screens_dir = react_dir / "src" / "screens"
     screens_dir.mkdir(parents=True, exist_ok=True)
+    write_json(react_dir / ".frontend-engine.json", page_spec_manifest())
     design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
     context = _codegen_context(task, blueprint, ui_blueprint)
     total = len(screenshots)
@@ -288,22 +305,25 @@ def _generate_react_frontend_pages(
             on_success=record_success,
         )
 
+    renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
     pending_indexes: list[int] = []
     for pending_index, pending_item in enumerate(screenshots, start=1):
         pending_key = str(getattr(pending_item, "key", "") or f"page_{pending_index}")
         pending_token = _react_component_token(pending_key, pending_index)
         pending_creative_key = _page_creative_key(task, design_brief, pending_item)
-        if not _react_component_cache_ready(
-            screens_dir / f"{pending_token}.jsx",
-            screens_dir / f"{pending_token}.css",
-            screens_dir / f"{pending_token}.meta.json",
-            pending_creative_key,
+        if not _frontend_page_cache_ready(
+            component_path=screens_dir / f"{pending_token}.jsx",
+            css_path=screens_dir / f"{pending_token}.css",
+            spec_path=screens_dir / f"{pending_token}.page-spec.json",
+            meta_path=screens_dir / f"{pending_token}.meta.json",
+            creative_key=pending_creative_key,
+            legacy=requires_legacy_fallback(renderer, pending_item),
         ):
             pending_indexes.append(pending_index)
     if pending_indexes and pending_indexes[0] > 1:
         _emit(emit, codegen_progress_start, f"从未完成页面继续 {pending_indexes[0]}/{total}")
     elif not pending_indexes:
-        _emit(emit, codegen_progress_start, f"复用全部 React 页面组件 {total}/{total}")
+        _emit(emit, codegen_progress_start, f"复用全部 PageSpec/React 页面缓存 {total}/{total}")
 
     def build_page(index: int, item: Any) -> dict[str, Any]:
         page_started_at = time.perf_counter()
@@ -314,43 +334,90 @@ def _generate_react_frontend_pages(
         component_name = f"Screen{token}"
         component_path = screens_dir / f"{token}.jsx"
         css_path = screens_dir / f"{token}.css"
+        spec_path = screens_dir / f"{token}.page-spec.json"
         meta_path = screens_dir / f"{token}.meta.json"
         css_scope = _react_css_scope(page_key, index)
         creative_key = _page_creative_key(task, design_brief, item)
         progress = codegen_progress_start + min(4, int(index / max(total, 1) * 4))
-        reused = _react_component_cache_ready(component_path, css_path, meta_path, creative_key)
+        legacy = requires_legacy_fallback(renderer, item)
+        reused = _frontend_page_cache_ready(
+            component_path=component_path,
+            css_path=css_path,
+            spec_path=spec_path,
+            meta_path=meta_path,
+            creative_key=creative_key,
+            legacy=legacy,
+        )
+        module = module_by_key.get(str(getattr(item, "module_key", "") or ""))
+        screen_payload = _page_spec_screen_payload(item)
+        engine = LEGACY_FALLBACK_VERSION if legacy else PAGE_SPEC_SCHEMA_VERSION
+        data: dict[str, str] | None = None
+        if reused and not legacy:
+            cached_spec = _read_json_dict(spec_path)
+            data = render_page_spec(
+                cached_spec,
+                css_scope=css_scope,
+                creative_key=creative_key,
+                renderer=renderer,
+                module=_module_payload(module),
+                screen=screen_payload,
+                visual_identity=design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {},
+                color_contract=visual_style_contract,
+            )
         if not reused:
-            _emit(emit, progress, f"生成 React 界面组件 {index}/{total}")
-            module = module_by_key.get(str(getattr(item, "module_key", "") or ""))
-            data = None
+            _emit(emit, progress, f"生成 {'legacy React' if legacy else 'PageSpec'} 页面 {index}/{total}")
             last_error: Exception | None = None
             try:
                 for quality_attempt in range(2):
                     if stop_event.is_set():
                         raise RuntimeError("React 页面生成已因模型网关错误停止")
                     try:
-                        data = _generate_react_component(
-                            task=task,
-                            blueprint=blueprint,
-                            ui_blueprint=ui_blueprint,
-                            provider=provider,
-                            screenshot=item,
-                            module=module,
-                            visual_reference=style_reference,
-                            visual_style_contract=visual_style_contract,
-                            context=context,
-                            design_brief=design_brief,
-                            index=index,
-                            total=total,
-                            component_name=component_name,
-                            css_scope=css_scope,
-                            creative_key=creative_key,
-                            validation_feedback=sanitize_error_message(last_error, limit=240) if last_error else "",
-                            retry_policy=page_retry_policy(),
-                            cancel_event=stop_event,
-                        )
+                        if legacy:
+                            data = _generate_react_component(
+                                task=task,
+                                blueprint=blueprint,
+                                ui_blueprint=ui_blueprint,
+                                provider=provider,
+                                screenshot=item,
+                                module=module,
+                                visual_reference=style_reference,
+                                visual_style_contract=visual_style_contract,
+                                context=context,
+                                design_brief=design_brief,
+                                index=index,
+                                total=total,
+                                component_name=component_name,
+                                css_scope=css_scope,
+                                creative_key=creative_key,
+                                validation_feedback=sanitize_error_message(last_error, limit=240) if last_error else "",
+                                retry_policy=page_retry_policy(),
+                                cancel_event=stop_event,
+                            )
+                        else:
+                            page_spec = request_page_spec(
+                                provider=provider,
+                                software_context=context,
+                                screen=screen_payload,
+                                module=_module_payload(module),
+                                visual_identity=design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {},
+                                color_contract=visual_style_contract,
+                                validation_feedback=sanitize_error_message(last_error, limit=360) if last_error else "",
+                                retry_policy=page_retry_policy(),
+                                cancel_event=stop_event,
+                            )
+                            data = render_page_spec(
+                                page_spec,
+                                css_scope=css_scope,
+                                creative_key=creative_key,
+                                renderer=renderer,
+                                module=_module_payload(module),
+                                screen=screen_payload,
+                                visual_identity=design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {},
+                                color_contract=visual_style_contract,
+                            )
+                            write_json(spec_path, page_spec)
                         break
-                    except ValueError as exc:
+                    except (PageSpecValidationError, ValueError) as exc:
                         last_error = exc
                         category = classify_text_error(exc)
                         if category in {
@@ -372,11 +439,11 @@ def _generate_react_frontend_pages(
                                 repair_budget=1,
                                 reason=sanitize_error_message(exc, limit=300),
                             )
-                            _emit(emit, progress, f"React 组件格式或质量不合格，定向修复 {page_key} 1/1")
+                            _emit(emit, progress, f"{'React 组件' if legacy else 'PageSpec'} 格式或质量不合格，定向修复 {page_key} 1/1")
                             continue
                         raise
                 if data is None:
-                    raise RuntimeError(f"{page_key} React 组件生成失败：{last_error}") from last_error
+                    raise RuntimeError(f"{page_key} 页面生成失败：{last_error}") from last_error
             except Exception as exc:
                 stop_event.set()
                 trace_event(
@@ -389,15 +456,24 @@ def _generate_react_frontend_pages(
                 raise RuntimeError(
                     f"{page_key} 前端模型请求失败，已停止剩余页面，避免长时间重复等待：{sanitize_error_message(exc)}"
                 ) from exc
+        if data is not None:
             component_path.write_text(
                 f'import React from "react";\nimport "./{token}.css";\n\n'
                 f"export default function {component_name}() {{\n  return (\n{data['jsx']}\n  );\n}}\n",
                 encoding="utf-8",
             )
             css_path.write_text(data["css"], encoding="utf-8")
-            meta_path.write_text(
-                json.dumps({"creative_key": creative_key, "page_key": page_key, "framework": "react-vite"}, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+        if not reused:
+            write_json(
+                meta_path,
+                {
+                    "creative_key": creative_key,
+                    "cache_key": legacy_cache_key(creative_key) if legacy else page_spec_cache_key(creative_key),
+                    "page_key": page_key,
+                    "framework": "react-vite",
+                    "engine": engine,
+                    **({} if legacy else page_spec_manifest()),
+                },
             )
         _sanitize_cached_react_component(component_path)
         _sanitize_cached_react_css(css_path, css_scope)
@@ -423,7 +499,11 @@ def _generate_react_frontend_pages(
                 "interaction_pre_state": str(getattr(item, "interaction_pre_state", "") or ""),
                 "interaction_post_state": str(getattr(item, "interaction_post_state", "") or ""),
                 "interaction_result_evidence": str(getattr(item, "interaction_result_evidence", "") or ""),
-                "source": "react-vite-component",
+                "source": "legacy-react-fallback" if legacy else "page-spec-v1",
+                "engine": engine,
+                "page_spec": str(spec_path) if not legacy else "",
+                "page_spec_schema_version": "" if legacy else PAGE_SPEC_SCHEMA_VERSION,
+                "component_library_version": "" if legacy else COMPONENT_LIBRARY_VERSION,
                 "component": str(component_path),
                 "creative_key": creative_key,
                 "visual_reference": _report_reference_summary(style_reference),
@@ -493,6 +573,8 @@ def _generate_react_frontend_pages(
     imports = [str(item["import"]) for item in results]
     registrations = [str(item["registration"]) for item in results]
     pages = [dict(item["page"]) for item in results]
+    page_spec_count = sum(1 for page in pages if page.get("source") == "page-spec-v1")
+    legacy_react_page_count = sum(1 for page in pages if page.get("source") == "legacy-react-fallback")
     shared_confirmation_page_count = sum(1 for page in pages if bool(page.get("requires_confirmation")))
     request_timings = [
         float(item.get("elapsed_seconds") or 0.0)
@@ -501,6 +583,23 @@ def _generate_react_frontend_pages(
     ]
     with runtime_lock:
         runtime_summary = _frontend_runtime_summary(runtime_state, cancelled_page_count=0)
+    write_json(
+        prototype_dir / "page-spec-manifest.json",
+        {
+            **page_spec_manifest(),
+            "page_spec_count": page_spec_count,
+            "legacy_react_page_count": legacy_react_page_count,
+            "page_count": len(pages),
+            "pages": [
+                {
+                    "page_key": str(page.get("key") or ""),
+                    "engine": str(page.get("engine") or ""),
+                    "source": str(page.get("source") or ""),
+                }
+                for page in pages
+            ],
+        },
+    )
     _write_react_app_files(
         task=task,
         blueprint=blueprint,
@@ -522,11 +621,16 @@ def _generate_react_frontend_pages(
     return {
         "enabled": True,
         "ready": len(pages) == total,
-        "source": "gpt-style-reference-image2-to-react-vite",
+        "source": "gpt-style-reference-image2-to-pagespec-react-vite",
         "framework": "react",
         "build_tool": "vite",
+        "frontend_engine_version": FRONTEND_ENGINE_VERSION,
+        "page_spec_schema_version": PAGE_SPEC_SCHEMA_VERSION,
+        "component_library_version": COMPONENT_LIBRARY_VERSION,
         "renderer": str(getattr(ui_blueprint, "renderer", "") or "admin"),
         "page_count": len(pages),
+        "page_spec_count": page_spec_count,
+        "legacy_react_page_count": legacy_react_page_count,
         "shared_confirmation_contract": "shared-confirm-dialog-v1",
         "shared_confirmation_page_count": shared_confirmation_page_count,
         "shared_confirmation_ready": (react_dir / "src" / "SharedConfirmDialog.jsx").is_file(),
@@ -1148,14 +1252,65 @@ def _react_css_scope(page_key: str, index: int) -> str:
     return f"screen-{token or f'page-{index}'}"
 
 
-def _react_component_cache_ready(component_path: Path, css_path: Path, meta_path: Path, creative_key: str) -> bool:
-    if not component_path.exists() or not css_path.exists() or not meta_path.exists():
+def _frontend_page_cache_ready(
+    *,
+    component_path: Path,
+    css_path: Path,
+    spec_path: Path,
+    meta_path: Path,
+    creative_key: str,
+    legacy: bool,
+) -> bool:
+    meta = _read_json_dict(meta_path)
+    if not meta or str(meta.get("creative_key") or "") != creative_key:
         return False
+    if legacy:
+        return bool(
+            str(meta.get("engine") or "") == LEGACY_FALLBACK_VERSION
+            and str(meta.get("cache_key") or "") == legacy_cache_key(creative_key)
+            and component_path.is_file()
+            and css_path.is_file()
+            and component_path.stat().st_size > 900
+            and css_path.stat().st_size > 500
+        )
+    spec = _read_json_dict(spec_path)
+    return bool(
+        str(meta.get("engine") or "") == PAGE_SPEC_SCHEMA_VERSION
+        and str(meta.get("cache_key") or "") == page_spec_cache_key(creative_key)
+        and str(meta.get("page_spec_schema_version") or "") == PAGE_SPEC_SCHEMA_VERSION
+        and str(meta.get("component_library_version") or "") == COMPONENT_LIBRARY_VERSION
+        and str(spec.get("schema_version") or "") == PAGE_SPEC_SCHEMA_VERSION
+        and str(spec.get("page_key") or "") == str(meta.get("page_key") or "")
+    )
+
+
+def _read_json_dict(path: Path) -> dict[str, Any]:
     try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    return str(meta.get("creative_key") or "") == creative_key and component_path.stat().st_size > 900 and css_path.stat().st_size > 500
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _page_spec_screen_payload(item: Any) -> dict[str, Any]:
+    return {
+        "key": str(getattr(item, "key", "") or ""),
+        "title": str(getattr(item, "title", "") or ""),
+        "caption": str(getattr(item, "caption", "") or ""),
+        "page_kind": str(getattr(item, "page_kind", "") or "general"),
+        "module_key": str(getattr(item, "module_key", "") or ""),
+        "interaction_action": str(getattr(item, "interaction_action", "") or ""),
+        "interaction_mode": str(getattr(item, "interaction_mode", "") or "browse"),
+        "interaction_surface": str(getattr(item, "interaction_surface", "") or "workspace"),
+        "requires_confirmation": bool(getattr(item, "requires_confirmation", False)),
+        "interaction_action_key": str(getattr(item, "interaction_action_key", "") or ""),
+        "interaction_role": str(getattr(item, "interaction_role", "") or ""),
+        "interaction_trigger": str(getattr(item, "interaction_trigger", "") or ""),
+        "interaction_input_fields": list(getattr(item, "interaction_input_fields", None) or []),
+        "interaction_pre_state": str(getattr(item, "interaction_pre_state", "") or ""),
+        "interaction_post_state": str(getattr(item, "interaction_post_state", "") or ""),
+        "interaction_result_evidence": str(getattr(item, "interaction_result_evidence", "") or ""),
+    }
 
 
 def _write_react_app_files(
@@ -1520,57 +1675,6 @@ def _shared_confirm_dialog_css() -> str:
 .shared-confirm-actions .shared-confirm-primary{max-width:280px;overflow:hidden;border-color:var(--shell-accent,#0f766e);background:var(--shell-accent,#0f766e);color:#fff;text-overflow:ellipsis;}
 @media(max-width:760px){.shared-confirm-layer{padding:16px}.shared-confirm-dialog{width:calc(100vw - 32px);height:480px;grid-template-rows:112px minmax(0,1fr) 62px}.shared-confirm-body{padding:14px 16px}.shared-confirm-header,.shared-confirm-actions{padding-left:16px;padding-right:16px}.shared-confirm-summary{grid-template-columns:1fr}.shared-confirm-summary>div:nth-child(n+4){display:none}.shared-confirm-evidence b:nth-of-type(n+4){display:none}}
 '''
-
-
-def _build_react_vite_bundle(react_dir: Path) -> None:
-    electron_node = os.getenv("SOFT_ELECTRON_NODE", "").strip()
-    node = electron_node or shutil.which("node") or shutil.which("node.exe")
-    vite_bin = _frontend_node_module_root() / "vite" / "bin" / "vite.js"
-    if not node or (not vite_bin.exists() and not os.getenv("SOFT_NODE_MODULE_ROOT", "").strip()):
-        raise RuntimeError("缺少随软件提供的 Node/Vite 运行环境，无法构建 React 界面工程")
-    env = dict(os.environ)
-    if electron_node and str(node).lower() == electron_node.lower():
-        env["ELECTRON_RUN_AS_NODE"] = "1"
-    result = subprocess.run(
-        [node, str(vite_bin), "build", "--config", "vite.runtime.config.js"],
-        cwd=str(react_dir),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-        timeout=180,
-        env=env,
-    )
-    if result.returncode != 0:
-        detail = _react_build_error_detail(result.stdout or "")
-        raise RuntimeError(f"React + Vite 界面工程构建失败：{detail[:900]}")
-
-
-def _react_build_error_detail(output: str) -> str:
-    cleaned = re.sub(r"\x1b\[[0-9;]*m", "", str(output or ""))
-    lines = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
-    important: list[str] = []
-    markers = ("error during build", "ERROR:", "file:", "Expected ", "Unexpected ", "Parse failure")
-    for index, line in enumerate(lines):
-        if any(marker.lower() in line.lower() for marker in markers):
-            start = max(0, index - 1)
-            end = min(len(lines), index + 4)
-            for item in lines[start:end]:
-                if re.match(r"\s*at\s", item):
-                    continue
-                if item not in important:
-                    important.append(item)
-    if important:
-        return "\n".join(important)
-    return "\n".join(lines[-8:])
-
-
-def _frontend_node_module_root() -> Path:
-    configured = os.getenv("SOFT_NODE_MODULE_ROOT", "").strip()
-    if configured:
-        return Path(configured)
-    return Path(__file__).resolve().parents[2] / "node_modules"
 
 
 def _publish_react_page_entries(prototype_dir: Path, dist_dir: Path, screenshots: list[Any], *, renderer: str) -> None:

@@ -12,6 +12,7 @@ from generate_materials import _confirmed_outline_from_resume_dir, _seed_from_ou
 from softcopyright.generator import (
     _begin_generation_attempt,
     _delivery_zip_path,
+    _invalidate_legacy_frontend_cache_for_pagespec,
     _load_completed_resume_report,
     _resume_failure_payload,
     _resume_failure_progress,
@@ -104,6 +105,53 @@ class ResumeConfirmedOutlineTests(unittest.TestCase):
 
         self.assertEqual(payload["attempt_id"], "attempt-9")
         self.assertEqual(leftovers, [])
+
+    def test_pagespec_upgrade_invalidates_only_legacy_page_and_screenshot_caches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            source_dir = output_dir / "generated_source"
+            screens_dir = source_dir / "ui-prototype" / "react-app" / "src" / "screens"
+            screens_dir.mkdir(parents=True)
+            for name in ("ScreenA.jsx", "ScreenA.css", "ScreenA.meta.json"):
+                (screens_dir / name).write_text("legacy", encoding="utf-8")
+            blueprint_path = source_dir / "product-blueprint.json"
+            blueprint_path.write_text('{"modules":[]}', encoding="utf-8")
+            reference_path = source_dir / "ui-prototype" / "visual-references" / "style_reference.png"
+            reference_path.parent.mkdir(parents=True)
+            reference_path.write_bytes(b"image2")
+            ui_dir = output_dir / "ui_screenshots"
+            ui_dir.mkdir()
+            (ui_dir / "screen.png").write_bytes(b"old-shot")
+            (ui_dir / "ui_blueprint.json").write_text("{}", encoding="utf-8")
+            (ui_dir / "screenshot-checkpoint.json").write_text("{}", encoding="utf-8")
+
+            result = _invalidate_legacy_frontend_cache_for_pagespec(output_dir)
+
+            self.assertTrue(result["migrated"])
+            self.assertEqual(result["previous_version"], "legacy-react-cache")
+            self.assertFalse(any(screens_dir.iterdir()))
+            self.assertFalse((ui_dir / "screen.png").exists())
+            self.assertFalse((ui_dir / "screenshot-checkpoint.json").exists())
+            self.assertTrue((ui_dir / "ui_blueprint.json").exists())
+            self.assertTrue(blueprint_path.exists())
+            self.assertEqual(reference_path.read_bytes(), b"image2")
+
+    def test_current_pagespec_attempt_keeps_partial_page_cache_for_resume(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            react_dir = output_dir / "generated_source" / "ui-prototype" / "react-app"
+            screens_dir = react_dir / "src" / "screens"
+            screens_dir.mkdir(parents=True)
+            (screens_dir / "ScreenA.page-spec.json").write_text('{"schema_version":"page-spec-v1"}', encoding="utf-8")
+            (react_dir / ".frontend-engine.json").write_text(
+                '{"frontend_engine_version":"pagespec-hybrid-v1"}',
+                encoding="utf-8",
+            )
+
+            result = _invalidate_legacy_frontend_cache_for_pagespec(output_dir)
+
+            self.assertFalse(result["migrated"])
+            self.assertTrue((screens_dir / "ScreenA.page-spec.json").exists())
 
     def test_completed_resume_returns_existing_material_package(self):
         with tempfile.TemporaryDirectory() as temp_dir:

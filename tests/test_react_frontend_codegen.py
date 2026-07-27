@@ -54,6 +54,69 @@ class _ReactProvider:
         self.messages.append(messages)
         content = messages[-1]["content"]
         prompt = content if isinstance(content, str) else content[0]["text"]
+        if "结构化 PageSpec" in prompt or "受控 PageSpec" in prompt:
+            page_key_match = re.search(r'page_key 固定为 "([^"]+)"', prompt)
+            page_kind_match = re.search(r'page_kind 固定为 "([^"]+)"', prompt)
+            action_key_match = re.search(r'"interaction_action_key":\s*"([^"]*)"', prompt)
+            action_match = re.search(r'"interaction_action":\s*"([^"]*)"', prompt)
+            page_key = page_key_match.group(1) if page_key_match else "tasks"
+            page_kind = page_kind_match.group(1) if page_kind_match else "module"
+            action_key = action_key_match.group(1) if action_key_match else ""
+            action_label = action_match.group(1) if action_match and action_match.group(1) else "提交处理"
+            mobile = '"renderer": "mobile_app"' in prompt or "720x1280" in prompt
+            regions = [
+                {
+                    "id": "filters",
+                    "component": "filter_bar",
+                    "title": "任务筛选",
+                    "fields": [{"label": "任务编号", "value": "请输入任务编号"}, {"label": "任务状态", "value": "全部状态"}],
+                },
+                {
+                    "id": "tasks",
+                    "component": "mobile_list" if mobile else "data_table",
+                    "title": "巡检任务清单",
+                    "columns": ["任务编号", "设备名称", "责任班组", "任务状态"],
+                    "items": [
+                        {"label": f"巡检任务 {index}", "value": f"WO-202607-{index:03d}", "owner": "东区巡检组", "status": "进行中"}
+                        for index in range(1, 6)
+                    ],
+                },
+                {
+                    "id": "metrics",
+                    "component": "metric_group",
+                    "title": "任务指标",
+                    "metrics": [{"label": "今日任务", "value": "28"}, {"label": "完成率", "value": "96.4%"}],
+                },
+            ]
+            actions = []
+            contract = {"mode": "browse", "requires_confirmation": False}
+            if action_key:
+                actions = [{"action_key": action_key, "label": action_label, "variant": "primary", "requires_confirmation": '"requires_confirmation": true' in prompt}]
+                contract = {
+                    "mode": "workflow",
+                    "action_key": action_key,
+                    "role": "巡检主管",
+                    "trigger": "任务信息与执行条件核验通过",
+                    "input_fields": ["任务编号", "责任班组"],
+                    "pre_state": "待处理",
+                    "post_state": "已提交",
+                    "result_evidence": "任务状态和操作日志",
+                    "requires_confirmation": '"requires_confirmation": true' in prompt,
+                }
+                regions.append({"id": "result", "component": "operation_result", "title": "操作结果"})
+            return json.dumps(
+                {
+                    "schema_version": "page-spec-v1",
+                    "page_key": page_key,
+                    "page_kind": page_kind,
+                    "layout": "mobile_feed" if mobile else "table_workspace",
+                    "theme": {"density": "comfortable", "accent_variant": "primary"},
+                    "regions": regions,
+                    "actions": actions,
+                    "interaction_contract": contract,
+                },
+                ensure_ascii=False,
+            )
         scope = re.search(r'className="screen-root ([^"]+)"', prompt).group(1)
         creative_key = re.search(r'data-page-structure="([^"]+)"', prompt).group(1)
         cards = "".join(
@@ -435,8 +498,8 @@ class ReactFrontendCodegenTests(unittest.TestCase):
                 "SOFT_ELECTRON_NODE": electron_node,
                 "SOFT_NODE_MODULE_ROOT": r"C:\Program Files\Soft Copyright Generator\resources\app.asar\node_modules",
             },
-        ), patch("backend.softcopyright.ai_frontend_codegen.shutil.which", return_value=system_node), patch(
-            "backend.softcopyright.ai_frontend_codegen.subprocess.run"
+        ), patch("backend.softcopyright.frontend_codegen.vite_build.shutil.which", return_value=system_node), patch(
+            "backend.softcopyright.frontend_codegen.vite_build.subprocess.run"
         ) as run:
             run.return_value.returncode = 0
             run.return_value.stdout = ""
@@ -716,11 +779,14 @@ class ReactFrontendCodegenTests(unittest.TestCase):
             self.assertTrue(report["ready"])
             self.assertEqual(report["framework"], "react")
             self.assertEqual(report["renderer"], "mobile_app")
+            self.assertEqual(report["page_spec_count"], 3)
+            self.assertEqual(report["legacy_react_page_count"], 0)
             self.assertTrue(provider.messages)
             self.assertTrue(all(isinstance(messages[-1]["content"], str) for messages in provider.messages))
             prompts = [messages[-1]["content"] for messages in provider.messages]
-            self.assertTrue(all("按 visual_identity_spec 在组件外层渲染本软件专属的共享外壳" in prompt for prompt in prompts))
-            self.assertTrue(all("一个主要工作区和不超过两个辅助区域" in prompt for prompt in prompts))
+            self.assertTrue(all("结构化 PageSpec" in prompt for prompt in prompts))
+            self.assertTrue(all("不要生成 JSX、CSS、HTML" in prompt for prompt in prompts))
+            self.assertTrue(all("allowed_region_components" in prompt for prompt in prompts))
             initial_request_count = len(provider.messages)
             resumed_messages = []
             resumed_report = generate_ai_frontend_pages(
@@ -742,11 +808,12 @@ class ReactFrontendCodegenTests(unittest.TestCase):
             )
             self.assertTrue(resumed_report["ready"])
             self.assertEqual(len(provider.messages), initial_request_count)
-            self.assertIn("复用全部 React 页面组件 3/3", resumed_messages)
-            self.assertFalse(any("生成 React 界面组件" in message for message in resumed_messages))
+            self.assertIn("复用全部 PageSpec/React 页面缓存 3/3", resumed_messages)
+            self.assertFalse(any("生成 PageSpec 页面" in message for message in resumed_messages))
             self.assertTrue((root / "react-app" / "src" / "App.jsx").exists())
             self.assertTrue((root / "react-app" / "src" / "SharedAppShell.jsx").exists())
             self.assertTrue((root / "react-app" / "src" / "SharedConfirmDialog.jsx").exists())
+            self.assertEqual(len(list((root / "react-app" / "src" / "screens").glob("*.page-spec.json"))), 3)
             app_source = (root / "react-app" / "src" / "App.jsx").read_text(encoding="utf-8")
             self.assertIn("SharedAppShell", app_source)
             self.assertIn("SharedConfirmDialog", app_source)
@@ -762,8 +829,8 @@ class ReactFrontendCodegenTests(unittest.TestCase):
             self.assertIn('data-renderer="mobile_app"', (root / "home.html").read_text(encoding="utf-8"))
             self.assertNotIn("stable-app", (root / "home.html").read_text(encoding="utf-8"))
             quality_text, quality_hits = _ui_screenshot_html_quality({item.key: item for item in screenshots})
-            self.assertIn("今日现场任务", quality_text)
-            self.assertIn("业务对象", quality_text)
+            self.assertIn("巡检任务清单", quality_text)
+            self.assertIn("东区巡检组", quality_text)
             self.assertNotIn("EquipmentAssetRecord", quality_text)
             self.assertNotIn("FaultDiagnosisQuery", quality_text)
             self.assertNotIn("DiagnosisEvidenceTrace", quality_text)
@@ -786,9 +853,9 @@ class ReactFrontendCodegenTests(unittest.TestCase):
                     self.assertEqual(page.locator(".shared-app-header").count(), 1, page_errors)
                     self.assertTrue(page.locator(".shared-app-header").is_visible())
                     self.assertFalse(page.locator(".mobile-header").is_visible())
-                    self.assertIn("今日现场任务", page.locator("body").inner_text())
+                    self.assertIn("巡检任务清单", page.locator("body").inner_text())
                     self.assertNotIn("case_desk", page.locator("body").inner_text())
-                    self.assertEqual(page.locator(".mobile-tabs").count(), 1)
+                    self.assertEqual(page.locator(".shared-app-nav").count(), 1)
                     page.goto(
                         f"http://127.0.0.1:{server.server_port}/field_task_operation_1_1.html",
                         wait_until="networkidle",
@@ -796,11 +863,11 @@ class ReactFrontendCodegenTests(unittest.TestCase):
                     self.assertEqual(page.locator('[data-shared-confirm-dialog="true"]:visible').count(), 1, page_errors)
                     self.assertEqual(page.locator('.screen-root [role="dialog"]:visible').count(), 0, page_errors)
                     self.assertIn("确认下达巡检工单", page.locator(".shared-confirm-dialog").inner_text())
-                    self.assertIn("东区设备巡检组", page.locator(".shared-confirm-dialog").inner_text())
+                    self.assertIn("责任班组", page.locator(".shared-confirm-dialog").inner_text())
                     self.assertIn("确认下达", page.locator(".shared-confirm-primary").inner_text())
                     confirmation_summary = _capture_visible_content_summary(page, screenshots[2])
                     confirmation_crops = _capture_visible_action_crops(page, screenshots[2], root / "capture-review")
-                    self.assertNotIn("今日现场任务", confirmation_summary["visible_text"])
+                    self.assertNotIn("巡检任务清单", confirmation_summary["visible_text"])
                     self.assertIn("取消", confirmation_crops)
                     self.assertTrue(any(label.startswith("确认") for label in confirmation_crops))
                     self.assertFalse(any("任务首页" in label for label in confirmation_crops))

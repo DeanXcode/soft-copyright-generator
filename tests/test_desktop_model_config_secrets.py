@@ -5,6 +5,17 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 MAIN_CJS = ROOT / "desktop" / "electron" / "main.cjs"
 MAIN_JSX = ROOT / "desktop" / "src" / "main.jsx"
+RENDERER_FILES = [
+    MAIN_JSX,
+    ROOT / "desktop" / "src" / "modelOptions.js",
+    ROOT / "desktop" / "src" / "components" / "QueuePanel.jsx",
+    ROOT / "desktop" / "src" / "components" / "SettingsDrawer.jsx",
+    ROOT / "desktop" / "src" / "components" / "ResultReport.jsx",
+]
+
+
+def read_renderer_source() -> str:
+    return "\n".join(path.read_text(encoding="utf-8") for path in RENDERER_FILES)
 
 
 class DesktopModelConfigSecretTests(unittest.TestCase):
@@ -36,7 +47,7 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertNotIn('apiKey: config.SOFT_MODEL_GPT_API_KEY', save_block)
 
     def test_desktop_uses_write_only_secret_inputs(self):
-        source = MAIN_JSX.read_text(encoding="utf-8")
+        source = read_renderer_source()
 
         self.assertIn("更换请求地址（留空则保持不变）", source)
         self.assertIn("请求地址状态", source)
@@ -64,7 +75,7 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
 
     def test_multiple_text_providers_have_separate_secret_slots_and_hidden_presets(self):
         main_source = MAIN_CJS.read_text(encoding="utf-8")
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
         save_block = main_source.split('ipcMain.handle("save-model-config"', 1)[1].split('ipcMain.handle("open-path"', 1)[0]
 
         for provider in ("grok", "claude", "gemini", "deepseek"):
@@ -90,8 +101,16 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertIn('检测到上次运行中断，当前没有活动生成进程', source)
         self.assertIn('上次任务标记完成，但材料包文件不存在', source)
 
+    def test_recovery_card_warns_when_pagespec_engine_invalidates_legacy_pages(self):
+        main_source = MAIN_CJS.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
+
+        self.assertIn('const FRONTEND_ENGINE_VERSION = "pagespec-hybrid-v1";', main_source)
+        self.assertIn('pageEngineUpgradeRequired', main_source)
+        self.assertIn('页面生成引擎已升级，将复用蓝图和参考图并重新生成全部界面', renderer_source)
+
     def test_default_name_only_flow_auto_confirms_blueprint_and_keeps_review_option(self):
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
 
         self.assertIn('blueprintReviewBeforeGeneration: false', renderer_source)
         self.assertIn('enqueueQuickTask(currentPromptText)', renderer_source)
@@ -102,14 +121,14 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertNotIn('"确认模块"', renderer_source)
 
     def test_name_inference_operation_contract_is_preserved_for_backend_reuse(self):
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
 
         self.assertIn('operationSpecs: normalizeOperationSpecs', renderer_source)
         self.assertIn('operationSpecs: module.operationSpecs', renderer_source)
         self.assertIn('resultEvidence:', renderer_source)
 
     def test_default_template_is_visible_and_clears_model_credentials_for_generation(self):
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
         main_source = MAIN_CJS.read_text(encoding="utf-8")
         generate_block = main_source.split('ipcMain.handle("generate-materials"', 1)[1].split(
             'ipcMain.handle("infer-feature-hint"', 1
@@ -127,7 +146,7 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
     def test_model_catalog_is_loaded_in_main_process(self):
         main_source = MAIN_CJS.read_text(encoding="utf-8")
         preload_source = (ROOT / "desktop" / "electron" / "preload.cjs").read_text(encoding="utf-8")
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
 
         self.assertIn('ipcMain.handle("list-available-models"', main_source)
         self.assertIn('Authorization: `Bearer ${apiKey}`', main_source)
@@ -139,7 +158,7 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertIn("refreshAvailableModels", renderer_source)
 
     def test_model_fallback_choices_are_scoped_to_selected_provider(self):
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
 
         self.assertIn("const providerModelChoices =", renderer_source)
         self.assertIn('grok: ["grok-3-mini"]', renderer_source)
@@ -150,7 +169,7 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertNotIn('...modelChoices].filter(Boolean))];', renderer_source)
 
     def test_settings_has_single_animated_header_entry(self):
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
         style_source = (ROOT / "desktop" / "src" / "styles.css").read_text(encoding="utf-8")
 
         self.assertNotIn("<Settings2", renderer_source)
@@ -160,7 +179,7 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertIn(".drawer-backdrop.open .settings-drawer", style_source)
 
     def test_brand_refresh_has_workflow_and_result_hero(self):
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
         style_source = (ROOT / "desktop" / "src" / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn('import appIcon from "../../build/icon.png"', renderer_source)
@@ -171,7 +190,7 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertIn(".result-hero", style_source)
 
     def test_brand_refresh_phase_two_hierarchy(self):
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
         style_source = (ROOT / "desktop" / "src" / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn('className="queue-brand-mark"', renderer_source)
@@ -183,7 +202,7 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertIn("@keyframes brandPulse", style_source)
 
     def test_semantic_icons_replace_repeated_brand_marks(self):
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
         style_source = (ROOT / "desktop" / "src" / "styles.css").read_text(encoding="utf-8")
 
         self.assertEqual(renderer_source.count("<img src={appIcon}"), 1)
@@ -195,7 +214,7 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
 
     def test_packaged_frontend_runtime_uses_unpacked_esbuild_and_separate_model(self):
         main_source = MAIN_CJS.read_text(encoding="utf-8")
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
 
         self.assertIn('function packagedEsbuildBinaryPath()', main_source)
         self.assertIn('"app.asar.unpacked", "node_modules", "@esbuild", "win32-x64", "esbuild.exe"', main_source)
@@ -207,7 +226,7 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertIn('onUpdateModelConfig("frontendModelName"', renderer_source)
 
     def test_process_detail_nodes_have_completed_and_in_progress_states(self):
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
         style_source = (ROOT / "desktop" / "src" / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn('const rowState = latestRow && ["planning", "running"].includes(status) ? "in-progress" : "completed";', renderer_source)
@@ -218,7 +237,7 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertNotIn(".process-text-dot.plan", style_source)
 
     def test_process_detail_does_not_expose_raw_runtime_log(self):
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
         style_source = (ROOT / "desktop" / "src" / "styles.css").read_text(encoding="utf-8")
 
         self.assertNotIn("原始运行日志", renderer_source)
@@ -227,7 +246,7 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         self.assertNotIn(".log-view", style_source)
 
     def test_progress_done_event_cannot_create_an_empty_success_result(self):
-        renderer_source = MAIN_JSX.read_text(encoding="utf-8")
+        renderer_source = read_renderer_source()
         result_block = renderer_source.split("function resultFromGenerationEvent", 1)[1].split("function seedFromOutputDir", 1)[0]
 
         self.assertIn('if (!event.result || typeof event.result !== "object") return null;', result_block)
