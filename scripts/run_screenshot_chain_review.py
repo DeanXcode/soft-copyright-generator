@@ -16,7 +16,6 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-from softcopyright.blueprint import generate_blueprint  # noqa: E402
 from softcopyright.generator import _material_consistency_checks  # noqa: E402
 from softcopyright.llm.provider import build_provider, config_from_env  # noqa: E402
 from softcopyright.llm_blueprint import generate_blueprint_with_llm  # noqa: E402
@@ -25,13 +24,14 @@ from softcopyright.packager import write_json  # noqa: E402
 from softcopyright.screenshots import generate_ui_screenshots  # noqa: E402
 from softcopyright.sourcegen import generate_source_project, source_project_stats  # noqa: E402
 from softcopyright.ui_blueprint import ui_matches_software_type  # noqa: E402
+from softcopyright.ui_roles import role_coverage_summary  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate source + UI prototype + screenshots without Word/PDF packaging.")
     parser.add_argument("--task-file", help="UTF-8 JSON task file. Prefer this when task text contains Chinese.")
     parser.add_argument("--output-root", default="output-screenshot-chain-review")
-    parser.add_argument("--model-provider", default="local-template", help="local-template or gpt/custom/openai-compatible.")
+    parser.add_argument("--model-provider", default="custom", help="GPT/OpenAI-compatible provider.")
     parser.add_argument("--software-name", default="Screenshot Chain Review System")
     parser.add_argument("--version", default="V1.0")
     parser.add_argument("--language", default="Java")
@@ -70,7 +70,9 @@ def load_task_spec(args: argparse.Namespace) -> dict:
 def build_task(args: argparse.Namespace, spec: dict) -> GenerationTask:
     seed = spec.get("seed")
     model_provider = _normalize_provider(str(spec.get("model_provider") or args.model_provider))
-    default_model_name = os.environ.get("SOFT_MODEL_GPT_NAME", "gpt-4o-mini") if _uses_llm(model_provider) else "template-v1"
+    if not _uses_llm(model_provider):
+        raise ValueError("当前截图链路验收要求使用 GPT/OpenAI-compatible，不再支持 local-template。")
+    default_model_name = os.environ.get("SOFT_MODEL_GPT_NAME", "gpt-5.5")
     kwargs = {
         "software_name": str(spec.get("software_name") or args.software_name),
         "version": str(spec.get("version") or args.version),
@@ -107,30 +109,26 @@ def main() -> int:
         print("EVENT_JSON:" + json.dumps(event, ensure_ascii=False), flush=True)
 
     provider = None
-    blueprint_source = "local-template"
+    blueprint_source = "llm"
     trace_path = output_dir / "llm_trace.jsonl"
     previous_trace_path = os.environ.get("SOFT_LLM_TRACE_PATH")
     try:
-        if _uses_llm(task.model_provider):
-            os.environ["SOFT_LLM_TRACE_PATH"] = str(trace_path)
-            llm_config = config_from_env(
-                provider=task.model_provider,
-                model=task.model_name,
-                base_url=os.environ.get("SOFT_MODEL_GPT_BASE_URL", ""),
-                api_key=os.environ.get("SOFT_MODEL_GPT_API_KEY", ""),
-            )
-            task.llm_api_key_configured = bool(llm_config.api_key)
-            provider = build_provider(llm_config)
-            blueprint = generate_blueprint_with_llm(
-                task,
-                provider,
-                emit=lambda progress, message, **extra: emit("blueprint", progress, message, **extra),
-            )
-            if blueprint is None:
-                raise RuntimeError("GPT blueprint was not generated")
-            blueprint_source = "llm"
-        else:
-            blueprint = generate_blueprint(task)
+        os.environ["SOFT_LLM_TRACE_PATH"] = str(trace_path)
+        llm_config = config_from_env(
+            provider=task.model_provider,
+            model=task.model_name,
+            base_url=os.environ.get("SOFT_MODEL_GPT_BASE_URL", ""),
+            api_key=os.environ.get("SOFT_MODEL_GPT_API_KEY", ""),
+        )
+        task.llm_api_key_configured = bool(llm_config.api_key)
+        provider = build_provider(llm_config)
+        blueprint = generate_blueprint_with_llm(
+            task,
+            provider,
+            emit=lambda progress, message, **extra: emit("blueprint", progress, message, **extra),
+        )
+        if blueprint is None:
+            raise RuntimeError("GPT blueprint was not generated")
 
         emit("source", 32, "生成源码项目")
         source_info = generate_source_project(task, blueprint, output_dir)
@@ -143,6 +141,7 @@ def main() -> int:
             source_info=source_info,
             emit=lambda progress, message, **extra: emit("screenshots", progress, message, **extra),
             use_project_server=bool(spec.get("project_server") or args.project_server),
+            require_llm_blueprint=True,
         )
         source_info.update(source_project_stats(Path(source_info["source_dir"])))
     except Exception as exc:
@@ -238,6 +237,18 @@ def _checks(
         "ui_screenshot_base_url": source_info.get("ui_screenshot_base_url", "") if isinstance(source_info, dict) else "",
         "ui_project_server_started": bool(source_info.get("ui_project_server_started")) if isinstance(source_info, dict) else False,
     }
+    role_summary = role_coverage_summary(ui_blueprint)
+    checks.update(
+        {
+            "ui_role_signature": role_summary.get("signature", ""),
+            "ui_role_count": role_summary.get("expected_role_count", 0),
+            "ui_role_screen_count": role_summary.get("screen_count", 0),
+            "ui_role_module_screen_count": role_summary.get("module_screen_count", 0),
+            "ui_role_has_login": role_summary.get("has_login", False),
+            "ui_role_has_dashboard": role_summary.get("has_dashboard", False),
+            "ui_role_has_statistics": role_summary.get("has_statistics", False),
+        }
+    )
     if ui_blueprint.renderer == "game":
         checks["ui_screenshot_aspect_ratio"] = "9:16"
         checks["ui_mobile_portrait_match"] = bool(dimensions) and all(
@@ -281,7 +292,7 @@ def _normalize_provider(provider: str) -> str:
     lowered = (provider or "").strip().lower()
     if lowered in {"gpt", "newapi", "openai-compatible"}:
         return "custom"
-    return lowered or "local-template"
+    return lowered or "custom"
 
 
 def _safe_task_dict(task: GenerationTask) -> dict:

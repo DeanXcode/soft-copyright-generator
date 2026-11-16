@@ -6,10 +6,95 @@ import re
 from pathlib import Path
 
 from .blueprint import ProductBlueprint, FeatureModule
+from .domain_profile import build_domain_profile
 from .models import GenerationTask
 
 
-def generate_source_project(task: GenerationTask, blueprint: ProductBlueprint, output_dir: Path) -> dict:
+SOURCE_MATERIAL_ORDER_FILE = ".source-material-order.json"
+SOURCE_MATERIAL_SUFFIXES = {
+    ".java",
+    ".xml",
+    ".py",
+    ".js",
+    ".ts",
+    ".php",
+    ".cs",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".html",
+    ".css",
+    ".sql",
+    ".yml",
+    ".yaml",
+    ".properties",
+}
+
+
+def repair_generated_business_record_labels(source_dir: Path) -> int:
+    """Migrate old generated service defaults that could leak generic labels into UI data."""
+    changed = 0
+    pattern = re.compile(
+        r"(name:\s*payload\.name\s*\|\|\s*[\"'])([^\"']*?)业务记录([\"'])"
+    )
+    seeded_pattern = re.compile(r"([\"'])([^\"'\r\n]*?)记录(\d{2,})([\"'])")
+    for path in source_dir.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in {".js", ".ts", ".py"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        updated, count = pattern.subn(r"\1\2对象\3", text)
+        updated, seeded_count = seeded_pattern.subn(r"\1\2对象\3\4", updated)
+        count += seeded_count
+        if count:
+            path.write_text(updated, encoding="utf-8")
+            changed += count
+    return changed
+
+
+def repair_generated_domain_sample_leaks(source_dir: Path, blueprint: ProductBlueprint) -> int:
+    """Replace transport-only seed values in cached non-transport JS services."""
+    if build_domain_profile(blueprint=blueprint).requires_route_topology:
+        return 0
+    modules_by_token = {_snake(module.key): module for module in (getattr(blueprint, "modules", []) or [])}
+    changed = 0
+    for path in source_dir.rglob("*Service.js"):
+        if not path.is_file():
+            continue
+        token = path.stem[:-7] if path.stem.endswith("Service") else ""
+        module = modules_by_token.get(token)
+        if module is None or _is_transport_module(module):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        updated = text
+        regions = _business_record_regions(module, [str(item) for item in (module.data_fields or [])])
+        for index in range(1, 5):
+            replacements = {
+                _transport_node_sequence(index): _business_process_sequence(module, index),
+                ["北向", "南向", "双向", "东向"][index - 1]: _business_direction(index),
+                _transport_service_scope(index): regions[(index - 1) % len(regions)],
+            }
+            for old, new in replacements.items():
+                occurrence_count = updated.count(old)
+                if occurrence_count:
+                    updated = updated.replace(old, new)
+                    changed += occurrence_count
+        if updated != text:
+            path.write_text(updated, encoding="utf-8")
+    return changed
+
+
+def generate_source_project(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    output_dir: Path,
+    visual_reference_report: dict | None = None,
+) -> dict:
     source_dir = output_dir / "generated_source"
     source_dir.mkdir(parents=True, exist_ok=True)
 
@@ -18,6 +103,9 @@ def generate_source_project(task: GenerationTask, blueprint: ProductBlueprint, o
     files: list[Path] = []
     if source_strategy == "java_with_web_console":
         files.extend(_generate_java_project(task, blueprint, source_dir))
+        files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
+    elif source_strategy == "csharp_web_api":
+        files.extend(_generate_csharp_project(task, blueprint, source_dir))
         files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
     elif source_strategy == "javascript_with_java_api":
         files.extend(_generate_javascript_project(task, blueprint, source_dir))
@@ -30,12 +118,16 @@ def generate_source_project(task: GenerationTask, blueprint: ProductBlueprint, o
         files.extend(_generate_javascript_project(task, blueprint, source_dir / "gateway-service", include_readme=False))
     elif source_strategy == "embedded_mixed":
         files.extend(_generate_embedded_mixed_project(task, blueprint, source_dir))
+        files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
     elif source_strategy == "system_service_mixed":
         files.extend(_generate_system_service_project(task, blueprint, source_dir))
+        files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
     elif task.language == "Java":
         files.extend(_generate_java_project(task, blueprint, source_dir))
+        files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
     elif task.language == "C#":
         files.extend(_generate_csharp_project(task, blueprint, source_dir))
+        files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
     elif task.language == "Python":
         files.extend(_generate_python_project(task, blueprint, source_dir))
     elif task.language == "JavaScript":
@@ -43,9 +135,27 @@ def generate_source_project(task: GenerationTask, blueprint: ProductBlueprint, o
     else:
         files.extend(_generate_generic_project(task, blueprint, source_dir))
 
+    material_order_path = _write_source_material_order_manifest(source_dir)
     blueprint_path = _write(source_dir / "product-blueprint.json", json.dumps(blueprint.to_dict(), ensure_ascii=False, indent=2))
     files.append(blueprint_path)
+    visual_contract_path = _write_visual_reference_contract(source_dir, visual_reference_report)
+    if visual_contract_path:
+        files.append(visual_contract_path)
     total_lines = sum(_count_lines(path) for path in files)
+    relative_files = [path.relative_to(source_dir).as_posix() for path in files if path.exists()]
+    persistence_required = source_strategy == "python_with_web_console" or task.language == "Python"
+    repository_files = [path for path in relative_files if "/repositories/" in f"/{path}"]
+    migration_files = [path for path in relative_files if path.startswith("migrations/")]
+    test_files = [path for path in relative_files if path.startswith("tests/") and path.endswith(".py")]
+    persistence_ready = (
+        not persistence_required
+        or (
+            "app/core/database.py" in relative_files
+            and bool(repository_files)
+            and bool(migration_files)
+            and bool(test_files)
+        )
+    )
     return {
         "source_dir": str(source_dir),
         "files": [str(path) for path in files],
@@ -55,36 +165,39 @@ def generate_source_project(task: GenerationTask, blueprint: ProductBlueprint, o
         "technical_architecture": architecture,
         "source_language": architecture.get("source_language") or task.language,
         "source_strategy": source_strategy or "language-single",
+        "material_order_manifest": str(material_order_path),
+        "material_order_strategy": "front-core-middle-support-tail-core",
+        "visual_reference_contract": str(visual_contract_path) if visual_contract_path else "",
         "total_lines": total_lines,
+        "source_persistence_required": persistence_required,
+        "source_persistence_engine": "sqlite" if persistence_required else "",
+        "source_persistence_ready": persistence_ready,
+        "source_repository_file_count": len(repository_files),
+        "source_migration_file_count": len(migration_files),
+        "source_test_file_count": len(test_files),
     }
+
+
+def refresh_generated_source_metadata(task: GenerationTask, blueprint: ProductBlueprint, source_info: dict) -> None:
+    source_dir = Path(str(source_info.get("source_dir") or ""))
+    if not source_dir.is_dir():
+        return
+    blueprint_path = _write(
+        source_dir / "product-blueprint.json",
+        json.dumps(blueprint.to_dict(), ensure_ascii=False, indent=2),
+    )
+    _write(source_dir / "README.md", _readme(task, blueprint))
+    architecture = getattr(blueprint, "technical_architecture", {}) or {}
+    source_info["blueprint_path"] = str(blueprint_path)
+    source_info["technical_architecture"] = architecture
+    source_info["source_language"] = architecture.get("source_language") or task.language
+    source_info["source_strategy"] = architecture.get("source_strategy") or source_info.get("source_strategy") or "language-single"
 
 
 def read_source_line_entries(source_dir: Path) -> list[dict]:
-    allowed = {
-        ".java",
-        ".xml",
-        ".py",
-        ".js",
-        ".ts",
-        ".php",
-        ".cs",
-        ".cpp",
-        ".h",
-        ".hpp",
-        ".html",
-        ".css",
-        ".sql",
-        ".yml",
-        ".yaml",
-        ".properties",
-    }
     entries: list[dict] = []
-    for path in sorted(source_dir.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in allowed:
-            continue
+    for order_index, path in enumerate(_ordered_source_material_paths(source_dir, SOURCE_MATERIAL_SUFFIXES), start=1):
         relative = path.relative_to(source_dir).as_posix()
-        if _is_duplicate_served_prototype(relative) or _is_internal_material_file(relative):
-            continue
         try:
             content = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -97,6 +210,7 @@ def read_source_line_entries(source_dir: Path) -> list[dict]:
                         "file": relative,
                         "line": line_number,
                         "text": sanitized,
+                        "order_index": order_index,
                     }
                 )
     return entries
@@ -116,7 +230,9 @@ def source_project_stats(source_dir: Path) -> dict:
     files = [
         str(path)
         for path in sorted(source_dir.rglob("*"))
-        if path.is_file() and not _is_duplicate_served_prototype(path.relative_to(source_dir).as_posix())
+        if path.is_file()
+        and not _is_duplicate_served_prototype(path.relative_to(source_dir).as_posix())
+        and not _is_internal_material_file(path.relative_to(source_dir).as_posix())
     ]
     return {
         "files": files,
@@ -124,11 +240,256 @@ def source_project_stats(source_dir: Path) -> dict:
     }
 
 
+def _write_visual_reference_contract(source_dir: Path, visual_reference_report: dict | None) -> Path | None:
+    if not isinstance(visual_reference_report, dict) or not visual_reference_report.get("ready"):
+        return None
+    style_reference = visual_reference_report.get("style_reference")
+    if not isinstance(style_reference, dict):
+        style_reference = {}
+    payload = {
+        "version": "2026-07-08",
+        "generation_order": "visual_reference_before_source_project",
+        "mode": visual_reference_report.get("mode", ""),
+        "source": visual_reference_report.get("source", ""),
+        "image_model": visual_reference_report.get("image_model", ""),
+        "image_size": visual_reference_report.get("image_size", ""),
+        "style_reference": {
+            "image_path": style_reference.get("image_path", ""),
+            "image_sha256": style_reference.get("image_sha256", ""),
+            "image_width": style_reference.get("image_width", 0),
+            "image_height": style_reference.get("image_height", 0),
+            "prompt_summary": style_reference.get("prompt_summary", ""),
+        },
+        "usage": "The source project and runnable UI prototype are generated after this visual reference is ready.",
+    }
+    return _write(source_dir / "ui-visual-reference-contract.json", json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _write_source_material_order_manifest(source_dir: Path) -> Path:
+    ordered_paths = _heuristic_source_material_paths(source_dir, SOURCE_MATERIAL_SUFFIXES)
+    files = []
+    for index, path in enumerate(ordered_paths, start=1):
+        relative = path.relative_to(source_dir).as_posix()
+        files.append(
+            {
+                "order": index,
+                "path": relative,
+                "tier": _source_material_tier(relative),
+                "lines": _count_lines(path),
+            }
+        )
+    manifest = {
+        "version": "2026-06-30",
+        "strategy": "front-core-middle-support-tail-core",
+        "description": "Internal source material reading order. Core business files are split between the front and tail so first/last 30-page extraction remains useful.",
+        "files": files,
+    }
+    path = source_dir / SOURCE_MATERIAL_ORDER_FILE
+    return _write(path, json.dumps(manifest, ensure_ascii=False, indent=2))
+
+
+def _ordered_source_material_paths(source_dir: Path, allowed: set[str]) -> list[Path]:
+    candidates = _source_material_candidate_paths(source_dir, allowed)
+    candidate_by_relative = {path.relative_to(source_dir).as_posix(): path for path in candidates}
+    manifest_order = _read_source_material_order_manifest(source_dir, candidate_by_relative)
+    if not manifest_order:
+        return _heuristic_source_material_paths(source_dir, allowed)
+    # The manifest is written immediately after the runnable business project
+    # is generated. Later screenshot/React assets must not silently enter the
+    # last 30 source-material pages merely because they share a source suffix.
+    return manifest_order
+
+
+def _read_source_material_order_manifest(source_dir: Path, candidate_by_relative: dict[str, Path]) -> list[Path]:
+    path = source_dir / SOURCE_MATERIAL_ORDER_FILE
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, list):
+        return []
+    result: list[Path] = []
+    seen: set[str] = set()
+    for item in files:
+        relative = str(item.get("path") if isinstance(item, dict) else item).replace("\\", "/").strip()
+        if not relative or relative in seen:
+            continue
+        path = candidate_by_relative.get(relative)
+        if path and path.exists():
+            result.append(path)
+            seen.add(relative)
+    return result
+
+
+def _heuristic_source_material_paths(source_dir: Path, allowed: set[str]) -> list[Path]:
+    return _arrange_source_material_paths(_source_material_candidate_paths(source_dir, allowed), source_dir)
+
+
+def _source_material_candidate_paths(source_dir: Path, allowed: set[str]) -> list[Path]:
+    candidates: list[Path] = []
+    if not source_dir.exists():
+        return candidates
+    for path in sorted(source_dir.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in allowed:
+            continue
+        relative = path.relative_to(source_dir).as_posix()
+        if _is_duplicate_served_prototype(relative) or _is_internal_material_file(relative):
+            continue
+        if _is_prototype_landing_entry(path, relative):
+            continue
+        if "node_modules/" in relative or "/vendor/" in relative:
+            continue
+        candidates.append(path)
+    return candidates
+
+
+def _arrange_source_material_paths(paths: list[Path], source_dir: Path) -> list[Path]:
+    core = [path for path in paths if _source_material_tier(path.relative_to(source_dir).as_posix()) == "core"]
+    support = [path for path in paths if _source_material_tier(path.relative_to(source_dir).as_posix()) != "core"]
+    core.sort(key=lambda path: _source_material_sort_key(path.relative_to(source_dir).as_posix()))
+    support.sort(key=lambda path: _source_material_sort_key(path.relative_to(source_dir).as_posix()))
+    front_core, tail_core = _split_core_material_paths(core, tail_effective_line_target=1700)
+    return front_core + support + tail_core
+
+
+def _split_core_material_paths(core: list[Path], tail_effective_line_target: int) -> tuple[list[Path], list[Path]]:
+    if not core:
+        return [], []
+    effective_counts = {path: _source_material_effective_line_count(path) for path in core}
+    total_effective = sum(effective_counts.values())
+    if total_effective <= tail_effective_line_target * 2:
+        front_core: list[Path] = []
+        tail_core: list[Path] = []
+        for index, path in enumerate(core):
+            if index % 2 == 0:
+                front_core.append(path)
+            else:
+                tail_core.append(path)
+        return front_core, tail_core
+
+    tail_core_reversed: list[Path] = []
+    tail_lines = 0
+    for path in reversed(core):
+        tail_core_reversed.append(path)
+        tail_lines += effective_counts.get(path, 0)
+        if tail_lines >= tail_effective_line_target:
+            break
+    tail_core = list(reversed(tail_core_reversed))
+    tail_set = set(tail_core)
+    front_core = [path for path in core if path not in tail_set]
+    return front_core, tail_core
+
+
+def _source_material_effective_line_count(path: Path) -> int:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        content = path.read_text(encoding="gbk", errors="ignore")
+    except Exception:
+        return 0
+    count = 0
+    suffix = path.suffix.lower()
+    for line in content.splitlines():
+        sanitized = _sanitize_source_material_line(line.rstrip())
+        if sanitized.strip() and not _is_comment_only_source_line(sanitized, suffix):
+            count += 1
+    return count
+
+
+def _source_material_tier(relative: str) -> str:
+    normalized = relative.replace("\\", "/").lower()
+    core_parts = (
+        "/service/",
+        "/services/",
+        "/controller/",
+        "/controllers/",
+        "/repository/",
+        "/repositories/",
+        "/mapper/",
+        "/routers/",
+        "/routes/",
+        "/api/",
+        "/workflow/",
+        "/business/",
+        "/admin_cli/",
+        "/edge/services/",
+        "/firmware/src/",
+        "/system/src/",
+    )
+    core_names = (
+        "service",
+        "controller",
+        "repository",
+        "router",
+        "route",
+        "mapper",
+        "workflow",
+        "operationtrace",
+        "businessworkflow",
+        "manager",
+        "worker",
+        "command",
+        "daemon",
+        "driver",
+    )
+    if any(part in normalized for part in core_parts):
+        return "core"
+    stem = Path(normalized).stem
+    if any(name in stem for name in core_names):
+        return "core"
+    return "support"
+
+
+def _source_material_sort_key(relative: str) -> tuple[int, str]:
+    normalized = relative.replace("\\", "/").lower()
+    priority = 50
+    weighted_parts = [
+        ("/service/", 1),
+        ("/services/", 1),
+        ("businessworkflow", 2),
+        ("operationtrace", 3),
+        ("/controller/", 4),
+        ("/controllers/", 4),
+        ("/routers/", 5),
+        ("/routes/", 5),
+        ("/repository/", 6),
+        ("/repositories/", 6),
+        ("/mapper/", 7),
+        ("/firmware/src/", 8),
+        ("/system/src/", 8),
+        ("/edge/services/", 9),
+        ("/admin_cli/", 9),
+        ("/models/", 20),
+        ("/domain/", 20),
+        ("/dto/", 22),
+        ("/queries/", 22),
+        ("/schemas/", 22),
+        ("/common/", 24),
+        ("/config/", 25),
+        ("/configuration/", 25),
+        ("/resources/", 28),
+        ("/src/", 30),
+    ]
+    for marker, value in weighted_parts:
+        if marker in normalized:
+            priority = min(priority, value)
+    if normalized.endswith(("pom.xml", ".csproj", "package.json", "requirements.txt", "cmakelists.txt")):
+        priority = 35
+    return (priority, normalized)
+
+
 def _is_duplicate_served_prototype(relative: str) -> bool:
-    normalized = relative.replace("\\", "/")
-    return (
-        normalized.startswith("src/main/resources/static/ui-prototype/")
-        or normalized.startswith("wwwroot/ui-prototype/")
+    normalized = relative.replace("\\", "/").lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "ui-prototype/",
+            "src/main/resources/static/ui-prototype/",
+            "wwwroot/ui-prototype/",
+        )
     )
 
 
@@ -136,8 +497,33 @@ def _is_internal_material_file(relative: str) -> bool:
     normalized = relative.replace("\\", "/")
     name = Path(normalized).name.lower()
     return (
-        name in {"readme.md", "ui_prototype_entry.md", "product-blueprint.json", "prototype-manifest.json"}
+        name in {
+            "readme.md",
+            "ui_prototype_entry.md",
+            "product-blueprint.json",
+            "prototype-manifest.json",
+            SOURCE_MATERIAL_ORDER_FILE,
+        }
         or normalized.startswith("ui-prototype/")
+    )
+
+
+def _is_prototype_landing_entry(path: Path, relative: str) -> bool:
+    normalized = relative.replace("\\", "/").lower()
+    if not normalized.endswith("index.html"):
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    compact = re.sub(r"\s+", " ", text).lower()
+    return (
+        "/ui-prototype/index.html" in compact
+        and (
+            "http-equiv=\"refresh\"" in compact
+            or "http-equiv='refresh'" in compact
+            or "打开运行界面" in text
+        )
     )
 
 
@@ -201,12 +587,33 @@ def _generate_java_project(task: GenerationTask, blueprint: ProductBlueprint, so
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.view.RedirectView;
 
 @SpringBootApplication
 public class {app_class} {{
     public static void main(String[] args) {{
         SpringApplication.run({app_class}.class, args);
     }}
+
+    @RestController
+    public static class RuntimeController {{
+        @GetMapping("/health")
+        public java.util.Map<String, String> health() {{
+            return java.util.Map.of(
+                    "status", "ok",
+                    "software", "{_java_literal(task.software_name)}",
+                    "version", "{_java_literal(task.version)}");
+        }}
+
+        @GetMapping("/")
+        public RedirectView index() {{
+            return new RedirectView("/ui-prototype/index.html");
+        }}
+    }}
+
+{_java_runtime_module_controllers(blueprint)}
 }}
 """,
         )
@@ -216,14 +623,18 @@ public class {app_class} {{
         _write(
             resources / "application.yml",
             f"""server:
-  port: 8080
+  port: ${{PORT:8080}}
 spring:
   application:
     name: {_ascii_token(task.software_name)}-service
   datasource:
-    url: jdbc:mysql://localhost:3306/{_ascii_token(task.software_name)}?useUnicode=true&characterEncoding=utf8
-    username: root
-    password: root
+    url: jdbc:h2:mem:{_ascii_token(task.software_name)};MODE=MySQL;DB_CLOSE_DELAY=-1
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  sql:
+    init:
+      mode: never
 software:
   name: "{task.software_name}"
   version: "{task.version}"
@@ -258,6 +669,11 @@ software:
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>runtime</scope>
+        </dependency>
     </dependencies>
     <build>
         <plugins>
@@ -281,7 +697,7 @@ software:
     if include_readme:
         files.append(_write(source_dir / "README.md", _readme(task, blueprint)))
     files.append(_write(resources / "schema.sql", _java_schema_sql(blueprint)))
-    files = _ensure_line_target(files, java_root, task, blueprint, target_lines=3200)
+    files = _ensure_line_target(files, java_root, task, blueprint, target_lines=3400)
     files = _align_source_material_pages(files, source_dir, java_root / "service", ".java")
     return files
 
@@ -385,6 +801,36 @@ public class SoftwareProfile {{
 """,
         ),
     ]
+
+
+def _java_runtime_module_controllers(blueprint: ProductBlueprint) -> str:
+    blocks: list[str] = []
+    for module in blueprint.modules[:16]:
+        route = _snake(module.key).replace("_", "-")
+        title = _json_literal(module.title)
+        description = _json_literal(module.description)
+        field_values = ", ".join(_json_literal(item) for item in (module.data_fields[:4] or ["业务编号", "业务名称", "状态"]))
+        operation_values = ", ".join(_json_literal(item) for item in (module.operations[:4] or ["查询", "新增", "编辑", "导出"]))
+        class_name = f"{_pascal(module.key)}RuntimeController"
+        blocks.append(
+            f"""
+    @RestController
+    public static class {class_name} {{
+        @GetMapping("/api/{route}")
+        public java.util.Map<String, Object> list() {{
+            return java.util.Map.of(
+                    "module", {title},
+                    "description", {description},
+                    "fields", java.util.List.of({field_values}),
+                    "operations", java.util.List.of({operation_values}),
+                    "records", java.util.List.of(
+                            java.util.Map.of("code", "{_snake(module.key).upper()}-1001", "status", "ENABLED"),
+                            java.util.Map.of("code", "{_snake(module.key).upper()}-1002", "status", "PENDING")));
+        }}
+    }}
+"""
+        )
+    return "\n".join(blocks)
 
 
 def _java_module_files(
@@ -934,19 +1380,292 @@ create index idx_{module.key}_code on {module.key}_record(code);
     return "\n".join(blocks)
 
 
+def _python_database_module() -> str:
+    return '''from contextlib import contextmanager
+import os
+from pathlib import Path
+import sqlite3
+
+
+class Database:
+    def __init__(self, path: str | Path | None = None):
+        configured = path or os.getenv("SOFTWARE_DB_PATH") or "data/application.db"
+        self.path = Path(configured)
+
+    @contextmanager
+    def connection(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+
+default_database = Database()
+'''
+
+
+def _python_migrations_module() -> str:
+    return '''from pathlib import Path
+from app.core.database import Database, default_database
+
+
+MIGRATION_FILE = Path(__file__).resolve().parents[2] / "migrations" / "001_initial.sql"
+
+
+def initialize_database(database: Database | None = None) -> Database:
+    current = database or default_database
+    script = MIGRATION_FILE.read_text(encoding="utf-8")
+    with current.connection() as connection:
+        connection.executescript(script)
+    return current
+'''
+
+
+def _python_schema_sql(blueprint: ProductBlueprint) -> str:
+    blocks: list[str] = []
+    owner_candidates = list(getattr(blueprint, "roles", []) or getattr(blueprint, "target_users", []) or ["业务操作员"])
+    owner_role = str(owner_candidates[0] or "业务操作员")
+
+    def sql_text(value: object) -> str:
+        return str(value or "").replace("'", "''")
+
+    for module_index, module in enumerate(blueprint.modules, start=1):
+        table = f"{_snake(module.key)}_record"
+        token = _snake(module.key)
+        code_prefix = re.sub(r"[^A-Za-z0-9]", "", token).upper()[:4] or f"M{module_index}"
+        operation_labels = [str(value).strip() for value in (module.operations or []) if str(value).strip()]
+        status_cycle = ["ENABLED", "PENDING", "PROCESSING"]
+        seed_rows = []
+        for row_index in range(1, 4):
+            operation = operation_labels[(row_index - 1) % len(operation_labels)] if operation_labels else "业务处理"
+            code = f"{code_prefix}-{module_index:02d}{row_index:02d}"
+            name = f"{module.title}{'待办' if row_index == 1 else '记录' if row_index == 2 else '任务'}"
+            description = f"{module.title}：{operation}，用于运行界面数据加载与状态核验。"
+            timestamp = f"2026-06-{20 + row_index:02d}T{8 + row_index:02d}:1{row_index}:00"
+            seed_rows.append(
+                "INSERT OR IGNORE INTO "
+                f"{table} (code, name, status, owner_role, description, created_at, updated_at) VALUES "
+                f"('{sql_text(code)}', '{sql_text(name)}', '{status_cycle[row_index - 1]}', "
+                f"'{sql_text(owner_role)}', '{sql_text(description)}', '{timestamp}', '{timestamp}');"
+            )
+        blocks.append(
+            f'''CREATE TABLE IF NOT EXISTS {table} (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    owner_role TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_{table}_status ON {table}(status);
+CREATE INDEX IF NOT EXISTS idx_{table}_updated_at ON {table}(updated_at);
+{chr(10).join(seed_rows)}
+'''
+        )
+    return "\n".join(blocks)
+
+
+def _python_repository_module(module: FeatureModule) -> str:
+    token = _snake(module.key)
+    class_name = _pascal(token)
+    table = f"{token}_record"
+    return f'''from datetime import datetime
+from app.core.database import Database, default_database
+from app.core.migrations import initialize_database
+from app.models.{token}_model import {class_name}Record
+
+
+class {class_name}Repository:
+    def __init__(self, database: Database | None = None):
+        self.database = initialize_database(database or default_database)
+
+    def list(self, keyword: str | None = None, status: str | None = None) -> list[{class_name}Record]:
+        clauses = []
+        parameters: list[str] = []
+        if keyword:
+            clauses.append("(name LIKE ? OR code LIKE ?)")
+            parameters.extend([f"%{{keyword}}%", f"%{{keyword}}%"])
+        if status:
+            clauses.append("status = ?")
+            parameters.append(status)
+        where = f" WHERE {{' AND '.join(clauses)}}" if clauses else ""
+        sql = "SELECT * FROM {table}" + where + " ORDER BY updated_at DESC, id DESC"
+        with self.database.connection() as connection:
+            rows = connection.execute(sql, parameters).fetchall()
+        return [self._to_record(row) for row in rows]
+
+    def find_by_id(self, record_id: int) -> {class_name}Record | None:
+        with self.database.connection() as connection:
+            row = connection.execute("SELECT * FROM {table} WHERE id = ?", (record_id,)).fetchone()
+        return self._to_record(row) if row else None
+
+    def find_by_code(self, code: str) -> {class_name}Record | None:
+        with self.database.connection() as connection:
+            row = connection.execute("SELECT * FROM {table} WHERE code = ?", (code,)).fetchone()
+        return self._to_record(row) if row else None
+
+    def create(self, code: str, name: str, owner_role: str, description: str) -> {class_name}Record:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.database.connection() as connection:
+            cursor = connection.execute(
+                "INSERT INTO {table} (code, name, status, owner_role, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (code, name, "ENABLED", owner_role, description, now, now),
+            )
+            record_id = int(cursor.lastrowid)
+        record = self.find_by_id(record_id)
+        if record is None:
+            raise RuntimeError("保存后未找到业务记录")
+        return record
+
+    def update_status(self, record_id: int, status: str) -> {class_name}Record:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.database.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE {table} SET status = ?, updated_at = ? WHERE id = ?",
+                (status, now, record_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("记录不存在")
+        record = self.find_by_id(record_id)
+        if record is None:
+            raise RuntimeError("更新后未找到业务记录")
+        return record
+
+    @staticmethod
+    def _to_record(row) -> {class_name}Record:
+        return {class_name}Record(
+            id=int(row["id"]), code=str(row["code"]), name=str(row["name"]),
+            status=str(row["status"]), owner_role=str(row["owner_role"]),
+            description=str(row["description"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
+'''
+
+
+def _python_service_module(module: FeatureModule) -> str:
+    token = _snake(module.key)
+    class_name = _pascal(token)
+    return f'''from app.models.{token}_model import {class_name}Record
+from app.repositories.{token}_repository import {class_name}Repository
+
+
+class {class_name}Service:
+    """{module.title}业务服务。"""
+
+    def __init__(self, repository: {class_name}Repository | None = None):
+        self.repository = repository or {class_name}Repository()
+
+    def list_records(self, keyword: str | None = None, status: str | None = None) -> list[{class_name}Record]:
+        return self.repository.list(keyword=keyword, status=status)
+
+    def create_record(self, code: str, name: str, owner_role: str, description: str) -> {class_name}Record:
+        if not code.strip() or not name.strip():
+            raise ValueError("业务编号和名称不能为空")
+        if self.repository.find_by_code(code.strip()):
+            raise ValueError("业务编号已存在")
+        return self.repository.create(code.strip(), name.strip(), owner_role.strip() or "业务操作员", description.strip())
+
+    def update_status(self, record_id: int, status: str) -> {class_name}Record:
+        allowed = {{"PENDING", "ENABLED", "PROCESSING", "COMPLETED", "ARCHIVED"}}
+        if status not in allowed:
+            raise ValueError("状态不在允许范围内")
+        return self.repository.update_status(record_id, status)
+
+    def count_by_status(self) -> dict[str, int]:
+        result: dict[str, int] = {{}}
+        for record in self.repository.list():
+            result[record.status] = result.get(record.status, 0) + 1
+        return result
+'''
+
+
+def _python_persistence_test(blueprint: ProductBlueprint) -> str:
+    module = blueprint.modules[0] if blueprint.modules else FeatureModule("business", "业务模块", "业务处理", ["BusinessRecord"])
+    token = _snake(module.key)
+    class_name = _pascal(token)
+    return f'''from pathlib import Path
+from tempfile import TemporaryDirectory
+import sys
+import unittest
+
+# Support discovery with an isolated/embedded Python interpreter as well.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.core.database import Database
+from app.repositories.{token}_repository import {class_name}Repository
+from app.services.{token}_service import {class_name}Service
+
+
+class PersistenceTests(unittest.TestCase):
+    def test_record_survives_repository_reopen(self):
+        with TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "application.db")
+            service = {class_name}Service({class_name}Repository(database))
+            created = service.create_record("TEST-001", "持久化测试记录", "tester", "验证 SQLite 仓储")
+            self.assertEqual(created.status, "ENABLED")
+
+            reopened = {class_name}Service({class_name}Repository(Database(database.path)))
+            records = reopened.list_records(keyword="TEST-001")
+            self.assertEqual(len(records), 1)
+            updated = reopened.update_status(records[0].id, "COMPLETED")
+            self.assertEqual(updated.status, "COMPLETED")
+            self.assertEqual(reopened.count_by_status()["COMPLETED"], 1)
+
+    def test_duplicate_code_is_rejected(self):
+        with TemporaryDirectory() as temp_dir:
+            service = {class_name}Service({class_name}Repository(Database(Path(temp_dir) / "application.db")))
+            service.create_record("TEST-002", "首条记录", "tester", "")
+            with self.assertRaisesRegex(ValueError, "业务编号已存在"):
+                service.create_record("TEST-002", "重复记录", "tester", "")
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+
+
 def _generate_python_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path, include_readme: bool = True) -> list[Path]:
     app_dir = source_dir / "app"
-    for folder in [app_dir / "routers", app_dir / "services", app_dir / "models", app_dir / "schemas", app_dir / "core"]:
+    for folder in [
+        app_dir / "routers",
+        app_dir / "services",
+        app_dir / "repositories",
+        app_dir / "models",
+        app_dir / "schemas",
+        app_dir / "core",
+        source_dir / "migrations",
+        source_dir / "tests",
+        source_dir / "data",
+    ]:
         folder.mkdir(parents=True, exist_ok=True)
     files = [
         _write(source_dir / "requirements.txt", "fastapi\nuvicorn\npydantic\n"),
         _write(app_dir / "__init__.py", ""),
+        _write(app_dir / "core" / "__init__.py", ""),
+        _write(app_dir / "repositories" / "__init__.py", ""),
+        _write(source_dir / "tests" / "__init__.py", ""),
+        _write(app_dir / "core" / "database.py", _python_database_module()),
+        _write(app_dir / "core" / "migrations.py", _python_migrations_module()),
+        _write(source_dir / "migrations" / "001_initial.sql", _python_schema_sql(blueprint)),
         _write(
             app_dir / "main.py",
             f'''from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from app.core.migrations import initialize_database
 
+initialize_database()
 app = FastAPI(title="{task.software_name}", version="{task.version}")
 app.mount("/ui-prototype", StaticFiles(directory="ui-prototype", html=True), name="ui_prototype")
 
@@ -988,49 +1707,12 @@ class {_pascal(token)}Record:
 ''',
                 ),
                 _write(
+                    app_dir / "repositories" / f"{token}_repository.py",
+                    _python_repository_module(module),
+                ),
+                _write(
                     app_dir / "services" / f"{token}_service.py",
-                    f'''from datetime import datetime
-from app.models.{token}_model import {_pascal(token)}Record
-
-
-class {_pascal(token)}Service:
-    """{title}业务服务。"""
-
-    def __init__(self):
-        self.records: list[{_pascal(token)}Record] = []
-
-    def list_records(self, keyword: str | None = None, status: str | None = None):
-        result = []
-        for record in self.records:
-            keyword_matched = not keyword or keyword in record.name or keyword in record.code
-            status_matched = not status or status == record.status
-            if keyword_matched and status_matched:
-                result.append(record)
-        return result
-
-    def create_record(self, code: str, name: str, owner_role: str, description: str):
-        now = datetime.now()
-        record = {_pascal(token)}Record(
-            id=len(self.records) + 1,
-            code=code,
-            name=name,
-            status="ENABLED",
-            owner_role=owner_role,
-            description=description,
-            created_at=now,
-            updated_at=now,
-        )
-        self.records.append(record)
-        return record
-
-    def update_status(self, record_id: int, status: str):
-        for record in self.records:
-            if record.id == record_id:
-                record.status = status
-                record.updated_at = datetime.now()
-                return record
-        raise ValueError("记录不存在")
-''',
+                    _python_service_module(module),
                 ),
                 _write(
                     app_dir / "routers" / f"{token}_router.py",
@@ -1053,15 +1735,40 @@ def create_record(code: str, name: str, owner_role: str, description: str):
                 ),
             ]
         )
+    router_imports = "\n".join(
+        f"from app.routers.{_snake(module.key)}_router import router as {_snake(module.key)}_router"
+        for module in blueprint.modules
+    )
+    router_mounts = "\n".join(f"app.include_router({_snake(module.key)}_router)" for module in blueprint.modules)
+    files.append(
+        _write(
+            app_dir / "runtime_routes.py",
+            f'''from app.main import app
+{router_imports}
+
+{router_mounts}
+''',
+        )
+    )
+    files.append(
+        _write(
+            source_dir / "tests" / "test_persistence.py",
+            _python_persistence_test(blueprint),
+        )
+    )
     files = _ensure_generic_line_target(files, app_dir / "services", task, blueprint, target_lines=3200, extension=".py")
     files = _align_source_material_pages(files, source_dir, app_dir / "services", ".py")
     return files
 
 
-def _generate_javascript_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path, include_readme: bool = True) -> list[Path]:
+def _generate_javascript_project_legacy(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path, include_readme: bool = True) -> list[Path]:
     src = source_dir / "src"
     for folder in [src / "routes", src / "services", src / "models", src / "middleware"]:
         folder.mkdir(parents=True, exist_ok=True)
+    route_mounts = "\n".join(
+        f'app.use("/{_snake(module.key)}", require("./routes/{_snake(module.key)}Route"));'
+        for module in blueprint.modules
+    )
     files = [
         _write(
             source_dir / "package.json",
@@ -1084,8 +1791,10 @@ def _generate_javascript_project(task: GenerationTask, blueprint: ProductBluepri
             f'''const express = require("express");
 const path = require("path");
 const app = express();
+const port = Number(process.env.PORT || 8080);
 app.use(express.json());
 app.use("/ui-prototype", express.static(path.join(__dirname, "..", "ui-prototype")));
+{route_mounts}
 
 app.get("/health", (req, res) => {{
   res.json({{ status: "ok", software: "{task.software_name}", version: "{task.version}" }});
@@ -1095,8 +1804,8 @@ app.get("/", (req, res) => {{
   res.redirect("/ui-prototype/index.html");
 }});
 
-app.listen(8080, () => {{
-  console.log("{task.software_name} service started on 8080");
+app.listen(port, () => {{
+  console.log("{task.software_name} service started on " + port);
 }});
 ''',
         ),
@@ -1189,6 +1898,571 @@ module.exports = router;
     files = _ensure_generic_line_target(files, src / "services", task, blueprint, target_lines=3200, extension=".js")
     files = _align_source_material_pages(files, source_dir, src / "services", ".js")
     return files
+
+
+def _generate_javascript_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path, include_readme: bool = True) -> list[Path]:
+    src = source_dir / "src"
+    for folder in [src / "routes", src / "services", src / "models", src / "middleware"]:
+        folder.mkdir(parents=True, exist_ok=True)
+    files = [
+        _write(
+            source_dir / "package.json",
+            f'''{{
+  "name": "{_ascii_token(task.software_name)}",
+  "version": "1.0.0",
+  "description": "{task.software_name}",
+  "main": "src/server.js",
+  "scripts": {{
+    "start": "node src/server.js"
+  }}
+}}
+''',
+        ),
+        _write(src / "server.js", _javascript_runtime_server(task, blueprint)),
+    ]
+    if include_readme:
+        files.insert(0, _write(source_dir / "README.md", _readme(task, blueprint)))
+    for module in blueprint.modules:
+        token = _snake(module.key)
+        files.extend(
+            [
+                _write(src / "models" / f"{token}Record.js", _javascript_model_source(module, token)),
+                _write(src / "services" / f"{token}Service.js", _javascript_service_source(module, token)),
+                _write(src / "routes" / f"{token}Route.js", _javascript_route_source(module, token)),
+            ]
+        )
+    files = _ensure_generic_line_target(files, src / "services", task, blueprint, target_lines=3200, extension=".js")
+    files = _align_source_material_pages(files, source_dir, src / "services", ".js")
+    return files
+
+
+def _javascript_runtime_server(task: GenerationTask, blueprint: ProductBlueprint) -> str:
+    route_registrations = "\n".join(
+        f'registerRoute(require("./routes/{_snake(module.key)}Route"));'
+        for module in blueprint.modules
+    )
+    return f'''const fs = require("fs");
+const http = require("http");
+const path = require("path");
+const url = require("url");
+
+const SOFTWARE_NAME = {_json_literal(task.software_name)};
+const SOFTWARE_VERSION = {_json_literal(task.version)};
+const PORT = Number(process.env.PORT || 8080);
+const UI_ROOT = path.resolve(__dirname, "..", "ui-prototype");
+const routes = [];
+
+function registerRoute(routeModule) {{
+  if (!routeModule || !Array.isArray(routeModule.routes)) {{
+    return;
+  }}
+  for (const route of routeModule.routes) {{
+    routes.push({{
+      basePath: normalizePath(routeModule.basePath || route.basePath || "/"),
+      method: String(route.method || "GET").toUpperCase(),
+      path: normalizePath(route.path || "/"),
+      handler: route.handler,
+    }});
+  }}
+}}
+
+{route_registrations}
+
+function normalizePath(value) {{
+  const text = String(value || "/").trim();
+  const withSlash = text.startsWith("/") ? text : "/" + text;
+  return withSlash.replace(/\\/+/g, "/").replace(/\\/$/, "") || "/";
+}}
+
+function joinRoute(basePath, routePath) {{
+  if (routePath === "/") {{
+    return normalizePath(basePath);
+  }}
+  return normalizePath(basePath + "/" + routePath.replace(/^\\//, ""));
+}}
+
+function matchRoute(method, pathname) {{
+  const requestSegments = normalizePath(pathname).split("/").filter(Boolean);
+  for (const route of routes) {{
+    if (route.method !== method) {{
+      continue;
+    }}
+    const fullPath = joinRoute(route.basePath, route.path);
+    const routeSegments = fullPath.split("/").filter(Boolean);
+    if (routeSegments.length !== requestSegments.length) {{
+      continue;
+    }}
+    const params = {{}};
+    let matched = true;
+    for (let index = 0; index < routeSegments.length; index += 1) {{
+      const expected = routeSegments[index];
+      const actual = requestSegments[index];
+      if (expected.startsWith(":")) {{
+        params[expected.slice(1)] = decodeURIComponent(actual);
+      }} else if (expected !== actual) {{
+        matched = false;
+        break;
+      }}
+    }}
+    if (matched) {{
+      return {{ route, params }};
+    }}
+  }}
+  return null;
+}}
+
+function sendJson(res, status, payload) {{
+  const body = JSON.stringify(payload);
+  res.writeHead(status, {{
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+    "Cache-Control": "no-store",
+  }});
+  res.end(body);
+}}
+
+function redirect(res, location) {{
+  res.writeHead(302, {{ Location: location }});
+  res.end();
+}}
+
+function mimeType(filePath) {{
+  const ext = path.extname(filePath).toLowerCase();
+  return {{
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".svg": "image/svg+xml; charset=utf-8",
+  }}[ext] || "application/octet-stream";
+}}
+
+function servePrototype(pathname, res) {{
+  const relative = decodeURIComponent(pathname.replace(/^\\/ui-prototype\\/?/, "")) || "index.html";
+  const requested = path.resolve(UI_ROOT, relative);
+  if (!requested.startsWith(UI_ROOT)) {{
+    sendJson(res, 403, {{ error: "forbidden" }});
+    return;
+  }}
+  fs.stat(requested, (statError, stat) => {{
+    if (statError || !stat.isFile()) {{
+      sendJson(res, 404, {{ error: "not_found" }});
+      return;
+    }}
+    res.writeHead(200, {{
+      "Content-Type": mimeType(requested),
+      "Cache-Control": "no-store",
+    }});
+    fs.createReadStream(requested).pipe(res);
+  }});
+}}
+
+function readBody(req) {{
+  return new Promise((resolve, reject) => {{
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {{
+      const raw = Buffer.concat(chunks).toString("utf8").trim();
+      if (!raw) {{
+        resolve({{}});
+        return;
+      }}
+      try {{
+        resolve(JSON.parse(raw));
+      }} catch (error) {{
+        reject(new Error("invalid_json_body"));
+      }}
+    }});
+    req.on("error", reject);
+  }});
+}}
+
+const server = http.createServer(async (req, res) => {{
+  const parsed = url.parse(req.url || "/", true);
+  const pathname = decodeURIComponent(parsed.pathname || "/");
+  const method = String(req.method || "GET").toUpperCase();
+
+  if (method === "GET" && pathname === "/health") {{
+    sendJson(res, 200, {{
+      status: "ok",
+      software: SOFTWARE_NAME,
+      version: SOFTWARE_VERSION,
+      routeCount: routes.length,
+      servedPrototype: fs.existsSync(path.join(UI_ROOT, "index.html")),
+    }});
+    return;
+  }}
+  if (method === "GET" && pathname === "/") {{
+    redirect(res, "/ui-prototype/index.html");
+    return;
+  }}
+  if (method === "GET" && pathname.startsWith("/ui-prototype")) {{
+    servePrototype(pathname, res);
+    return;
+  }}
+
+  const matched = matchRoute(method, pathname);
+  if (!matched) {{
+    sendJson(res, 404, {{ error: "route_not_found", path: pathname }});
+    return;
+  }}
+
+  try {{
+    const body = ["POST", "PUT", "PATCH"].includes(method) ? await readBody(req) : {{}};
+    const result = await matched.route.handler({{
+      query: parsed.query || {{}},
+      params: matched.params,
+      body,
+      method,
+      path: pathname,
+    }});
+    sendJson(res, 200, {{ success: true, data: result }});
+  }} catch (error) {{
+    sendJson(res, 400, {{ success: false, error: error.message || "request_failed" }});
+  }}
+}});
+
+server.listen(PORT, "127.0.0.1", () => {{
+  console.log(`${{SOFTWARE_NAME}} service started on ${{PORT}}`);
+}});
+'''
+
+
+def _javascript_model_source(module: FeatureModule, token: str) -> str:
+    return f'''class {_pascal(token)}Record {{
+  constructor(data) {{
+    Object.assign(this, data);
+    this.id = data.id;
+    this.code = data.code;
+    this.name = data.name;
+    this.status = data.status || "ENABLED";
+    this.ownerRole = data.ownerRole;
+    this.description = data.description;
+    this.moduleTitle = data.moduleTitle || {_json_literal(module.title)};
+    this.region = data.region;
+    this.priority = data.priority;
+    this.result = data.result;
+    this.createdAt = data.createdAt || new Date();
+    this.updatedAt = data.updatedAt || new Date();
+  }}
+}}
+
+module.exports = {_pascal(token)}Record;
+'''
+
+
+def _javascript_service_source(module: FeatureModule, token: str) -> str:
+    record_name = f"{_pascal(token)}Record"
+    seed_records = _json_block_literal(_javascript_seed_records(module, token), indent=6)
+    default_description = _business_record_description(module, index=1)
+    return f'''const {record_name} = require("../models/{token}Record");
+
+class {_pascal(token)}Service {{
+  constructor() {{
+    this.records = {seed_records}.map((item) => new {record_name}(item));
+  }}
+
+  list(query = {{}}) {{
+    return this.records.filter((record) => {{
+      const keyword = String(query.keyword || "").trim();
+      const keywordMatched = !keyword
+        || record.name.includes(keyword)
+        || record.code.includes(keyword)
+        || String(record.region || "").includes(keyword);
+      const statusMatched = !query.status || query.status === record.status;
+      return keywordMatched && statusMatched;
+    }});
+  }}
+
+  find(id) {{
+    const record = this.records.find((item) => item.id === Number(id));
+    if (!record) {{
+      throw new Error("record_not_found");
+    }}
+    return record;
+  }}
+
+  create(payload = {{}}) {{
+    const record = new {record_name}({{
+      ...payload,
+      id: this.records.length + 1,
+      code: payload.code || this.createCode(),
+      name: payload.name || {_json_literal((module.title or "业务") + "对象")},
+      status: payload.status || "PENDING",
+      moduleTitle: {_json_literal(module.title)},
+      ownerRole: payload.ownerRole || {_json_literal(_javascript_owner_role(module))},
+      description: payload.description || {_json_literal(default_description)},
+      updatedAt: new Date().toISOString(),
+    }});
+    this.records.push(record);
+    return record;
+  }}
+
+  changeStatus(id, status) {{
+    const record = this.find(id);
+    record.status = status || "PROCESSING";
+    record.updatedAt = new Date();
+    record.result = this.statusText(record.status);
+    return record;
+  }}
+
+  summary() {{
+    const total = this.records.length;
+    const pending = this.records.filter((item) => item.status === "PENDING").length;
+    const completed = this.records.filter((item) => item.status === "COMPLETED").length;
+    return {{
+      module: {_json_literal(module.title)},
+      total,
+      pending,
+      completed,
+      latestRecord: this.records[0] || null,
+    }};
+  }}
+
+  createCode() {{
+    const sequence = String(this.records.length + 1).padStart(4, "0");
+    return "{_business_code_prefix(module, token)}-" + sequence;
+  }}
+
+  statusText(status) {{
+    return {{
+      ENABLED: "enabled",
+      PENDING: "pending_review",
+      PROCESSING: "processing",
+      COMPLETED: "completed",
+      ARCHIVED: "archived",
+    }}[status] || "processing";
+  }}
+}}
+
+module.exports = new {_pascal(token)}Service();
+'''
+
+
+def _javascript_route_source(module: FeatureModule, token: str) -> str:
+    return f'''const service = require("../services/{token}Service");
+
+function createRouter(basePath) {{
+  const routes = [];
+  const router = {{
+    get(path, handler) {{
+      routes.push({{ method: "GET", path, handler }});
+    }},
+    post(path, handler) {{
+      routes.push({{ method: "POST", path, handler }});
+    }},
+    patch(path, handler) {{
+      routes.push({{ method: "PATCH", path, handler }});
+    }},
+  }};
+  return {{ basePath, routes, router }};
+}}
+
+const route = createRouter("/{token}");
+const router = route.router;
+
+router.get("/", (request) => service.list(request.query));
+router.get("/summary", () => service.summary());
+router.get("/:id", (request) => service.find(request.params.id));
+router.post("/", (request) => service.create(request.body));
+router.patch("/:id/status", (request) => service.changeStatus(request.params.id, request.body.status));
+
+module.exports = {{
+  basePath: route.basePath,
+  moduleKey: "{token}",
+  moduleTitle: {_json_literal(module.title)},
+  routes: route.routes,
+}};
+'''
+
+
+def _javascript_seed_records(module: FeatureModule, token: str) -> list[dict[str, object]]:
+    fields = [str(item) for item in (module.data_fields or []) if str(item).strip()]
+    operations = [str(item) for item in (module.operations or []) if str(item).strip()]
+    statuses = ["ENABLED", "PENDING", "PROCESSING", "COMPLETED"]
+    prefix = _business_code_prefix(module, token)
+    names = _business_record_names(module)
+    regions = _business_record_regions(module, fields)
+    transport = _is_transport_module(module)
+    records: list[dict[str, object]] = []
+    for index in range(1, 5):
+        code = f"{prefix}-{1000 + index}"
+        name = names[(index - 1) % len(names)]
+        region = regions[(index - 1) % len(regions)] if regions else module.title
+        operation = operations[(index - 1) % len(operations)] if operations else "business_processing"
+        record: dict[str, object] = {
+            "id": index,
+            "code": code,
+            "name": name,
+            "status": statuses[(index - 1) % len(statuses)],
+            "ownerRole": _javascript_owner_role(module),
+            "description": _business_record_description(module, operation=operation, region=region, index=index),
+            "moduleTitle": module.title,
+            "region": region,
+            "priority": "P" + str((index % 3) + 1),
+            "result": operation,
+            "createdAt": f"2026-06-{20 + index:02d}T09:{10 + index:02d}:00",
+            "updatedAt": f"2026-06-{24 + index:02d}T15:{20 + index:02d}:00",
+            "nodeSequence": _transport_node_sequence(index) if transport else _business_process_sequence(module, index),
+            "direction": ["北向", "南向", "双向", "东向"][(index - 1) % 4] if transport else _business_direction(index),
+            "serviceScope": _transport_service_scope(index) if transport else region,
+            "fieldValues": {},
+        }
+        field_values: dict[str, object] = {}
+        for field_index, field in enumerate(fields[:10]):
+            value = _business_field_value(module, field, index, code, name)
+            record[field] = value
+            field_values[field] = value
+        record["fieldValues"] = field_values
+        records.append(record)
+    return records
+
+
+def _business_record_description(
+    module: FeatureModule,
+    *,
+    operation: str = "",
+    region: str = "",
+    index: int = 1,
+) -> str:
+    title = str(getattr(module, "title", "") or "业务模块")
+    operations = [str(item) for item in (getattr(module, "operations", []) or []) if str(item).strip()]
+    operation_text = operation or (operations[(index - 1) % len(operations)] if operations else "业务处理")
+    if region:
+        region_text = region
+    elif _is_transport_module(module):
+        region_text = _transport_service_scope(index)
+    else:
+        regions = _business_record_regions(
+            module,
+            [str(item) for item in (getattr(module, "data_fields", []) or []) if str(item).strip()],
+        )
+        region_text = regions[(index - 1) % len(regions)] if regions else f"{title}服务区域{index}"
+    phase = ["建档", "复核", "匹配", "归档"][(index - 1) % 4]
+    return f"{title}-{operation_text}-{region_text}-{phase}"
+
+
+def _business_field_value(module: FeatureModule, field: str, index: int, code: str, name: str) -> str:
+    title = str(getattr(module, "title", "") or "")
+    text = str(field or "")
+    if re.search(r"编号|编码|单号|代码|ID", text, re.I):
+        return code
+    if re.search(r"名称|标题|线路|路径", text):
+        return name
+    transport = _is_transport_module(module)
+    if transport and re.search(r"途经|节点序列|站点序列", text):
+        return _transport_node_sequence(index)
+    if transport and re.search(r"方向|通行", text):
+        return ["北向", "南向", "双向", "东向"][(index - 1) % 4]
+    if re.search(r"范围|服务|覆盖|片区|区域", text):
+        return _transport_service_scope(index) if transport else f"{title}服务区域{index}"
+    if re.search(r"状态|进度", text):
+        return ["已启用", "待复核", "处理中", "已完成"][(index - 1) % 4]
+    if re.search(r"时间|日期|更新|创建|生效", text):
+        return f"2026-06-{24 + index:02d} 15:{20 + index:02d}"
+    if re.search(r"等级|优先级|适配", text):
+        return ["一级适配", "二级适配", "重点复核", "冲突校验"][(index - 1) % 4]
+    if re.search(r"角色|责任|人员|单位|部门", text):
+        return _javascript_owner_role(module)
+    if re.search(r"结果|结论|说明|备注", text):
+        return f"{title}已完成{['建档', '复核', '匹配', '归档'][(index - 1) % 4]}"
+    return [code, name, f"{title}业务对象{index}", f"{title}处理结果{index}"][(index - 1) % 4]
+
+
+def _transport_node_sequence(index: int) -> str:
+    sequences = [
+        "沪杭枢纽-浦东东区-临港接驳点",
+        "虹桥枢纽-外环货运站-南环联络口",
+        "机场北站-航站楼集散点-东区短驳口",
+        "外高桥港区-保税仓节点-主干线入口",
+    ]
+    return sequences[(index - 1) % len(sequences)]
+
+
+def _transport_service_scope(index: int) -> str:
+    scopes = ["浦东东区至临港片区", "虹桥枢纽至南环货运带", "机场枢纽至东部接驳区", "港区集疏运服务圈"]
+    return scopes[(index - 1) % len(scopes)]
+
+
+def _business_process_sequence(module: FeatureModule, index: int) -> str:
+    operations = [str(item).strip() for item in (getattr(module, "operations", []) or []) if str(item).strip()]
+    if not operations:
+        return "业务受理-规则校验-状态更新"
+    rotated = operations[(index - 1) % len(operations) :] + operations[: (index - 1) % len(operations)]
+    return "-".join(rotated[:3])
+
+
+def _business_direction(index: int) -> str:
+    return ["受理方向", "复核方向", "协同方向", "归档方向"][(index - 1) % 4]
+
+
+def _javascript_owner_role(module: FeatureModule) -> str:
+    roles = [str(item) for item in (getattr(module, "roles", []) or []) if str(item).strip()]
+    return roles[0] if roles else "业务操作员"
+
+
+def _is_transport_module(module: FeatureModule) -> bool:
+    text = " ".join(
+        [
+            str(getattr(module, "title", "") or ""),
+            str(getattr(module, "description", "") or ""),
+            " ".join(str(item) for item in (getattr(module, "data_fields", []) or [])),
+        ]
+    )
+    return build_domain_profile(context_text=text).requires_route_topology
+
+
+def _business_code_prefix(module: FeatureModule, fallback_token: str) -> str:
+    title = str(getattr(module, "title", "") or "")
+    if "干线" in title:
+        return "TR-HX"
+    if "支线" in title:
+        return "BR-JR"
+    if "节点" in title or "衔接" in title:
+        return "TN-JD"
+    if "匹配" in title or "评估" in title:
+        return "MT-PG"
+    if "规则" in title:
+        return "CR-GZ"
+    if "问题" in title:
+        return "WT-CZ"
+    if "发布" in title or "方案" in title:
+        return "FA-FB"
+    if "统计" in title or "报表" in title:
+        return "TJ-BB"
+    token = re.sub(r"[^A-Za-z0-9]+", "", fallback_token or "YW").upper()
+    return (token[:2] or "YW") + "-YW"
+
+
+def _business_record_names(module: FeatureModule) -> list[str]:
+    title = str(getattr(module, "title", "") or "业务记录")
+    if "干线" in title:
+        return ["沪杭干线北向联络线", "城际货运南环干线", "机场枢纽快速干线", "港区集疏运主干线"]
+    if "支线" in title:
+        return ["临港园区接驳支线", "东部片区社区支线", "冷链仓储短驳支线", "客运站微循环支线"]
+    if "节点" in title or "衔接" in title:
+        return ["综合客运枢纽A区", "铁路货场换装节点", "港区东门接驳点", "机场北侧集散节点"]
+    if "匹配" in title or "评估" in title:
+        return ["干支线接驳时效评估", "覆盖盲区匹配复核", "节点容量冲突评估", "跨区线路组合测算"]
+    if "规则" in title:
+        return ["接驳距离阈值规则", "等待时长上限规则", "节点容量窗口规则", "服务范围重叠规则"]
+    if "问题" in title and _is_transport_module(module):
+        return ["支线覆盖缺口工单", "节点容量冲突工单", "方向不一致处置单", "服务范围越界工单"]
+    if "发布" in title or "方案" in title:
+        return ["临港干支线适配方案", "机场枢纽接驳发布单", "港区集疏运生效方案", "城际线路换乘方案"]
+    if "统计" in title or "报表" in title:
+        return ["日运行适配汇总", "区域衔接效率报表", "规则命中趋势分析", "问题闭环统计清单"]
+    return [f"{title}待办", f"{title}复核单", f"{title}处理单", f"{title}归档单"]
+
+
+def _business_record_regions(module: FeatureModule, fields: list[str]) -> list[str]:
+    title = str(getattr(module, "title", "") or "")
+    if _is_transport_module(module):
+        return ["浦东东区", "临港新片区", "虹桥枢纽片区", "外高桥港区"]
+    return [f"{title}服务区域{index}" for index in range(1, 5)]
 
 
 def _generate_generic_project(task: GenerationTask, blueprint: ProductBlueprint, source_dir: Path) -> list[Path]:
@@ -1378,6 +2652,8 @@ def _generate_csharp_project(task: GenerationTask, blueprint: ProductBlueprint, 
         _write(
             src / "Program.cs",
             f"""using {root_namespace}.Configuration;
+using {root_namespace}.Repositories;
+using {root_namespace}.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
@@ -1387,6 +2663,7 @@ builder.Services.AddSingleton(new SoftwareProfile(
     "{task.product_type}",
     "{blueprint.industry}"
 ));
+{_csharp_service_registrations(blueprint)}
 var app = builder.Build();
 app.UseStaticFiles();
 app.MapControllers();
@@ -1500,6 +2777,20 @@ def _csharp_module_files(src: Path, namespace: str, module: FeatureModule) -> li
         _write(src / "Services" / f"{class_name}ExportService.cs", _csharp_export(namespace, class_name, record_name, title)),
         _write(src / "Controllers" / f"{class_name}Controller.cs", _csharp_controller(namespace, class_name, record_name, query_name, title)),
     ]
+
+
+def _csharp_service_registrations(blueprint: ProductBlueprint) -> str:
+    lines: list[str] = []
+    for module in blueprint.modules:
+        class_name = _pascal(module.key)
+        lines.extend(
+            [
+                f"builder.Services.AddSingleton<I{class_name}Repository, InMemory{class_name}Repository>();",
+                f"builder.Services.AddSingleton<{class_name}Validator>();",
+                f"builder.Services.AddSingleton<{class_name}Service>();",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def _csharp_record(namespace: str, record_name: str, title: str, description: str) -> str:
@@ -2199,45 +3490,58 @@ runtime:
 
 
 def _align_source_material_pages(files: list[Path], source_dir: Path, target_dir: Path, extension: str) -> list[Path]:
-    remainder = len(read_source_lines(source_dir)) % 50
-    if remainder == 0:
-        return files
-    lines_needed = 50 - remainder
-    if extension in {".js", ".ts"}:
-        path = target_dir / "workflowTransitionSupport.js"
-    elif extension == ".py":
-        path = target_dir / "workflow_transition_support.py"
+    current_lines = len(read_source_lines(source_dir))
+    if current_lines < 3000:
+        lines_needed = 3000 - current_lines
     else:
-        path = target_dir / "workflow-state-support.properties"
-    files.append(_write(path, _source_alignment_lines(lines_needed, extension)))
+        remainder = current_lines % 50
+        lines_needed = 50 - remainder if remainder else 0
+    if lines_needed <= 0:
+        return files
+    path = _source_alignment_path(target_dir, extension)
+    files.append(_write(path, _source_alignment_lines(lines_needed, extension, source_dir=source_dir, target_dir=target_dir)))
     return files
 
 
-def _source_alignment_lines(lines_needed: int, extension: str) -> str:
+def _source_alignment_path(target_dir: Path, extension: str) -> Path:
+    if extension in {".js", ".ts"}:
+        return target_dir / "workflowTransitionSupport.js"
+    if extension == ".py":
+        return target_dir / "workflow_transition_support.py"
+    if extension == ".java":
+        return target_dir / "WorkflowTransitionSupport.java"
+    if extension == ".cs":
+        return target_dir / "WorkflowTransitionSupport.cs"
+    return target_dir / "workflow-state-support.properties"
+
+
+def _source_alignment_lines(lines_needed: int, extension: str, *, source_dir: Path, target_dir: Path) -> str:
+    if extension == ".java":
+        return _java_source_alignment_lines(lines_needed, source_dir=source_dir, target_dir=target_dir)
+    if extension == ".cs":
+        return _csharp_source_alignment_lines(lines_needed, source_dir=source_dir, target_dir=target_dir)
     if extension in {".js", ".ts"}:
         base = [
-            "const workflowTransitionSupport = { visible: new Set([\"PENDING\", \"PROCESSING\", \"COMPLETED\"]), closed: new Set([\"COMPLETED\", \"ARCHIVED\"]) };",
-            "workflowTransitionSupport.normalizeRecord = (record) => ({ ...record, status: record && record.status ? String(record.status).trim() : \"PENDING\" });",
+            "const workflowTransitionSupport = {};",
+            "workflowTransitionSupport.visible = new Set([\"PENDING\", \"PROCESSING\", \"COMPLETED\"]);",
+            "workflowTransitionSupport.closed = new Set([\"COMPLETED\", \"ARCHIVED\"]);",
+            "workflowTransitionSupport.normalizeRecord = (record) => ({ ...(record || {}), status: String(record?.status || \"PENDING\").trim() });",
             "workflowTransitionSupport.canModify = (record) => !workflowTransitionSupport.closed.has(workflowTransitionSupport.normalizeRecord(record).status);",
             "workflowTransitionSupport.resolveNextStatus = (record) => workflowTransitionSupport.normalizeRecord(record).status === \"PENDING\" ? \"PROCESSING\" : \"COMPLETED\";",
-            "workflowTransitionSupport.applyTransition = (record, operatorName) => ({ ...workflowTransitionSupport.normalizeRecord(record), operatorName: operatorName || \"system\", status: workflowTransitionSupport.resolveNextStatus(record), updatedAt: new Date() });",
-            "workflowTransitionSupport.buildAuditLine = (record) => [record.code || \"-\", record.module || \"-\", record.operation || \"-\", record.operatorName || \"system\", record.status || \"PENDING\"].join(\"|\");",
-            "workflowTransitionSupport.toQuery = (record) => ({ code: record.code || \"\", status: workflowTransitionSupport.normalizeRecord(record).status, updatedAt: record.updatedAt || new Date() });",
+            "workflowTransitionSupport.applyTransition = (record, operatorName) => ({ ...workflowTransitionSupport.normalizeRecord(record), operatorName: operatorName || \"system\", updatedAt: new Date() });",
+            "workflowTransitionSupport.buildAuditLine = (record) => [record.code || \"-\", record.module || \"-\", record.operation || \"-\", record.status || \"PENDING\"].join(\"|\");",
+            "workflowTransitionSupport.toQuery = (record) => ({ code: record?.code || \"\", status: record?.status || \"PENDING\", updatedAt: record?.updatedAt || new Date() });",
             "module.exports = workflowTransitionSupport;",
         ]
     elif extension == ".py":
         base = [
             "WORKFLOW_VISIBLE_STATES = {'PENDING', 'PROCESSING', 'COMPLETED'}",
             "WORKFLOW_CLOSED_STATES = {'COMPLETED', 'ARCHIVED'}",
-            "def normalize_workflow_record(record):",
-            "    current = dict(record or {})",
-            "    current['status'] = str(current.get('status') or 'PENDING').strip() or 'PENDING'",
-            "    return current",
-            "def apply_workflow_transition(record, operator_name):",
-            "    current = normalize_workflow_record(record)",
-            "    current['operator_name'] = operator_name or 'system'",
-            "    current['status'] = 'PROCESSING' if current['status'] == 'PENDING' else 'COMPLETED'",
-            "    return current",
+            "def normalize_workflow_record(record): return {**dict(record or {}), 'status': str(dict(record or {}).get('status') or 'PENDING').strip() or 'PENDING'}",
+            "def can_modify_workflow(record): return normalize_workflow_record(record)['status'] not in WORKFLOW_CLOSED_STATES",
+            "def resolve_next_workflow_status(record): return 'PROCESSING' if normalize_workflow_record(record)['status'] == 'PENDING' else 'COMPLETED'",
+            "def apply_workflow_transition(record, operator_name): return {**normalize_workflow_record(record), 'operator_name': operator_name or 'system'}",
+            "def build_workflow_audit_line(record): return '|'.join(str(record.get(key, '-')) for key in ('code', 'module', 'operation', 'status'))",
         ]
     else:
         base = [
@@ -2259,6 +3563,86 @@ def _source_alignment_lines(lines_needed: int, extension: str) -> str:
             rows.append(f"workflow.transition.snapshot.{index:02d}=PENDING,PROCESSING,COMPLETED,ARCHIVED,BUSINESS-FLOW-{index:02d}")
         index += 1
     return "\n".join(rows)
+
+
+def _java_source_alignment_lines(lines_needed: int, *, source_dir: Path, target_dir: Path) -> str:
+    package = _java_package_for_directory(source_dir, target_dir)
+    rows: list[str] = []
+    if package and lines_needed >= 2:
+        rows.append(f"package {package};")
+    remaining = max(0, lines_needed - len(rows))
+    if remaining <= 1:
+        rows.append("public class WorkflowTransitionSupport {}")
+        return "\n".join(rows[:lines_needed])
+    rows.append("public class WorkflowTransitionSupport {")
+    method_templates = [
+        '    public String resolveNextStatus(String status) { return "PENDING".equals(status) ? "PROCESSING" : "PROCESSING".equals(status) ? "COMPLETED" : "ARCHIVED"; }',
+        '    public boolean canModify(String status) { return !"COMPLETED".equals(status) && !"ARCHIVED".equals(status); }',
+        '    public String normalizeOperator(String operator) { return operator == null || operator.isBlank() ? "system" : operator.trim(); }',
+        '    public String buildAuditLine(String code, String module, String operation, String operator, String status) { return code + "|" + module + "|" + operation + "|" + operator + "|" + status; }',
+    ]
+    index = 1
+    while len(rows) < lines_needed - 1:
+        if index <= len(method_templates):
+            rows.append(method_templates[index - 1])
+        else:
+            rows.append(f'    public String transitionSnapshot{index - len(method_templates):02d}() {{ return "PENDING|PROCESSING|COMPLETED|ARCHIVED|BUSINESS-FLOW-{index:02d}"; }}')
+        index += 1
+    rows.append("}")
+    return "\n".join(rows[:lines_needed])
+
+
+def _csharp_source_alignment_lines(lines_needed: int, *, source_dir: Path, target_dir: Path) -> str:
+    namespace = _csharp_namespace_for_directory(source_dir, target_dir)
+    rows: list[str] = []
+    if namespace and lines_needed >= 3:
+        rows.append(f"namespace {namespace};")
+    remaining = max(0, lines_needed - len(rows))
+    if remaining <= 1:
+        rows.append("public class WorkflowTransitionSupport {}")
+        return "\n".join(rows[:lines_needed])
+    if remaining == 2:
+        rows.extend(["public class WorkflowTransitionSupport", "{}"])
+        return "\n".join(rows[:lines_needed])
+    rows.extend(["public class WorkflowTransitionSupport", "{"])
+    method_templates = [
+        '    public string ResolveNextStatus(string? status) => status == "PENDING" ? "PROCESSING" : status == "PROCESSING" ? "COMPLETED" : "ARCHIVED";',
+        '    public bool CanModify(string? status) => status != "COMPLETED" && status != "ARCHIVED";',
+        '    public string NormalizeOperator(string? operatorName) => string.IsNullOrWhiteSpace(operatorName) ? "system" : operatorName.Trim();',
+        '    public string BuildAuditLine(string code, string module, string operation, string operatorName, string status) => string.Join("|", code, module, operation, operatorName, status);',
+    ]
+    index = 1
+    while len(rows) < lines_needed - 1:
+        if index <= len(method_templates):
+            rows.append(method_templates[index - 1])
+        else:
+            rows.append(f'    public string TransitionSnapshot{index - len(method_templates):02d}() => "PENDING|PROCESSING|COMPLETED|ARCHIVED|BUSINESS-FLOW-{index:02d}";')
+        index += 1
+    rows.append("}")
+    return "\n".join(rows[:lines_needed])
+
+
+def _java_package_for_directory(source_dir: Path, target_dir: Path) -> str:
+    try:
+        relative = target_dir.relative_to(source_dir).as_posix()
+    except ValueError:
+        return ""
+    marker = "src/main/java/"
+    if marker not in relative:
+        return ""
+    return relative.split(marker, 1)[1].replace("/", ".").strip(".")
+
+
+def _csharp_namespace_for_directory(source_dir: Path, target_dir: Path) -> str:
+    project = next(source_dir.glob("*.csproj"), None)
+    if not project:
+        return ""
+    try:
+        relative = target_dir.relative_to(source_dir / "src").as_posix()
+    except ValueError:
+        return project.stem
+    suffix = relative.replace("/", ".").strip(".")
+    return f"{project.stem}.{suffix}" if suffix else project.stem
 
 
 def _ensure_line_target(
@@ -2286,48 +3670,271 @@ def _ensure_generic_line_target(
     total_lines = sum(_count_lines(path) for path in files)
     if total_lines >= target_lines:
         return files
-    if extension == ".cs":
-        files.append(_write(target_dir / "BusinessWorkflowService.cs", _csharp_scenario_catalog(task, blueprint, target_lines - total_lines)))
-    elif extension == ".js":
-        files.append(_write(target_dir / "businessWorkflowService.js", _javascript_scenario_catalog(task, blueprint, target_lines - total_lines)))
-    elif extension == ".py":
-        files.append(_write(target_dir / "business_workflow_service.py", _python_scenario_catalog(task, blueprint, target_lines - total_lines)))
+    missing_lines = target_lines - total_lines
+    if extension in {".cs", ".js", ".py"}:
+        files.extend(
+            _write_generic_workflow_shards(
+                target_dir=target_dir,
+                task=task,
+                blueprint=blueprint,
+                missing_lines=missing_lines,
+                extension=extension,
+            )
+        )
     else:
-        files.append(_write(target_dir / f"business_workflow{extension}", _generic_scenario_catalog(task, blueprint, target_lines - total_lines, extension)))
+        files.append(_write(target_dir / f"business_workflow{extension}", _generic_scenario_catalog(task, blueprint, missing_lines, extension)))
     return files
 
 
-def _javascript_scenario_catalog(task: GenerationTask, blueprint: ProductBlueprint, missing_lines: int) -> str:
+def _write_generic_workflow_shards(
+    *,
+    target_dir: Path,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    missing_lines: int,
+    extension: str,
+) -> list[Path]:
+    modules = list(blueprint.modules) or [FeatureModule("business", "业务模块", "业务处理", ["BusinessRecord"])]
+    shard_count = max(len(modules), (max(1, missing_lines) + 379) // 380)
+    shard_count = min(24, shard_count)
+    target_per_shard = max(180, (max(1, missing_lines) + shard_count - 1) // shard_count)
+    result: list[Path] = []
+    for shard_index in range(shard_count):
+        module = modules[shard_index % len(modules)]
+        occurrence = shard_index // len(modules) + 1
+        token = _snake(module.key) or f"business_{shard_index + 1:02d}"
+        class_name = f"{_pascal(token)}WorkflowOrchestrator{occurrence if occurrence > 1 else ''}"
+        index_offset = shard_index * 100
+        if extension == ".py":
+            file_name = f"{token}_workflow_orchestrator{f'_{occurrence}' if occurrence > 1 else ''}.py"
+            content = _python_scenario_catalog(
+                task,
+                blueprint,
+                target_per_shard,
+                module_pool=[module],
+                class_name=class_name,
+                index_offset=index_offset,
+                scenario_minimum=4,
+                scenario_padding=1,
+            )
+        elif extension == ".js":
+            file_name = f"{token}WorkflowOrchestrator{occurrence if occurrence > 1 else ''}.js"
+            content = _javascript_scenario_catalog(
+                task,
+                blueprint,
+                target_per_shard,
+                module_pool=[module],
+                class_name=class_name,
+                index_offset=index_offset,
+                scenario_minimum=4,
+                scenario_padding=1,
+            )
+        else:
+            file_name = f"{class_name}.cs"
+            content = _csharp_scenario_catalog(
+                task,
+                blueprint,
+                target_per_shard,
+                module_pool=[module],
+                class_name=class_name,
+                index_offset=index_offset,
+                scenario_minimum=4,
+                scenario_padding=1,
+            )
+        result.append(_write(target_dir / file_name, content))
+    return result
+
+
+def _python_scenario_method_rows(
+    index: int,
+    module: FeatureModule,
+    operation: str,
+    field: str,
+    method_name: str,
+) -> list[str]:
+    variant = index % 5
+    if variant == 0:
+        return [
+            f"    def {method_name}(self, records: list[dict], keyword: str = '', status: str = '') -> list[dict]:",
+            "        matched = []",
+            "        for item in records:",
+            "            current = self.normalize_record(item)",
+            "            if keyword and keyword not in str(current.get('name', '')) and keyword not in current['code']:",
+            "                continue",
+            "            if status and current.get('status') != status:",
+            "                continue",
+            f"            current['matched_field'] = {_python_literal(field)}",
+            "            matched.append(current)",
+            "        return sorted(matched, key=lambda item: item.get('updated_at', ''), reverse=True)",
+        ]
+    if variant == 1:
+        return [
+            f"    def {method_name}(self, record: dict | None, decision: str, operator_name: str) -> dict:",
+            "        current = self.normalize_record(record)",
+            "        allowed = {'APPROVED', 'REJECTED', 'RETURNED'}",
+            "        if decision not in allowed:",
+            "            raise ValueError('复核结论不在允许范围内')",
+            f"        current['module'] = {_python_literal(module.title)}",
+            f"        current['operation'] = {_python_literal(operation)}",
+            "        current['reviewed_by'] = self.normalize_operator(operator_name)",
+            "        current['reviewed_at'] = datetime.now().isoformat(timespec='seconds')",
+            "        current['status'] = 'COMPLETED' if decision == 'APPROVED' else 'PROCESSING'",
+            "        self.append_audit_line({**current, 'operator': current['reviewed_by'], 'after_status': current['status']})",
+            "        return self.build_response(current)",
+        ]
+    if variant == 2:
+        return [
+            f"    def {method_name}(self, records: list[dict]) -> dict:",
+            "        summary: dict[str, int] = {}",
+            "        overdue = []",
+            "        for item in records:",
+            "            status = str(item.get('status') or 'PENDING')",
+            "            summary[status] = summary.get(status, 0) + 1",
+            "            if item.get('overdue') and status not in {'COMPLETED', 'ARCHIVED'}:",
+            "                overdue.append(item.get('code', '-'))",
+            f"        return {{'module': {_python_literal(module.title)}, 'metric': {_python_literal(field)},",
+            "                'total': len(records), 'status_summary': summary, 'overdue_codes': overdue}",
+        ]
+    if variant == 3:
+        return [
+            f"    def {method_name}(self, records: list[dict], operator_name: str) -> list[str]:",
+            f"        rows = [{_python_literal('编号,模块,操作,状态,负责人,更新时间')}]",
+            "        operator = self.normalize_operator(operator_name)",
+            "        for item in records:",
+            "            current = self.normalize_record(item)",
+            f"            current['module'] = {_python_literal(module.title)}",
+            f"            current['operation'] = {_python_literal(operation)}",
+            "            values = [current['code'], current['module'], current['operation'],",
+            "                      str(current.get('status', 'PENDING')), operator, str(current.get('updated_at', ''))]",
+            "            rows.append(','.join(value.replace(',', '，') for value in values))",
+            "        return rows",
+        ]
+    return [
+        f"    def {method_name}(self, record: dict | None, operator_name: str) -> dict:",
+        "        current = self.normalize_record(record)",
+        f"        current['module'] = {_python_literal(module.title)}",
+        f"        current['operation'] = {_python_literal(operation)}",
+        f"        current['focus_field'] = {_python_literal(field)}",
+        "        current['operator'] = self.normalize_operator(operator_name)",
+        "        current['before_status'] = current.get('status', 'PENDING')",
+        "        current['after_status'] = self.next_status(current['before_status'])",
+        "        current['updated_at'] = datetime.now().isoformat(timespec='seconds')",
+        "        self.validate_record(current)",
+        "        self.append_audit_line(current)",
+        "        return self.build_response(current)",
+    ]
+
+
+def _javascript_scenario_method_rows(
+    index: int,
+    module: FeatureModule,
+    operation: str,
+    field: str,
+    method_name: str,
+) -> list[str]:
+    variant = index % 5
+    if variant == 0:
+        return [
+            f"  {method_name}(records, keyword = '', status = '') {{",
+            "    return (records || []).map((item) => this.normalizeRecord(item)).filter((item) => {",
+            "      const keywordMatched = !keyword || String(item.name || '').includes(keyword) || item.code.includes(keyword);",
+            "      const statusMatched = !status || item.status === status;",
+            "      return keywordMatched && statusMatched;",
+            "    }).sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));",
+            "  }",
+        ]
+    if variant == 1:
+        return [
+            f"  {method_name}(record, decision, operatorName) {{",
+            "    const allowed = new Set(['APPROVED', 'REJECTED', 'RETURNED']);",
+            "    if (!allowed.has(decision)) throw new Error('复核结论不在允许范围内');",
+            "    const current = this.normalizeRecord(record);",
+            f"    current.module = {_json_literal(module.title)};",
+            f"    current.operation = {_json_literal(operation)};",
+            "    current.reviewedBy = this.normalizeOperator(operatorName);",
+            "    current.reviewedAt = new Date();",
+            "    current.afterStatus = decision === 'APPROVED' ? 'COMPLETED' : 'PROCESSING';",
+            "    this.applyStatus(current, current.afterStatus);",
+            "    this.appendAuditLine(current);",
+            "    return this.buildResponse(current);",
+            "  }",
+        ]
+    if variant == 2:
+        return [
+            f"  {method_name}(records) {{",
+            "    const statusSummary = {};",
+            "    const overdueCodes = [];",
+            "    for (const item of records || []) {",
+            "      const status = String(item.status || 'PENDING');",
+            "      statusSummary[status] = (statusSummary[status] || 0) + 1;",
+            "      if (item.overdue && !['COMPLETED', 'ARCHIVED'].includes(status)) overdueCodes.push(item.code || '-');",
+            "    }",
+            f"    return {{ module: {_json_literal(module.title)}, metric: {_json_literal(field)}, total: (records || []).length, statusSummary, overdueCodes }};",
+            "  }",
+        ]
+    if variant == 3:
+        return [
+            f"  {method_name}(records, operatorName) {{",
+            "    const operator = this.normalizeOperator(operatorName);",
+            "    const rows = ['编号,模块,操作,状态,负责人,更新时间'];",
+            "    for (const item of records || []) {",
+            "      const current = this.normalizeRecord(item);",
+            f"      const values = [current.code, {_json_literal(module.title)}, {_json_literal(operation)}, current.status || 'PENDING', operator, current.updatedAt || ''];",
+            "      rows.push(values.map((value) => String(value).replaceAll(',', '，')).join(','));",
+            "    }",
+            "    return rows;",
+            "  }",
+        ]
+    return [
+        f"  {method_name}(record, operatorName) {{",
+        "    const current = this.normalizeRecord(record);",
+        f"    current.module = {_json_literal(module.title)};",
+        f"    current.operation = {_json_literal(operation)};",
+        f"    current.focusField = {_json_literal(field)};",
+        "    current.operatorName = this.normalizeOperator(operatorName);",
+        "    current.beforeStatus = current.status || \"PENDING\";",
+        "    current.afterStatus = this.nextStatus(current.beforeStatus);",
+        "    current.updatedAt = new Date();",
+        "    this.validateRecord(current);",
+        "    this.applyStatus(current, current.afterStatus);",
+        "    this.appendAuditLine(current);",
+        "    return this.buildResponse(current);",
+        "  }",
+    ]
+
+
+def _javascript_scenario_catalog(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    missing_lines: int,
+    *,
+    module_pool: list[FeatureModule] | None = None,
+    class_name: str = "BusinessWorkflowEngine",
+    index_offset: int = 0,
+    scenario_minimum: int = 96,
+    scenario_padding: int = 16,
+) -> str:
     rows: list[str] = [
-        "class BusinessWorkflowEngine {",
+        f"class {class_name} {{",
         "  constructor() {",
         "    this.auditLines = [];",
         "    this.statusFlow = [\"PENDING\", \"PROCESSING\", \"COMPLETED\", \"ARCHIVED\"];",
         "    this.defaultOwner = \"system\";",
         "  }",
     ]
-    for index, module in _scenario_modules(blueprint, missing_lines, lines_per_item=12):
+    for index, module in _scenario_modules(
+        blueprint,
+        missing_lines,
+        lines_per_item=12,
+        module_pool=module_pool,
+        index_offset=index_offset,
+        minimum_count=scenario_minimum,
+        padding=scenario_padding,
+    ):
         operation = module.operations[(index - 1) % len(module.operations)] if module.operations else f"{module.title}处理"
         field = module.data_fields[(index - 1) % len(module.data_fields)] if module.data_fields else "业务状态"
         method_name = f"handle{_pascal(module.key)}{_pascal(_operation_token(operation))}{index:04d}"
-        rows.extend(
-            [
-                f"  {method_name}(record, operatorName) {{",
-                "    const current = this.normalizeRecord(record);",
-                f"    current.module = {_json_literal(module.title)};",
-                f"    current.operation = {_json_literal(operation)};",
-                f"    current.focusField = {_json_literal(field)};",
-                "    current.operatorName = this.normalizeOperator(operatorName);",
-                "    current.beforeStatus = current.status || \"PENDING\";",
-                "    current.afterStatus = this.nextStatus(current.beforeStatus);",
-                "    current.updatedAt = new Date();",
-                "    this.validateRecord(current);",
-                "    this.applyStatus(current, current.afterStatus);",
-                "    this.appendAuditLine(current);",
-                "    return this.buildResponse(current);",
-                "  }",
-            ]
-        )
+        rows.extend(_javascript_scenario_method_rows(index, module, operation, field, method_name))
     rows.extend(
         [
             "  normalizeRecord(record) {",
@@ -2372,41 +3979,44 @@ def _javascript_scenario_catalog(task: GenerationTask, blueprint: ProductBluepri
             "    return this.auditLines.slice();",
             "  }",
             "}",
-            "module.exports = new BusinessWorkflowEngine();",
+            f"module.exports = new {class_name}();",
         ]
     )
     return "\n".join(rows)
 
 
-def _python_scenario_catalog(task: GenerationTask, blueprint: ProductBlueprint, missing_lines: int) -> str:
+def _python_scenario_catalog(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    missing_lines: int,
+    *,
+    module_pool: list[FeatureModule] | None = None,
+    class_name: str = "BusinessWorkflowService",
+    index_offset: int = 0,
+    scenario_minimum: int = 96,
+    scenario_padding: int = 16,
+) -> str:
     rows: list[str] = [
         "from datetime import datetime",
-        "class BusinessWorkflowService:",
+        f"class {class_name}:",
         "    def __init__(self):",
         "        self.audit_lines = []",
         "        self.status_flow = ['PENDING', 'PROCESSING', 'COMPLETED', 'ARCHIVED']",
         "        self.default_owner = 'system'",
     ]
-    for index, module in _scenario_modules(blueprint, missing_lines, lines_per_item=12):
+    for index, module in _scenario_modules(
+        blueprint,
+        missing_lines,
+        lines_per_item=12,
+        module_pool=module_pool,
+        index_offset=index_offset,
+        minimum_count=scenario_minimum,
+        padding=scenario_padding,
+    ):
         operation = module.operations[(index - 1) % len(module.operations)] if module.operations else f"{module.title}处理"
         field = module.data_fields[(index - 1) % len(module.data_fields)] if module.data_fields else "业务状态"
         method_name = f"handle_{_snake(module.key)}_{_snake(_operation_token(operation))}_{index:04d}"
-        rows.extend(
-            [
-                f"    def {method_name}(self, record: dict | None, operator_name: str) -> dict:",
-                "        current = self.normalize_record(record)",
-                f"        current['module'] = {_python_literal(module.title)}",
-                f"        current['operation'] = {_python_literal(operation)}",
-                f"        current['focus_field'] = {_python_literal(field)}",
-                "        current['operator'] = self.normalize_operator(operator_name)",
-                "        current['before_status'] = current.get('status', 'PENDING')",
-                "        current['after_status'] = self.next_status(current['before_status'])",
-                "        current['updated_at'] = datetime.now().isoformat(timespec='seconds')",
-                "        self.validate_record(current)",
-                "        self.append_audit_line(current)",
-                "        return self.build_response(current)",
-            ]
-        )
+        rows.extend(_python_scenario_method_rows(index, module, operation, field, method_name))
     rows.extend(
         [
             "    def normalize_record(self, record: dict | None) -> dict:",
@@ -2433,7 +4043,7 @@ def _python_scenario_catalog(task: GenerationTask, blueprint: ProductBlueprint, 
             "        return {'success': True, 'data': record, 'audit_count': len(self.audit_lines)}",
             "    def create_business_code(self) -> str:",
             "        return f\"BUS-{len(self.audit_lines) + 1:06d}\"",
-            "workflow_service = BusinessWorkflowService()",
+            f"workflow_service = {class_name}()",
         ]
     )
     return "\n".join(rows)
@@ -2619,10 +4229,24 @@ def _html_scenario_catalog(task: GenerationTask, blueprint: ProductBlueprint, mi
     return "\n".join(rows)
 
 
-def _scenario_modules(blueprint: ProductBlueprint, missing_lines: int, lines_per_item: int) -> list[tuple[int, FeatureModule]]:
-    modules = blueprint.modules or [FeatureModule("business", "业务模块", "业务处理", ["BusinessRecord"])]
-    scenario_count = max(96, missing_lines // max(1, lines_per_item) + 16)
-    return [(index, modules[(index - 1) % len(modules)]) for index in range(1, scenario_count + 1)]
+def _scenario_modules(
+    blueprint: ProductBlueprint,
+    missing_lines: int,
+    lines_per_item: int,
+    *,
+    module_pool: list[FeatureModule] | None = None,
+    index_offset: int = 0,
+    minimum_count: int = 96,
+    padding: int = 16,
+) -> list[tuple[int, FeatureModule]]:
+    modules = module_pool or blueprint.modules or [FeatureModule("business", "业务模块", "业务处理", ["BusinessRecord"])]
+    item_size = max(1, lines_per_item)
+    required = (max(0, missing_lines) + item_size - 1) // item_size
+    scenario_count = max(max(1, minimum_count), required + max(0, padding))
+    return [
+        (index_offset + position, modules[(position - 1) % len(modules)])
+        for position in range(1, scenario_count + 1)
+    ]
 
 
 def _operation_token(value: str) -> str:
@@ -2634,6 +4258,14 @@ def _operation_token(value: str) -> str:
 
 def _json_literal(value: str) -> str:
     return json.dumps(str(value), ensure_ascii=False)
+
+
+def _json_value_literal(value) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _json_block_literal(value, *, indent: int = 2) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=indent)
 
 
 def _python_literal(value: str) -> str:
@@ -2750,20 +4382,38 @@ public class OperationTraceService
 """
 
 
-def _csharp_scenario_catalog(task: GenerationTask, blueprint: ProductBlueprint, missing_lines: int) -> str:
+def _csharp_scenario_catalog(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    missing_lines: int,
+    *,
+    module_pool: list[FeatureModule] | None = None,
+    class_name: str = "BusinessWorkflowService",
+    index_offset: int = 0,
+    scenario_minimum: int = 96,
+    scenario_padding: int = 16,
+) -> str:
     rows: list[str] = [
         "using System;",
         "using System.Collections.Generic;",
         "",
         f"namespace {_pascal(_ascii_token(task.software_name))}.Services;",
         "",
-        "public class BusinessWorkflowService",
+        f"public class {class_name}",
         "{",
         "    private readonly List<string> _auditLines = new();",
         "    private readonly List<string> _statusFlow = new() { \"PENDING\", \"PROCESSING\", \"COMPLETED\", \"ARCHIVED\" };",
         "    private const string DefaultOwner = \"system\";",
     ]
-    for index, module in _scenario_modules(blueprint, missing_lines, lines_per_item=12):
+    for index, module in _scenario_modules(
+        blueprint,
+        missing_lines,
+        lines_per_item=12,
+        module_pool=module_pool,
+        index_offset=index_offset,
+        minimum_count=scenario_minimum,
+        padding=scenario_padding,
+    ):
         operation = module.operations[(index - 1) % len(module.operations)] if module.operations else f"{module.title}处理"
         field = module.data_fields[(index - 1) % len(module.data_fields)] if module.data_fields else "业务状态"
         method_name = f"Handle{_pascal(module.key)}{_pascal(_operation_token(operation))}{index:0000}"

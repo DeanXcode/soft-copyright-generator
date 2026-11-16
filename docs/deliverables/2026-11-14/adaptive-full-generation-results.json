@@ -1,0 +1,105 @@
+{
+  "date": "2026-11-14",
+  "scope": "One fresh task, previous confirmed inputs and seed; no resumed stages or manual content correction. Automatic retries and one login page repair allowed.",
+  "run_dir": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\api-adaptive-deepseek-gpt-image-20261114-162448",
+  "text_model": "deepseek-v4.1-flash",
+  "image_model": "gpt-image-2",
+  "fresh_tasks": 1,
+  "successful_tasks": 1,
+  "elapsed_seconds": 754.6,
+  "stage_cache_hits": [],
+  "text_physical_requests": 68,
+  "complete_text_responses": 45,
+  "length_retries": 23,
+  "image_attempts": 1,
+  "image_successes": 1,
+  "image_seconds": 59.444,
+  "screenshot_count": 27,
+  "ready_for_delivery": true,
+  "findings": [],
+  "zip_path": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\api-adaptive-deepseek-gpt-image-20261114-162448\\sample-1\\output\\聚合剪辑软件-real-run-192936-1--材料包.zip",
+  "zip_integrity_ok": true,
+  "zip_file_count": 5,
+  "zip_bytes": 4894461,
+  "zip_sha256": "899a45bddcffc7a5b8d2cbb7c4253193b92c7ce90c96b3031843a1c00e1c968b",
+  "stage_timings": {
+    "blueprint": 126.91,
+    "manual_content": 71.4,
+    "source": 138.17,
+    "screenshots": 389.59,
+    "manual_docx": 0.87,
+    "source_docx": 1.59,
+    "pdf": 24.99,
+    "info": 0.0,
+    "package": 0.2,
+    "validate": 0.47
+  },
+  "usage_success_only": {
+    "prompt_tokens": 199202,
+    "completion_tokens": 90460,
+    "total_tokens": 289662
+  },
+  "usage_all_reported": {
+    "prompt_tokens": 303231,
+    "completion_tokens": 137360,
+    "total_tokens": 440591
+  },
+  "usage_limit": "Reported text tokens including failed length responses; image fees excluded; not an invoice.",
+  "warnings": [
+    "说明书部分正文页的 PDF 可提取文本少于 30 行，已按字符量和业务操作内容综合判定通过；提交前建议人工复核版面。"
+  ],
+  "quality_limits": {
+    "industry_subtype": "移动文件下载管理APP",
+    "manual_line_risk_pages": [
+      {
+        "page": 3,
+        "line_count": 27,
+        "character_count": 714
+      },
+      {
+        "page": 31,
+        "line_count": 24,
+        "character_count": 846
+      }
+    ]
+  },
+  "source_unchanged_during_api_run": true,
+  "post_run_changes": "Task snapshot endpoint redaction; generated report endpoint metadata cleaned, ZIP hash unchanged. No second full API run for this metadata-only change.",
+  "validation": {
+    "development_python": {
+      "passed": 385,
+      "seconds": 44.551,
+      "skipped": 0
+    },
+    "embedded_python": {
+      "passed": 385,
+      "seconds": 42.246,
+      "skipped": 0
+    },
+    "python_compile": true,
+    "electron_syntax": true,
+    "vite_build": true,
+    "diff_check": true
+  },
+  "source_sha256_during_api_run": {
+    "backend/softcopyright/llm/provider.py": "7a2755d803971b164bef43a8a07f8e5aceb27c35b80f57112b52e84954b06947",
+    "backend/softcopyright/llm/json_response.py": "d0bbc182b42d9cbcfc550365f7f2aa482c2a4b1ad43548cdd178ceb1c38c3142",
+    "backend/softcopyright/llm_blueprint.py": "6641c0723c8eb1e8a015ed8e602ef5fe381ca753b1ef21637a524b334116a9f2",
+    "backend/softcopyright/frontend_codegen/page_spec_request.py": "1e6ad1be838dd9401861c3902c318a8e4c4e506f492e73077b0689b9902d95d4",
+    "backend/softcopyright/ai_frontend_codegen.py": "a938ebf87b978c8d6a850e4f8474b7850ab7ba2cea7e2b9b03f6636217f5c21f",
+    "backend/softcopyright/llm_architecture.py": "3d986c0b7b36b57c92d5ddd3234b647694f2148c2dfeefc6ec4a41cff801520e",
+    "backend/softcopyright/ui_blueprint.py": "080b1c666bd7e65bbb11cbd6a4d91dd0a580f0ff6a0470b2ff2b535882d63726",
+    "backend/softcopyright/llm_manual.py": "68425cfc7d33d90642e19f3f42b8158063b3dea6e6bb444ea8f40f12f16f5673",
+    "backend/softcopyright/feature_inference.py": "6be7415ac195057bec19342ef02b0284798f492d137a4c1a5c886a5513289ca1"
+  },
+  "source_sha256_after_metadata_fix": {
+    "backend\\softcopyright\\llm\\provider.py": "7a2755d803971b164bef43a8a07f8e5aceb27c35b80f57112b52e84954b06947",
+    "backend\\softcopyright\\models.py": "a5bb46fb9b72bd285aabfff4e2f49c7d356f892f8aff6b5e72576b3a67078463"
+  },
+  "final_credential_scan": {
+    "files_and_archive_entries_checked": 762,
+    "credential_match_count": 0,
+    "matching_paths": [],
+    "scope": "Current run files including nested ZIP/DOCX, new report, results JSON and current progress document; four credential/endpoint literals in UTF-8 and UTF-16LE."
+  }
+}

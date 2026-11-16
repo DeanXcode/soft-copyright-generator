@@ -1,5 +1,17 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import appIcon from "../../build/icon.png";
+import QueuePanel from "./components/QueuePanel";
+import RendererErrorBoundary from "./components/RendererErrorBoundary";
+import ResultReport from "./components/ResultReport";
+import SettingsDrawer from "./components/SettingsDrawer";
+import useTaskQueuePersistence from "./hooks/useTaskQueuePersistence";
+import { modelProviders, textProviderChoices } from "./modelOptions";
+import {
+  enqueueOrReplaceRetryTask,
+  normalizeBusinessPlanState,
+  normalizeModelCatalogState
+} from "./stateNormalization";
 import {
   AlertTriangle,
   Archive,
@@ -9,63 +21,59 @@ import {
   FileCheck2,
   FileText,
   FolderOpen,
+  Image as ImageIcon,
   Loader2,
   PackageCheck,
   Plus,
   RefreshCw,
   Save,
-  Settings2,
+  SlidersHorizontal,
   Sparkles,
-  TerminalSquare,
-  Trash2,
-  Wand2
+  Square,
+  Trash2
 } from "lucide-react";
 import "./styles.css";
 
-const softwareCategories = ["应用软件", "嵌入式软件", "中间件", "操作系统"];
+const workflowStages = ["输入名称", "自动规划", "生成材料", "检查交付"];
+const reasoningEffortLabels = {
+  minimal: "极简",
+  low: "低",
+  medium: "中",
+  high: "高",
+  xhigh: "极高"
+};
 
-const productTypes = [
-  "APP",
-  "游戏软件",
-  "教育软件",
-  "金融软件",
-  "医疗软件",
-  "地理信息软件",
-  "云计算软件",
-  "信息安全软件",
-  "大数据软件",
-  "人工智能软件",
-  "VR软件",
-  "5G软件",
-  "小程序",
-  "物联网软件",
-  "智慧城市软件"
-];
-
-const modelProviders = [
-  {
-    value: "gpt",
-    label: "GPT",
-    description: "仅使用 GPT 生成大纲、蓝图、说明书正文和界面内容。",
-    provider: "custom",
-    modelName: "gpt",
-    cost: "唯一模式"
-  }
-];
+const stagePlannedSteps = {
+  visual_reference: [
+    { label: "准备视觉参考页面清单", match: ["视觉参考页面清单", "页面清单"] },
+    { label: "AI 生成全局风格提示词", match: ["全局视觉风格提示词", "生成视觉提示词"] },
+    { label: "gpt-image-2 生成全局风格参考图", match: ["全局视觉风格参考图", "视觉参考稿", "视觉参考图"] }
+  ],
+  screenshots: [
+    { label: "复用风格参考图", match: ["复用全局风格参考图", "根据参考图"] },
+    { label: "AI 按风格参考图生成全部界面代码", match: ["全局视觉风格参考图生成界面代码", "生成界面代码"] },
+    { label: "运行生成项目并重截手册图", match: ["生成项目服务", "渲染界面截图"] }
+  ]
+};
 
 const generationStages = [
   ["start", "提交任务"],
-  ["prepare", "理解软件名称"],
+  ["prepare", "确认业务蓝图"],
   ["blueprint", "生成产品蓝图"],
   ["manual_content", "生成说明书正文"],
-  ["source", "生成源码工程"],
-  ["source_doc", "源码鉴别材料"],
+  ["visual_reference", "生成风格参考图"],
+  ["source", "业务后端与接口"],
+  ["screenshots", "风格图到界面截图"],
   ["manual", "生成文档材料"],
-  ["screenshots", "生成界面截图"],
+  ["source_doc", "源码鉴别材料"],
   ["pdf", "转换 PDF"],
   ["info", "申请信息表"],
   ["package", "打包与校验"]
 ];
+
+const OUTLINE_TIMEOUT_BUFFER_MS = 30000;
+const QUEUE_STORAGE_KEY = "soft-copyright-generator.taskQueue.v1";
+let cachedQueueState = null;
 
 function App() {
   const bridgeAvailable = typeof window !== "undefined" && window.softCopyright;
@@ -78,15 +86,32 @@ function App() {
     featureHint: "",
     modelPlan: "gpt",
     modelProvider: "custom",
-    modelName: "gpt-4o-mini",
-    randomness: "standard"
+    modelName: "gpt-5.5",
+    randomness: "standard",
+    blueprintReviewBeforeGeneration: false
   });
   const [modelConfig, setModelConfig] = useState({
     mode: "gpt",
-    modelName: "gpt-4o-mini",
+    textProvider: "custom",
+    providerProfiles: {},
+    modelName: "gpt-5.5",
+    outlineModelName: "gpt-5.5",
+    frontendModelName: "gpt-5.5",
+    frontendWorkers: "auto",
+    outlineTimeoutSeconds: 60,
+    reasoningEffort: "medium",
     apiBaseUrl: "",
+    apiBaseUrlMasked: "未配置",
+    apiBaseUrlConfigured: false,
     apiKey: "",
     apiKeyConfigured: false,
+    imageModelName: "gpt-image-2",
+    imageUseTextApi: true,
+    imageApiBaseUrl: "",
+    imageApiBaseUrlMasked: "未单独配置，将复用文本请求地址",
+    imageApiBaseUrlConfigured: false,
+    imageApiKey: "",
+    imageApiKeyConfigured: false,
     preset: false
   });
   const [account, setAccount] = useState({
@@ -95,44 +120,181 @@ function App() {
     balanceLabel: "待配置",
     updatedAt: ""
   });
+  const [modelCatalogState, setModelCatalogState] = useState({ status: "idle", provider: "", models: [], message: "" });
+  const modelCatalog = useMemo(() => normalizeModelCatalogState(modelCatalogState), [modelCatalogState]);
+  const setModelCatalog = (nextValue) => {
+    setModelCatalogState((current) => normalizeModelCatalogState(typeof nextValue === "function" ? nextValue(normalizeModelCatalogState(current)) : nextValue));
+  };
   const [status, setStatus] = useState("idle");
   const [result, setResult] = useState(null);
   const [progress, setProgress] = useState(0);
   const [events, setEvents] = useState([]);
   const [processClock, setProcessClock] = useState({ mode: "idle", startedAt: 0, elapsedMs: 0 });
-  const [businessPlan, setBusinessPlan] = useState(createEmptyPlan());
+  const [businessPlanState, setBusinessPlanState] = useState(createEmptyPlan);
+  const businessPlan = useMemo(() => normalizeBusinessPlanState(businessPlanState), [businessPlanState]);
+  const setBusinessPlan = (nextValue) => {
+    setBusinessPlanState((current) => {
+      const normalizedCurrent = normalizeBusinessPlanState(current);
+      const next = typeof nextValue === "function" ? nextValue(normalizedCurrent) : nextValue;
+      return normalizeBusinessPlanState(next);
+    });
+  };
   const [featureHintMeta, setFeatureHintMeta] = useState({});
   const [inputText, setInputText] = useState("");
   const [outlineState, setOutlineState] = useState("empty");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [configStatus, setConfigStatus] = useState("");
-
-  const canPlan = extractSoftwareName(form.name).length > 0;
-  const planReady = businessPlan.modules.length > 0;
-  const gptConfigured = Boolean(
-    modelConfig.apiBaseUrl.trim() && (modelConfig.apiKey.trim() || (bridgeAvailable && modelConfig.apiKeyConfigured))
+  const [cancelRequested, setCancelRequested] = useState(false);
+  const { taskQueue, setTaskQueue, queuePaused, setQueuePaused, taskQueueRef } = useTaskQueuePersistence(
+    loadPersistedQueueState,
+    persistQueueState
   );
+  const [recoverableTasks, setRecoverableTasks] = useState([]);
+  const [recoveryStatus, setRecoveryStatus] = useState("");
+  const [activeQueueTaskId, setActiveQueueTaskId] = useState("");
+  const activeQueueTaskIdRef = useRef(activeQueueTaskId);
+  const queueRunningRef = useRef(false);
+
+  const gptConfigured =
+    form.modelPlan === "template" ||
+    Boolean(
+      (modelConfig.apiBaseUrlConfigured || modelConfig.apiBaseUrl.trim()) &&
+        (modelConfig.apiKey.trim() || (bridgeAvailable && modelConfig.apiKeyConfigured))
+    );
+  const isGeneratingStatus = status === "running" || status === "planning";
+  const currentPromptText = isGeneratingStatus ? inputText : inputText || form.name;
+  const currentSoftwareName = extractSoftwareName(currentPromptText);
+  const canPlan = currentSoftwareName.length > 0;
+  const planReady = businessPlan.modules.length > 0;
+  const canRetryFromConfirmedOutline = (status === "error" || status === "cancelled") && canPlan && planReady && outlineState === "confirmed" && gptConfigured;
   const canGenerate = canPlan && planReady && outlineState === "confirmed" && status !== "running" && status !== "planning" && gptConfigured;
-  const canPrimaryAction = canPlan && status !== "running" && status !== "planning";
-  const primaryActionLabel = primaryButtonLabel(status, outlineState, planReady, gptConfigured);
+  const canCancelTask = isGeneratingStatus && bridgeAvailable && Boolean(window.softCopyright.cancelGeneration) && !cancelRequested;
+  const canQueueQuickTask = isGeneratingStatus && !cancelRequested && Boolean(extractSoftwareName(inputText)) && gptConfigured;
+  const canPrimaryAction = isGeneratingStatus ? canQueueQuickTask || canCancelTask : canPlan;
+  const queueSummary = useMemo(() => summarizeQueue(taskQueue), [taskQueue]);
+  const promptTextareaValue = isGeneratingStatus ? inputText : currentPromptText;
+  const promptPlaceholder = isGeneratingStatus
+    ? "输入下一个软件名可加入队列；留空则可中止当前生成。"
+    : "输入软件名称，例如：小风点餐。也可以写补充要求。";
+  const primaryActionLabel = isGeneratingStatus
+    ? canQueueQuickTask
+      ? "加入队列"
+      : cancelRequested
+        ? "正在中止..."
+        : "中止生成"
+    : primaryButtonLabel(
+        status,
+        outlineState,
+        planReady,
+        gptConfigured,
+        canRetryFromConfirmedOutline,
+        form.blueprintReviewBeforeGeneration
+      );
+  const hasOutlineError = canPlan && Boolean(configStatus) && configStatus !== "saved" && configStatus !== "saving";
+  const taskStatusText = statusLabel(status, { canPlan, hasOutlineError });
   const generatedFiles = useMemo(() => buildGeneratedFiles(result), [result]);
   const qualityItems = useMemo(() => buildQualityItems(result), [result]);
   const activeEvent = currentEvent(events);
 
   useEffect(() => {
+    activeQueueTaskIdRef.current = activeQueueTaskId;
+  }, [activeQueueTaskId]);
+
+  useEffect(() => {
+    if (!bridgeAvailable || !window.softCopyright.listRecoverableTasks) return undefined;
+    let cancelled = false;
+    window.softCopyright
+      .listRecoverableTasks()
+      .then((response) => {
+        if (cancelled) return;
+        const tasks = Array.isArray(response?.tasks) ? response.tasks : [];
+        setRecoverableTasks(tasks);
+        setRecoveryStatus(tasks.length ? `发现 ${tasks.length} 个可恢复的未完成任务` : "");
+      })
+      .catch((error) => {
+        if (!cancelled) setRecoveryStatus(sanitizeErrorMessage(error?.message || "恢复任务扫描失败"));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bridgeAvailable, form.modelPlan]);
+
+  useEffect(() => {
     if (!bridgeAvailable) return undefined;
     return window.softCopyright.onGenerateEvent((event) => {
-      setProgress(event.progress || 0);
-      setEvents((current) => [
-        ...current,
-        {
-          ...event,
-          at: new Date().toLocaleTimeString(),
-          elapsedMs: processClock.startedAt ? Date.now() - processClock.startedAt : 0
-        }
-      ].slice(-500));
+      const enrichedEvent = {
+        ...event,
+        at: new Date().toLocaleTimeString(),
+        elapsedMs: processClock.startedAt ? Date.now() - processClock.startedAt : 0
+      };
+      setProgress(enrichedEvent.progress || 0);
+      setEvents((current) => [...current, enrichedEvent].slice(-500));
+      const taskId = activeQueueTaskIdRef.current;
+      const terminalResult = resultFromGenerationEvent(enrichedEvent);
+      if (taskId) {
+        updateQueueTask(taskId, (task) => ({
+          ...task,
+          status: terminalResult ? (terminalResult.cancelled ? "cancelled" : terminalResult.ok ? "success" : "error") : task.status,
+          phase: terminalResult?.ok ? "done" : task.phase,
+          progress: terminalResult?.ok ? 100 : enrichedEvent.progress || task.progress || 0,
+          events: [...(task.events || []), enrichedEvent].slice(-500),
+          result: terminalResult || task.result,
+          finishedAt: terminalResult ? Date.now() : task.finishedAt
+        }));
+      }
+      if (terminalResult) {
+        setResult(terminalResult);
+        setStatus(terminalResult.cancelled ? "cancelled" : terminalResult.ok ? "success" : "error");
+        setProcessClock((current) => ({ ...current, elapsedMs: Date.now() - (current.startedAt || Date.now()) }));
+        if (!terminalResult.ok || terminalResult.cancelled) setQueuePaused(true);
+      }
     });
   }, [bridgeAvailable, processClock.startedAt]);
+
+  useEffect(() => {
+    if (!bridgeAvailable || !window.softCopyright.getGenerationStatus) return undefined;
+    let cancelled = false;
+    const syncActiveGeneration = () => {
+      window.softCopyright
+        .getGenerationStatus()
+        .then((response) => {
+          if (cancelled || !response?.running) return;
+          const startedAt = Number(response.startedAt || Date.now());
+          const event = createProcessEvent(
+            response.stage || "start",
+            Number(response.progress || 0),
+            response.message || "后台材料生成任务仍在运行，已重新连接状态",
+            startedAt
+          );
+          setStatus("running");
+          setProgress(event.progress || 0);
+          setProcessClock({ mode: "materials", startedAt, elapsedMs: Math.max(0, Date.now() - startedAt) });
+          setEvents((current) => {
+            const latest = current[current.length - 1];
+            if (latest?.message === event.message && latest?.stage === event.stage) return current;
+            return [...current, event].slice(-500);
+          });
+          setQueuePaused(true);
+          setRecoveryStatus(`后台任务仍在运行：${response.title || "材料生成"}`);
+        })
+        .catch((error) => {
+          if (!cancelled) setRecoveryStatus(sanitizeErrorMessage(error?.message || "后台任务状态同步失败"));
+        });
+    };
+    syncActiveGeneration();
+    const timer = window.setInterval(syncActiveGeneration, 4000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [bridgeAvailable]);
+
+  useEffect(() => {
+    if (queuePaused || queueRunningRef.current || status === "planning" || status === "running") return;
+    const nextTask = taskQueue.find((item) => item.status === "queued");
+    if (!nextTask) return;
+    runQueuedTask(nextTask.id);
+  }, [taskQueue, queuePaused, status]);
 
   useEffect(() => {
     if (status !== "planning" && status !== "running") return undefined;
@@ -162,26 +324,49 @@ function App() {
     let cancelled = false;
     window.softCopyright.getModelConfig().then((config) => {
       if (cancelled || !config) return;
+      const plan = modelProviders.find((item) => item.value === config.mode) || modelProviders.find((item) => item.value === "gpt");
       setModelConfig({
-        mode: "gpt",
-        modelName: config.modelName || "gpt-4o-mini",
-        apiBaseUrl: config.apiBaseUrl || "",
-        apiKey: config.apiKey || "",
-        apiKeyConfigured: Boolean(config.apiKeyConfigured || config.apiKey),
+        mode: plan.value,
+        textProvider: config.textProvider || "custom",
+        providerProfiles: config.providerProfiles || {},
+        modelName: config.modelName || "gpt-5.5",
+        outlineModelName: config.outlineModelName || config.modelName || "gpt-5.5",
+        frontendModelName: config.frontendModelName || config.modelName || "gpt-5.5",
+        frontendWorkers: String(config.frontendWorkers || "auto"),
+        outlineTimeoutSeconds: Number(config.outlineTimeoutSeconds || 60),
+        reasoningEffort: config.reasoningEffort || "medium",
+        apiBaseUrl: "",
+        apiBaseUrlMasked: config.apiBaseUrlMasked || (config.apiBaseUrlConfigured ? "已配置（地址已隐藏）" : "未配置"),
+        apiBaseUrlConfigured: Boolean(config.apiBaseUrlConfigured),
+        apiKey: "",
+        apiKeyConfigured: Boolean(config.apiKeyConfigured),
+        imageModelName: config.imageModelName || "gpt-image-2",
+        imageUseTextApi: config.imageUseTextApi !== false,
+        imageApiBaseUrl: "",
+        imageApiBaseUrlMasked:
+          config.imageApiBaseUrlMasked ||
+          (config.imageApiBaseUrlConfigured ? "已单独配置（地址已隐藏）" : "未单独配置，将复用文本请求地址"),
+        imageApiBaseUrlConfigured: Boolean(config.imageApiBaseUrlConfigured),
+        imageApiKey: "",
+        imageApiKeyConfigured: Boolean(config.imageApiKeyConfigured),
         preset: Boolean(config.preset)
       });
-      const plan = modelProviders[0];
       setForm((current) => ({
         ...current,
-        modelPlan: "gpt",
+        modelPlan: plan.value,
         modelProvider: plan.provider,
-        modelName: config.modelName || plan.modelName
+        modelName: plan.value === "gpt" ? config.modelName || plan.modelName : plan.modelName
       }));
     });
     return () => {
       cancelled = true;
     };
   }, [bridgeAvailable]);
+
+  useEffect(() => {
+    if (!settingsOpen || form.modelPlan !== "gpt" || !bridgeAvailable || !window.softCopyright.listAvailableModels) return;
+    refreshAvailableModels();
+  }, [settingsOpen, bridgeAvailable, form.modelPlan]);
 
   function updateField(key, value) {
     setResult(null);
@@ -196,75 +381,157 @@ function App() {
       setEvents([]);
       setStatus("idle");
       setProgress(0);
+      setCancelRequested(false);
       setProcessClock({ mode: "idle", startedAt: 0, elapsedMs: 0 });
     }
   }
 
-  async function inferBusinessPlan(payload) {
+  function handlePromptTextChange(value) {
+    if (isGeneratingStatus) {
+      setInputText(value);
+      return;
+    }
+    updateField("name", value);
+  }
+
+  async function inferBusinessPlan(payload, startedAt = Date.now()) {
     if (!payload.name.trim()) return null;
+    const inferredProductType = inferProductType(payload.name, payload.featureHint || "");
+    const templateMode = form.modelPlan === "template";
     let featureHint = "";
     let meta = {};
-    if (!modelConfig.apiBaseUrl.trim() || !(modelConfig.apiKey.trim() || (bridgeAvailable && modelConfig.apiKeyConfigured))) {
-      setConfigStatus("请先配置 GPT 请求地址和 API Key");
+    if (!templateMode && !(modelConfig.apiBaseUrlConfigured || modelConfig.apiBaseUrl.trim())) {
+      const message = "请先配置文本模型请求地址";
+      setConfigStatus(message);
       setSettingsOpen(true);
-      return null;
+      return { error: message };
+    }
+    if (!templateMode && !(modelConfig.apiKey.trim() || (bridgeAvailable && modelConfig.apiKeyConfigured))) {
+      const message = "请先配置文本模型 API Key";
+      setConfigStatus(message);
+      setSettingsOpen(true);
+      return { error: message };
     }
     setStatus("planning");
     try {
-      const response =
-        bridgeAvailable && window.softCopyright.inferFeatureHint
-          ? await window.softCopyright.inferFeatureHint({ ...payload, modelPlan: "gpt", modelProvider: "custom" })
-          : await inferFeatureHintThroughDevApi({
-              ...payload,
-              modelName: modelConfig.modelName,
-              apiBaseUrl: modelConfig.apiBaseUrl,
-              apiKey: modelConfig.apiKey
-            });
-      if (response?.ok && response.featureHint) {
-        featureHint = response.featureHint;
-        meta = response.meta || {};
+      if (templateMode) {
+        featureHint = [inferFeatureHint(payload.name, inferredProductType), payload.featureHint || ""].filter(Boolean).join("、");
+        meta = {
+          feature_hint_source: "local-template",
+          feature_hint_keywords: splitTerms(featureHint),
+          no_token_consumption: true
+        };
       } else {
-        setConfigStatus(response?.message || response?.stderr || "GPT 大纲生成失败，请检查接口配置");
-        setSettingsOpen(true);
-        return null;
+        const request =
+          bridgeAvailable && window.softCopyright.inferFeatureHint
+            ? window.softCopyright.inferFeatureHint({
+                ...payload,
+                productType: inferredProductType,
+                modelPlan: "gpt",
+                modelProvider: "custom",
+                modelName: modelConfig.outlineModelName || modelConfig.modelName,
+                timeoutSeconds: modelConfig.outlineTimeoutSeconds || 60
+              })
+            : inferFeatureHintThroughDevApi({
+                ...payload,
+                productType: inferredProductType,
+                modelName: modelConfig.outlineModelName || modelConfig.modelName,
+                timeoutSeconds: modelConfig.outlineTimeoutSeconds || 60,
+                apiBaseUrl: modelConfig.apiBaseUrl,
+                apiKey: modelConfig.apiKey
+              });
+        const outlineTimeoutMs = normalizeOutlineTimeout(modelConfig.outlineTimeoutSeconds || 60) * 2 * 1000 + OUTLINE_TIMEOUT_BUFFER_MS;
+        const response = await withTimeout(request, outlineTimeoutMs, "GPT 蓝图生成超时，请稍后重试或检查模型网关响应速度");
+        if (response?.cancelled) {
+          return { cancelled: true };
+        }
+        if (response?.ok && response.featureHint) {
+          featureHint = response.featureHint;
+          meta = response.meta || {};
+        } else {
+          const message = sanitizeErrorMessage(response?.message || response?.stderr || "GPT 蓝图生成失败，请检查服务配置");
+          setConfigStatus(message);
+          setEvents((current) => [...current, createProcessEvent("outline", 0, message, startedAt)]);
+          if (response?.meta?.requires_gpt_config) {
+            setSettingsOpen(true);
+          }
+          return { error: message };
+        }
       }
-    } catch (_error) {
-      setConfigStatus("GPT 大纲生成失败，请检查接口配置");
-      setSettingsOpen(true);
-      return null;
+    } catch (error) {
+      const message = sanitizeErrorMessage(error?.message || "GPT 蓝图生成失败，请检查服务配置");
+      setConfigStatus(message);
+      setEvents((current) => [...current, createProcessEvent("outline", 0, message, startedAt)]);
+      return { error: message };
     }
     return {
       hint: featureHint,
       meta,
-      plan: buildBusinessPlan(payload.name, payload.productType, featureHint, meta)
+      plan: buildBusinessPlan(payload.name, inferredProductType, featureHint, meta)
     };
   }
 
   async function regeneratePlan() {
-    const name = extractSoftwareName(form.name || inputText);
+    const promptText = inputText || form.name;
+    const name = extractSoftwareName(promptText);
     if (!name || status === "running") return;
     const startedAt = Date.now();
     setResult(null);
+    setCancelRequested(false);
     setProgress(6);
     setStatus("planning");
     setProcessClock({ mode: "outline", startedAt, elapsedMs: 0 });
+    const templateMode = form.modelPlan === "template";
     setEvents([createProcessEvent("outline", 6, `正在读取软件名称「${name}」和产品类型`, startedAt)]);
     await wait(180);
     setProgress(18);
     setEvents((current) => [
       ...current,
-      createProcessEvent("outline", 18, "正在构建 GPT 结构化蓝图请求，要求返回模块分类、说明、数据对象和页面入口", startedAt)
+      createProcessEvent("outline", 18, templateMode ? "正在使用本地规则构建零 token 模块草案" : "正在构建两段式 GPT 蓝图请求，先识别名称语义，再生成模块草案", startedAt)
     ]);
     await wait(180);
     setProgress(32);
     setEvents((current) => [
       ...current,
-      createProcessEvent("outline", 32, "正在调用 GPT 识别名称语义，当前等待模型返回 JSON 蓝图", startedAt)
+      createProcessEvent("outline", 32, templateMode ? "Default Template 正在生成可编辑模块，不调用模型接口" : "正在调用 GPT 识别名称语义，随后会基于关键词生成可编辑模块", startedAt)
     ]);
-    const response = await inferBusinessPlan({ ...form, name, featureHint: extractInputSupplement(form.name || inputText) });
+    const response = await inferBusinessPlan({ ...form, name, featureHint: extractInputSupplement(promptText) }, startedAt);
+    if (response?.cancelled) {
+      setResult({
+        ok: false,
+        cancelled: true,
+        zipPath: "",
+        outputDir: "",
+        checks: {},
+        warnings: [],
+        stdout: "",
+        stderr: "已中止蓝图生成"
+      });
+      setStatus("cancelled");
+      setCancelRequested(false);
+      setProcessClock((current) => ({ ...current, elapsedMs: Date.now() - startedAt }));
+      return;
+    }
+    if (response?.error) {
+      setProgress(0);
+      setStatus(businessPlan.modules.length ? "editing" : "idle");
+      setCancelRequested(false);
+      setProcessClock({ mode: "idle", startedAt: 0, elapsedMs: 0 });
+      return;
+    }
     if (!response) {
       setProgress(0);
       setStatus(businessPlan.modules.length ? "editing" : "idle");
+      setCancelRequested(false);
+      setProcessClock({ mode: "idle", startedAt: 0, elapsedMs: 0 });
+      return;
+    }
+    const responsePlan = normalizeBusinessPlanState(response.plan);
+    if (!responsePlan.modules.length) {
+      setConfigStatus("蓝图返回结构不完整，未读取到有效模块，请重试当前蓝图请求");
+      setProgress(0);
+      setStatus("idle");
+      setCancelRequested(false);
       setProcessClock({ mode: "idle", startedAt: 0, elapsedMs: 0 });
       return;
     }
@@ -274,7 +541,7 @@ function App() {
       createProcessEvent(
         "outline",
         72,
-        `已收到 GPT 结构化结果，正在校验 ${response.plan.modules.length} 个模块的重复度和领域一致性`,
+        `${templateMode ? "已生成本地模板结果" : "已收到 GPT 结构化结果"}，正在校验 ${responsePlan.modules.length} 个模块的重复度和领域一致性`,
         startedAt
       )
     ]);
@@ -282,12 +549,18 @@ function App() {
     setProgress(88);
     setEvents((current) => [
       ...current,
-      createProcessEvent("outline", 88, "正在整理为可编辑蓝图，保留 GPT 的分类、模块说明、流程和页面信息", startedAt)
+      createProcessEvent("outline", 88, templateMode ? "正在整理本地模板蓝图，确认本次不消耗 token" : "正在整理为可编辑蓝图，保留 GPT 的分类、模块说明、流程和页面信息", startedAt)
     ]);
     await wait(180);
     setFeatureHintMeta({ ...(response.meta || {}), _plannedAt: new Date().toLocaleTimeString() });
-    setBusinessPlan(response.plan);
-    setForm((current) => ({ ...current, featureHint: serializePlan(response.plan) }));
+    setBusinessPlan(responsePlan);
+    setForm((current) => ({
+      ...current,
+      productType: responsePlan.productType || inferProductType(name, response.hint),
+      softwareCategory: inferSoftwareCategory(name, response.hint),
+      language: "自动选择",
+      featureHint: serializePlan(responsePlan)
+    }));
     setOutlineState("draft");
     setProgress(100);
     setEvents((current) => [
@@ -295,11 +568,12 @@ function App() {
       createProcessEvent(
         "outline",
         100,
-        `已生成 ${response.plan.modules.length} 个可申请材料使用的蓝图模块，可编辑后确认生成材料包`,
+        `已生成 ${responsePlan.modules.length} 个可申请材料使用的蓝图模块，可编辑后确认生成材料包`,
         startedAt
       )
     ]);
     setProcessClock((current) => ({ ...current, elapsedMs: Date.now() - startedAt }));
+    setCancelRequested(false);
     setStatus("editing");
   }
 
@@ -318,8 +592,26 @@ function App() {
   async function regenerateModule(moduleId) {
     const moduleIndex = businessPlan.modules.findIndex((module) => module.id === moduleId);
     if (moduleIndex < 0) return;
+    if (form.modelPlan === "template") {
+      const targetModule = businessPlan.modules[moduleIndex];
+      const next = {
+        ...businessPlan,
+        modules: businessPlan.modules.map((module, index) =>
+          module.id === moduleId ? regenerateModuleBlueprint(module, businessPlan, index) : module
+        )
+      };
+      setBusinessPlan(next);
+      setForm((formState) => ({ ...formState, featureHint: serializePlan(next) }));
+      setFeatureHintMeta((current) => ({ ...current, feature_hint_source: "local-template", no_token_consumption: true }));
+      setEvents((current) => [
+        ...current,
+        createProcessEvent("outline", 100, `已用本地规则刷新「${targetModule.title}」，未调用模型接口`)
+      ]);
+      setStatus("editing");
+      return;
+    }
     if (bridgeAvailable && !gptConfigured) {
-      setConfigStatus("请先配置 GPT 请求地址和 API Key");
+      setConfigStatus("请先选择文本模型供应商并配置 API Key");
       setSettingsOpen(true);
       return;
     }
@@ -327,6 +619,7 @@ function App() {
       const startedAt = Date.now();
       const targetModule = businessPlan.modules[moduleIndex];
       setOutlineState("draft");
+      setCancelRequested(false);
       setStatus("planning");
       setProgress(26);
       setProcessClock({ mode: "outline", startedAt, elapsedMs: 0 });
@@ -339,6 +632,22 @@ function App() {
         name: businessPlan.softwareName || form.name,
         featureHint: `请基于当前蓝图重新生成第 ${moduleIndex + 1} 个模块，保持软件名称语义一致。当前模块：${targetModule.title}。当前蓝图：${serializePlan(businessPlan)}`
       });
+      if (response?.cancelled) {
+        setResult({
+          ok: false,
+          cancelled: true,
+          zipPath: "",
+          outputDir: "",
+          checks: {},
+          warnings: [],
+          stdout: "",
+          stderr: "已中止蓝图生成"
+        });
+        setStatus("cancelled");
+        setCancelRequested(false);
+        setProcessClock((current) => ({ ...current, elapsedMs: Date.now() - startedAt }));
+        return;
+      }
       if (response?.plan?.modules?.length) {
         const replacement = response.plan.modules[moduleIndex] || response.plan.modules[0];
         const next = {
@@ -359,6 +668,7 @@ function App() {
       }
       setProgress(0);
       setProcessClock((current) => ({ ...current, elapsedMs: Date.now() - startedAt }));
+      setCancelRequested(false);
       setStatus("editing");
       return;
     }
@@ -460,64 +770,197 @@ function App() {
 
   function updateModelPlan(planValue) {
     const plan = modelProviders.find((item) => item.value === planValue) || modelProviders[0];
-    setModelConfig((current) => ({ ...current, mode: "gpt" }));
+    setModelConfig((current) => ({ ...current, mode: plan.value }));
     setForm((current) => ({
       ...current,
-      modelPlan: "gpt",
+      modelPlan: plan.value,
       modelProvider: plan.provider,
-      modelName: modelConfig.modelName || plan.modelName
+      modelName: plan.value === "gpt" ? modelConfig.modelName || plan.modelName : plan.modelName
     }));
+    setAccount(
+      plan.value === "template"
+        ? { status: "local", accountName: "Default Template", balanceLabel: "不消耗 token", updatedAt: "", message: "本地生成模式" }
+        : { status: "loading", accountName: "AI 账户", balanceLabel: "读取中", updatedAt: "", message: "" }
+    );
   }
 
   function updateModelConfig(key, value) {
     setConfigStatus("");
-    setModelConfig((current) => ({ ...current, [key]: value }));
+    setModelConfig((current) => {
+      if (key === "textProvider") {
+        const choice = textProviderChoices.find((item) => item.value === value) || textProviderChoices[0];
+        const savedProfile = current.providerProfiles?.[choice.value] || {};
+        const nextModel = savedProfile.modelName || choice.defaultModel;
+        return {
+          ...current,
+          textProvider: choice.value,
+          modelName: nextModel,
+          outlineModelName: savedProfile.outlineModelName || nextModel,
+          frontendModelName: savedProfile.frontendModelName || nextModel,
+          apiBaseUrl: "",
+          apiBaseUrlMasked: choice.addressMode === "preset" ? "官方预设（地址已隐藏）" : savedProfile.baseUrlConfigured ? "已配置（地址已隐藏）" : "未配置",
+          apiBaseUrlConfigured: choice.addressMode === "preset" || Boolean(savedProfile.baseUrlConfigured),
+          apiKey: "",
+          apiKeyConfigured: Boolean(savedProfile.apiKeyConfigured),
+          imageUseTextApi: choice.value === "custom" ? current.imageUseTextApi : false
+        };
+      }
+      const nextValue = key === "outlineTimeoutSeconds" ? normalizeOutlineTimeout(value) : value;
+      const next = { ...current, [key]: nextValue };
+      if (key === "modelName" && (!current.outlineModelName || current.outlineModelName === current.modelName)) {
+        next.outlineModelName = value;
+      }
+      if (key === "modelName" && (!current.frontendModelName || current.frontendModelName === current.modelName)) {
+        next.frontendModelName = value;
+      }
+      return next;
+    });
     if (key === "modelName") {
       setForm((current) => ({ ...current, modelName: value }));
+    }
+    if (key === "textProvider") {
+      const choice = textProviderChoices.find((item) => item.value === value) || textProviderChoices[0];
+      setForm((current) => ({ ...current, modelName: choice.defaultModel }));
+      setModelCatalog({ status: "idle", provider: choice.value, models: [], message: "保存供应商配置后可刷新该供应商的模型列表。" });
     }
   }
 
   async function saveModelConfig() {
+    const separateImageApiReady =
+      modelConfig.imageUseTextApi ||
+      (Boolean(modelConfig.imageApiBaseUrlConfigured || modelConfig.imageApiBaseUrl.trim()) &&
+        Boolean(modelConfig.imageApiKeyConfigured || modelConfig.imageApiKey.trim()));
     if (!bridgeAvailable || !window.softCopyright.saveModelConfig) {
-      if (!modelConfig.apiBaseUrl.trim() || !modelConfig.apiKey.trim()) {
-        setConfigStatus("请填写 GPT 请求地址和 API Key");
+      if (modelConfig.mode === "gpt" && ((!modelConfig.apiBaseUrlConfigured && !modelConfig.apiBaseUrl.trim()) || (!modelConfig.apiKeyConfigured && !modelConfig.apiKey.trim()))) {
+        setConfigStatus("请填写文本模型请求地址和 API Key");
         return;
       }
-      setModelConfig((current) => ({ ...current, mode: "gpt", apiKeyConfigured: Boolean(current.apiKey.trim()) }));
+      if (modelConfig.mode === "gpt" && !separateImageApiReady) {
+        setConfigStatus("请填写独立图片 API 请求地址和 API Key，或选择复用文本 API");
+        return;
+      }
+      setModelConfig((current) => ({
+        ...current,
+        mode: current.mode === "template" ? "template" : "gpt",
+        apiBaseUrlMasked: current.apiBaseUrl.trim() ? "已配置（地址已隐藏）" : current.apiBaseUrlMasked,
+        apiBaseUrlConfigured: Boolean(current.apiBaseUrlConfigured || current.apiBaseUrl.trim()),
+        apiKeyConfigured: Boolean(current.apiKeyConfigured || current.apiKey.trim()),
+        imageApiBaseUrlMasked: current.imageUseTextApi
+          ? "未单独配置，将复用文本请求地址"
+          : current.imageApiBaseUrl.trim()
+            ? "已单独配置（地址已隐藏）"
+            : current.imageApiBaseUrlMasked,
+        imageApiBaseUrlConfigured: current.imageUseTextApi
+          ? false
+          : Boolean(current.imageApiBaseUrlConfigured || current.imageApiBaseUrl.trim()),
+        imageApiKeyConfigured: current.imageUseTextApi
+          ? false
+          : Boolean(current.imageApiKeyConfigured || current.imageApiKey.trim())
+      }));
       setConfigStatus("saved");
       return;
     }
     setConfigStatus("saving");
     const response = await window.softCopyright.saveModelConfig({
-      mode: "gpt",
+      mode: modelConfig.mode,
+      textProvider: modelConfig.textProvider || "custom",
       modelName: modelConfig.modelName,
+      outlineModelName: modelConfig.outlineModelName || modelConfig.modelName,
+      frontendModelName: modelConfig.frontendModelName || modelConfig.modelName,
+      frontendWorkers: modelConfig.frontendWorkers || "auto",
+      outlineTimeoutSeconds: modelConfig.outlineTimeoutSeconds || 60,
+      reasoningEffort: modelConfig.reasoningEffort || "medium",
       apiBaseUrl: modelConfig.apiBaseUrl,
-      apiKey: modelConfig.apiKey
+      apiKey: modelConfig.apiKey,
+      imageModelName: modelConfig.imageModelName || "gpt-image-2",
+      imageUseTextApi: modelConfig.imageUseTextApi,
+      imageApiBaseUrl: modelConfig.imageApiBaseUrl,
+      imageApiKey: modelConfig.imageApiKey
     });
     if (!response?.ok) {
       setConfigStatus(response?.message || "保存失败");
       return;
     }
     setConfigStatus("saved");
-    const plan = modelProviders[0];
+    const plan = modelProviders.find((item) => item.value === response.mode) || modelProviders.find((item) => item.value === "gpt");
     setForm((current) => ({
       ...current,
-      modelPlan: "gpt",
+      modelPlan: plan.value,
       modelProvider: plan.provider,
-      modelName: response.modelName || plan.modelName
+      modelName: plan.value === "gpt" ? response.modelName || plan.modelName : plan.modelName
     }));
     setModelConfig((current) => ({
       ...current,
-      mode: "gpt",
+      mode: plan.value,
+      textProvider: response.textProvider || current.textProvider || "custom",
+      providerProfiles: response.providerProfiles || current.providerProfiles || {},
       modelName: response.modelName || current.modelName,
-      apiBaseUrl: response.apiBaseUrl || current.apiBaseUrl,
-      apiKey: response.apiKey || current.apiKey,
-      apiKeyConfigured: Boolean(response.apiKeyConfigured || response.apiKey || current.apiKey)
+      outlineModelName: response.outlineModelName || current.outlineModelName || response.modelName || current.modelName,
+      frontendModelName: response.frontendModelName || current.frontendModelName || response.modelName || current.modelName,
+      frontendWorkers: String(response.frontendWorkers || current.frontendWorkers || "auto"),
+      outlineTimeoutSeconds: Number(response.outlineTimeoutSeconds || current.outlineTimeoutSeconds || 60),
+      reasoningEffort: response.reasoningEffort || current.reasoningEffort || "medium",
+      apiBaseUrl: "",
+      apiBaseUrlMasked: response.apiBaseUrlMasked || (response.apiBaseUrlConfigured ? "已配置（地址已隐藏）" : "未配置"),
+      apiBaseUrlConfigured: Boolean(response.apiBaseUrlConfigured),
+      apiKey: "",
+      apiKeyConfigured: Boolean(response.apiKeyConfigured),
+      imageModelName: response.imageModelName || current.imageModelName || "gpt-image-2",
+      imageUseTextApi: response.imageUseTextApi !== false,
+      imageApiBaseUrl: "",
+      imageApiBaseUrlMasked:
+        response.imageApiBaseUrlMasked ||
+        (response.imageApiBaseUrlConfigured ? "已单独配置（地址已隐藏）" : "未单独配置，将复用文本请求地址"),
+      imageApiBaseUrlConfigured: Boolean(response.imageApiBaseUrlConfigured),
+      imageApiKey: "",
+      imageApiKeyConfigured: Boolean(response.imageApiKeyConfigured)
     }));
     await refreshModelAccount();
+    if (plan.value === "gpt") await refreshAvailableModels(response.textProvider || modelConfig.textProvider || "custom");
+  }
+
+  async function refreshAvailableModels(providerOverride = "") {
+    const requestedProvider = providerOverride || modelConfig.textProvider || "custom";
+    if (form.modelPlan !== "gpt") {
+      setModelCatalog({ status: "idle", provider: requestedProvider, models: [], message: "Default Template 使用本地规则，不读取模型目录" });
+      return null;
+    }
+    if (!bridgeAvailable || !window.softCopyright.listAvailableModels) {
+      setModelCatalog({ status: "unavailable", provider: requestedProvider, models: [], message: "当前环境不支持自动拉取模型" });
+      return null;
+    }
+    setModelCatalog({ status: "loading", provider: requestedProvider, models: [], message: "" });
+    try {
+      const response = await window.softCopyright.listAvailableModels();
+      const models = Array.isArray(response?.models) ? response.models.filter(Boolean) : [];
+      if (!response?.ok) {
+        setModelCatalog((current) => current.provider === requestedProvider
+          ? { status: "error", provider: requestedProvider, models: [], message: response?.message || "模型列表拉取失败" }
+          : current);
+        return response;
+      }
+      setModelCatalog((current) => current.provider === requestedProvider
+        ? { status: "loaded", provider: requestedProvider, models, message: `已读取 ${models.length} 个可用模型` }
+        : current);
+      return response;
+    } catch (error) {
+      setModelCatalog((current) => current.provider === requestedProvider
+        ? { status: "error", provider: requestedProvider, models: [], message: sanitizeErrorMessage(error?.message || "模型列表拉取失败") }
+        : current);
+      return null;
+    }
   }
 
   async function fetchModelAccount() {
+    if (form.modelPlan === "template") {
+      return {
+        status: "local",
+        accountName: "Default Template",
+        balanceLabel: "不消耗 token",
+        updatedAt: "",
+        message: "本地生成模式"
+      };
+    }
     if (!bridgeAvailable || !window.softCopyright.getModelAccount) return null;
     try {
       return await window.softCopyright.getModelAccount();
@@ -542,47 +985,492 @@ function App() {
     if (response) setAccount(response);
   }
 
-  async function handlePrimaryAction() {
-    if (!canPrimaryAction) return;
+  function updateQueueTask(taskId, updater) {
+    if (!taskId) return;
+    setTaskQueue((current) =>
+      current.map((task) => {
+        if (task.id !== taskId) return task;
+        return typeof updater === "function" ? updater(task) : { ...task, ...updater };
+      })
+    );
+  }
+
+  function appendQueueAndGlobalEvent(taskId, event) {
+    setEvents((current) => [...current, event].slice(-500));
+    if (taskId) {
+      updateQueueTask(taskId, (task) => ({
+        ...task,
+        progress: event.progress || task.progress || 0,
+        events: [...(task.events || []), event].slice(-500)
+      }));
+    }
+  }
+
+  function buildGenerationPayloadFromSnapshot(formSnapshot, planSnapshot, promptText, overrides = {}) {
+    const cleanName = planSnapshot.softwareName || extractSoftwareName(promptText) || formSnapshot.name;
+    const extraInputHint = extractInputSupplement(promptText);
+    const planHint = serializePlan(planSnapshot);
+    const hintText = [planHint, extraInputHint].filter(Boolean).join(" ");
+    const inferredProductType = planSnapshot.productType || formSnapshot.productType || inferProductType(cleanName, hintText);
+    return {
+      ...formSnapshot,
+      ...overrides,
+      name: cleanName,
+      productType: inferredProductType,
+      softwareCategory: formSnapshot.softwareCategory || inferSoftwareCategory(cleanName, hintText),
+      language: "自动选择",
+      featureHint: [planHint, extraInputHint].filter(Boolean).join("；"),
+      businessPlan: planSnapshot
+    };
+  }
+
+  function resumeOverridesForTask(task) {
+    const outputDir = String(task?.recovery?.outputDir || task?.result?.outputDir || "").trim();
+    if (!outputDir) return {};
+    return {
+      resumeOutputDir: outputDir,
+      seed: task?.result?.seed || seedFromOutputDir(outputDir) || task?.overrides?.seed || ""
+    };
+  }
+
+  function createQueuedTaskFromCurrent(overrides = {}, submitMessage = "已加入生成队列", options = {}) {
+    const promptText = currentPromptText;
+    const planSnapshot = clonePlainObject(options.businessPlanOverride || businessPlan);
+    if (!planSnapshot.modules?.length) return null;
+    const formSnapshot = clonePlainObject(form);
+    const payload = buildGenerationPayloadFromSnapshot(formSnapshot, planSnapshot, promptText, overrides);
+    return {
+      id: createId("queue"),
+      title: payload.name,
+      promptText,
+      formSnapshot,
+      businessPlan: planSnapshot,
+      overrides: clonePlainObject(overrides),
+      submitMessage,
+      autoPlan: false,
+      status: "queued",
+      phase: "queued",
+      progress: 0,
+      events: [],
+      result: null,
+      createdAt: Date.now(),
+      startedAt: 0,
+      finishedAt: 0
+    };
+  }
+
+  function enqueueCurrentGeneration(overrides = {}, submitMessage = "已加入生成队列", options = {}) {
+    if (!options.force && !canGenerate) return false;
     if (!gptConfigured) {
-      setConfigStatus("请先配置 GPT 请求地址和 API Key");
+      setConfigStatus("请先选择文本模型供应商并配置 API Key");
+      setSettingsOpen(true);
+      return false;
+    }
+    const task = createQueuedTaskFromCurrent(overrides, submitMessage, options);
+    if (!task) return false;
+    setTaskQueue((current) => enqueueOrReplaceRetryTask(current, task, { retry: Boolean(options.retry) }));
+    setInputText("");
+    setQueuePaused(false);
+    setConfigStatus("");
+    return true;
+  }
+
+  function enqueueQuickTask(promptOverride = "") {
+    const promptText = String(promptOverride || inputText).trim();
+    const name = extractSoftwareName(promptText);
+    if (!name) return;
+    if (!gptConfigured) {
+      setConfigStatus("请先选择文本模型供应商并配置 API Key");
       setSettingsOpen(true);
       return;
     }
-    if (outlineState !== "draft" && outlineState !== "confirmed") {
-      await regeneratePlan();
-      return;
-    }
-    if (outlineState === "draft") {
-      setOutlineState("confirmed");
-      await handleGenerate({}, "大纲已确认，开始生成材料包", { force: true });
-      return;
-    }
-    await handleGenerate({}, "大纲已确认，开始生成材料包");
+    const extraInputHint = extractInputSupplement(promptText);
+    const inferredProductType = inferProductType(name, extraInputHint);
+    const formSnapshot = {
+      ...clonePlainObject(form),
+      name,
+      productType: inferredProductType,
+      softwareCategory: inferSoftwareCategory(name, extraInputHint),
+      language: "自动选择",
+      featureHint: extraInputHint
+    };
+    setTaskQueue((current) => [
+      ...current,
+      {
+        id: createId("queue"),
+        title: name,
+        promptText,
+        formSnapshot,
+        businessPlan: null,
+        overrides: {},
+        submitMessage: `队列任务「${name}」开始生成材料包`,
+        autoPlan: true,
+        status: "queued",
+        phase: "queued",
+        progress: 0,
+        events: [],
+        result: null,
+        createdAt: Date.now(),
+        startedAt: 0,
+        finishedAt: 0
+      }
+    ]);
+    setInputText("");
+    setQueuePaused(false);
+    setConfigStatus("");
   }
 
-  async function handleGenerate(overrides = {}, submitMessage = "任务已提交", options = {}) {
-    if (!options.force && !canGenerate) return;
-    if (!gptConfigured || status === "running" || status === "planning" || !canPlan || !planReady) return;
+  function removeQueueTask(taskId) {
+    const target = taskQueueRef.current.find((task) => task.id === taskId);
+    if (target?.status === "running" || target?.status === "planning") return;
+    setTaskQueue((current) => current.filter((task) => task.id !== taskId));
+  }
+
+  function retryQueueTask(taskId) {
+    updateQueueTask(taskId, (task) => {
+      const outputDir = String(task.recovery?.outputDir || task.result?.outputDir || "").trim();
+      const seed = task.recovery?.seed || task.result?.seed || seedFromOutputDir(outputDir);
+      return {
+        ...task,
+        status: "queued",
+        phase: "queued",
+        progress: 0,
+        events: [],
+        result: null,
+        startedAt: 0,
+        finishedAt: 0,
+        autoPlan: !task.businessPlan?.modules?.length,
+        recovery: outputDir
+          ? {
+              ...(task.recovery || {}),
+              outputDir,
+              seed,
+              failedStage: task.phase || task.recovery?.failedStage || ""
+            }
+          : task.recovery,
+        submitMessage: outputDir ? `续跑队列任务「${task.title}」` : `重试队列任务「${task.title}」`
+      };
+    });
+    setQueuePaused(false);
+  }
+
+  function restoreRecoverableTask(recoverableTask) {
+    if (!recoverableTask?.businessPlan?.modules?.length) {
+      setRecoveryStatus("未找到可恢复的确认蓝图");
+      return;
+    }
+    const title = recoverableTask.title || recoverableTask.businessPlan.softwareName || "恢复任务";
+    const restoreMessage = recoverableTask.pageEngineUpgradeRequired
+      ? "页面生成引擎已升级，将复用蓝图和参考图并重新生成全部界面"
+      : `已从上次失败输出恢复「${title}」，将复用确认蓝图重新生成材料包`;
     const startedAt = Date.now();
-    const cleanName = businessPlan.softwareName || extractSoftwareName(form.name);
-    const extraInputHint = extractInputSupplement(form.name);
-    const planHint = serializePlan(businessPlan);
-    const payload = {
-      ...form,
-      ...overrides,
-      name: cleanName,
-      featureHint: [planHint, extraInputHint].filter(Boolean).join("；"),
-      businessPlan
+    const restoreEvent = createProcessEvent(
+      "start",
+      0,
+      restoreMessage,
+      startedAt
+    );
+    const formSnapshot = {
+      ...clonePlainObject(form),
+      ...(clonePlainObject(recoverableTask.formSnapshot) || {}),
+      name: title,
+      featureHint: serializePlan(recoverableTask.businessPlan),
+      language: "自动选择"
     };
+    const queueTask = {
+      id: createId("queue_recovered"),
+      title,
+      promptText: recoverableTask.promptText || title,
+      formSnapshot,
+      businessPlan: clonePlainObject(recoverableTask.businessPlan),
+      overrides: {},
+      submitMessage: recoverableTask.pageEngineUpgradeRequired
+        ? `恢复失败任务「${title}」；页面生成引擎已升级，将复用蓝图和参考图并重新生成全部界面`
+        : `恢复失败任务「${title}」，复用已确认蓝图继续生成材料包`,
+      autoPlan: false,
+      status: "queued",
+      phase: "queued",
+      progress: 0,
+      events: [restoreEvent],
+      result: recoverableTask.errorSummary
+        ? {
+            ok: false,
+            zipPath: "",
+            outputDir: recoverableTask.outputDir || "",
+            checks: domainProfileChecks(recoverableTask.domainProfile),
+            warnings: [],
+            stdout: "",
+            stderr: recoverableTask.errorSummary
+          }
+        : null,
+      createdAt: startedAt,
+      startedAt: 0,
+      finishedAt: 0,
+      recovery: {
+        outputDir: recoverableTask.outputDir || "",
+        seed: recoverableTask.seed || seedFromOutputDir(recoverableTask.outputDir || ""),
+        failedStage: recoverableTask.failedStage || "",
+        visualReferenceReady: Boolean(recoverableTask.visualReferenceReady),
+        pageEngineUpgradeRequired: Boolean(recoverableTask.pageEngineUpgradeRequired)
+      }
+    };
+    setTaskQueue((current) => [...current, queueTask]);
+    setRecoverableTasks((current) => current.filter((item) => item.id !== recoverableTask.id));
+    setRecoveryStatus(`已恢复「${title}」，任务已加入队列`);
+    setQueuePaused(false);
+    setBusinessPlan(queueTask.businessPlan);
+    setForm((current) => ({ ...current, ...formSnapshot }));
+    setOutlineState("confirmed");
+    setStatus("editing");
+  }
+
+  async function deleteRecoverableTask(recoverableTask) {
+    if (!recoverableTask) return;
+    const removeKey = String(recoverableTask.id || recoverableTask.outputDir || recoverableTask.title || "");
+    const isSameRecoverableTask = (item) => {
+      if (recoverableTask.id && item.id === recoverableTask.id) return true;
+      if (recoverableTask.outputDir && item.outputDir === recoverableTask.outputDir) return true;
+      return Boolean(removeKey) && String(item.id || item.outputDir || item.title || "") === removeKey;
+    };
+    setRecoverableTasks((current) => current.filter((item) => !isSameRecoverableTask(item)));
+    setRecoveryStatus("已删除恢复记录");
+    if (!bridgeAvailable || !window.softCopyright.deleteRecoverableTask) return;
+    try {
+      const response = await window.softCopyright.deleteRecoverableTask({
+        id: recoverableTask.id || "",
+        outputDir: recoverableTask.outputDir || ""
+      });
+      if (!response?.ok) {
+        throw new Error(response?.message || "删除恢复记录失败");
+      }
+    } catch (error) {
+      setRecoveryStatus(sanitizeErrorMessage(error?.message || "删除恢复记录失败"));
+      if (!window.softCopyright.listRecoverableTasks) return;
+      try {
+        const response = await window.softCopyright.listRecoverableTasks();
+        const tasks = Array.isArray(response?.tasks) ? response.tasks : [];
+        setRecoverableTasks(tasks);
+        if (tasks.length) setRecoveryStatus(`发现 ${tasks.length} 个可恢复的未完成任务`);
+      } catch (_refreshError) {
+        // Keep the visible error from the delete attempt.
+      }
+    }
+  }
+
+  async function openQueueTaskOutput(taskId, kind = "output") {
+    const target = taskQueueRef.current.find((task) => task.id === taskId);
+    if (!bridgeAvailable || !target?.result) return;
+    const openPath = kind === "zip" ? target.result.zipPath : target.result.outputDir;
+    if (openPath) await window.softCopyright.openPath(openPath);
+  }
+
+  function toggleQueuePaused() {
+    setQueuePaused((current) => !current);
+  }
+
+  async function runQueuedTask(taskId) {
+    if (queueRunningRef.current) return;
+    const initialTask = taskQueueRef.current.find((task) => task.id === taskId);
+    if (!initialTask || initialTask.status !== "queued") return;
+    const restoredOutputDir = String(initialTask.recovery?.outputDir || initialTask.result?.outputDir || "").trim();
+    if (initialTask.restoredFromRunning && !restoredOutputDir) {
+      const message = "检测到应用重启前遗留的队列状态。请使用上方恢复卡片续跑，避免重新生成蓝图和重复消耗额度。";
+      const failedResult = {
+        ok: false,
+        zipPath: "",
+        outputDir: "",
+        checks: {},
+        warnings: [],
+        stdout: "",
+        stderr: message
+      };
+      const event = createProcessEvent("start", 0, message, Date.now());
+      setRecoveryStatus(message);
+      setResult(failedResult);
+      setStatus("error");
+      setEvents([event]);
+      setQueuePaused(true);
+      updateQueueTask(taskId, {
+        status: "error",
+        phase: "interrupted",
+        progress: 0,
+        events: [event],
+        result: failedResult,
+        finishedAt: Date.now()
+      });
+      return;
+    }
+    queueRunningRef.current = true;
+    activeQueueTaskIdRef.current = taskId;
+    setActiveQueueTaskId(taskId);
+    setCancelRequested(false);
+    setResult(null);
+    const startedAt = Date.now();
+    let task = initialTask;
+    let planSnapshot = task.businessPlan ? clonePlainObject(task.businessPlan) : null;
+    let formSnapshot = clonePlainObject(task.formSnapshot || {});
+    const needsPlan = task.autoPlan || !planSnapshot?.modules?.length;
+
+    try {
+      if (needsPlan) {
+        const firstEvent = createProcessEvent("outline", 6, `队列任务「${task.title}」开始生成蓝图`, startedAt);
+        setBusinessPlan(createEmptyPlan());
+        setOutlineState("empty");
+        setStatus("planning");
+        setProgress(6);
+        setProcessClock({ mode: "outline", startedAt, elapsedMs: 0 });
+        setEvents([firstEvent]);
+        updateQueueTask(taskId, {
+          status: "planning",
+          phase: "outline",
+          progress: 6,
+          events: [firstEvent],
+          result: null,
+          startedAt,
+          finishedAt: 0
+        });
+        const outlineResponse = await inferBusinessPlan(
+          {
+            ...formSnapshot,
+            name: task.title,
+            featureHint: extractInputSupplement(task.promptText)
+          },
+          startedAt
+        );
+        if (outlineResponse?.cancelled) {
+          const cancelledResult = buildCancelledResult("已中止蓝图生成");
+          setResult(cancelledResult);
+          setStatus("cancelled");
+          setCancelRequested(false);
+          setQueuePaused(true);
+          updateQueueTask(taskId, {
+            status: "cancelled",
+            phase: "outline",
+            result: cancelledResult,
+            finishedAt: Date.now()
+          });
+          return;
+        }
+        if (outlineResponse?.error) {
+          throw new Error(outlineResponse.error);
+        }
+        if (!outlineResponse?.plan?.modules?.length) {
+          throw new Error("队列任务蓝图生成失败，请检查文本模型配置或稍后重试");
+        }
+        planSnapshot = clonePlainObject(outlineResponse.plan);
+        formSnapshot = {
+          ...formSnapshot,
+          productType: planSnapshot.productType || inferProductType(task.title, outlineResponse.hint || ""),
+          softwareCategory: inferSoftwareCategory(task.title, outlineResponse.hint || serializePlan(planSnapshot)),
+          language: "自动选择",
+          featureHint: serializePlan(planSnapshot)
+        };
+        setBusinessPlan(planSnapshot);
+        setFeatureHintMeta({ ...(outlineResponse.meta || {}), _plannedAt: new Date().toLocaleTimeString() });
+        setForm((current) => ({
+          ...current,
+          ...formSnapshot,
+          name: task.title,
+          featureHint: serializePlan(planSnapshot)
+        }));
+        setOutlineState("confirmed");
+        const readyEvent = createProcessEvent("outline", 100, `队列任务「${task.title}」蓝图完成，准备生成材料包`, startedAt);
+        setProgress(100);
+        appendQueueAndGlobalEvent(taskId, readyEvent);
+        updateQueueTask(taskId, (current) => ({
+          ...current,
+          businessPlan: planSnapshot,
+          formSnapshot,
+          autoPlan: false
+        }));
+      } else {
+        setBusinessPlan(planSnapshot);
+        setForm((current) => ({
+          ...current,
+          ...formSnapshot,
+          name: task.title,
+          featureHint: serializePlan(planSnapshot)
+        }));
+        setOutlineState("confirmed");
+      }
+
+      task = taskQueueRef.current.find((item) => item.id === taskId) || task;
+      const payload = buildGenerationPayloadFromSnapshot(
+        formSnapshot,
+        planSnapshot,
+        task.promptText || task.title,
+        {
+          ...(task.overrides || {}),
+          ...resumeOverridesForTask(task)
+        }
+      );
+      await runGenerationPayload(payload, task.submitMessage || `队列任务「${task.title}」开始生成材料包`, {
+        queueTaskId: taskId,
+        startedAt,
+        preserveEvents: needsPlan
+      });
+    } catch (error) {
+      const failedResult = {
+        ok: false,
+        zipPath: "",
+        outputDir: "",
+        checks: {},
+        warnings: [],
+        stdout: "",
+        stderr: sanitizeErrorMessage(error?.message || "队列任务异常")
+      };
+      const failedEvent = createProcessEvent("start", progress || 0, failedResult.stderr, startedAt);
+      setResult(failedResult);
+      setStatus("error");
+      setProcessClock((current) => ({ ...current, elapsedMs: Date.now() - startedAt }));
+      appendQueueAndGlobalEvent(taskId, failedEvent);
+      updateQueueTask(taskId, {
+        status: "error",
+        result: failedResult,
+        finishedAt: Date.now()
+      });
+      setQueuePaused(true);
+    } finally {
+      queueRunningRef.current = false;
+      activeQueueTaskIdRef.current = "";
+      setActiveQueueTaskId("");
+    }
+  }
+
+  async function runGenerationPayload(payload, submitMessage = "任务已提交", options = {}) {
+    const startedAt = options.startedAt || Date.now();
+    const queueTaskId = options.queueTaskId || "";
+    const startEvent = createProcessEvent("start", 3, submitMessage, startedAt);
     setStatus("running");
     setResult(null);
+    setCancelRequested(false);
     setProgress(3);
-    setProcessClock({ mode: "materials", startedAt, elapsedMs: 0 });
-    setEvents([createProcessEvent("start", 3, submitMessage, startedAt)]);
+    setProcessClock({ mode: "materials", startedAt, elapsedMs: Math.max(0, Date.now() - startedAt) });
+    if (options.preserveEvents) {
+      appendQueueAndGlobalEvent(queueTaskId, startEvent);
+    } else {
+      setEvents([startEvent]);
+      if (queueTaskId) {
+        updateQueueTask(queueTaskId, (task) => ({
+          ...task,
+          events: [startEvent],
+          progress: 3
+        }));
+      }
+    }
+    if (queueTaskId) {
+      updateQueueTask(queueTaskId, {
+        status: "running",
+        phase: "materials",
+        progress: 3,
+        result: null,
+        startedAt,
+        restoredFromRunning: false
+      });
+    }
     if (!bridgeAvailable) {
       await new Promise((resolve) => setTimeout(resolve, 700));
-      setResult({
+      const previewResult = {
         ok: true,
         zipPath: "浏览器预览模式：请在 Electron 中运行以调用本地生成器。",
         outputDir: "",
@@ -592,33 +1480,189 @@ function App() {
         stderr: "",
         seed: payload.seed || "preview-seed",
         randomness: payload.randomness
-      });
+      };
+      setResult(previewResult);
       setProgress(100);
       setProcessClock((current) => ({ ...current, elapsedMs: Date.now() - startedAt }));
       setStatus("success");
-      return;
+      if (queueTaskId) {
+        updateQueueTask(queueTaskId, {
+          status: "success",
+          phase: "done",
+          progress: 100,
+          result: previewResult,
+          finishedAt: Date.now()
+        });
+      }
+      return previewResult;
     }
     try {
-      const response = await window.softCopyright.generateMaterials(payload);
-      setResult(response);
+      const rawResponse = await window.softCopyright.generateMaterials(payload);
+      const response =
+        rawResponse && typeof rawResponse === "object"
+          ? rawResponse
+          : {
+              ok: false,
+              zipPath: "",
+              outputDir: "",
+              checks: {},
+              warnings: [],
+              stdout: "",
+              stderr: "生成任务未返回有效结果"
+            };
+      const cleanResult = sanitizeResult(response);
+      if (response.busy) {
+        const active = response.activeStatus || {};
+        const busyEvent = createProcessEvent(
+          active.stage || "start",
+          Number(active.progress || progress || 0),
+          active.message || "已有后台材料生成任务正在运行，队列已暂停等待",
+          Number(active.startedAt || startedAt)
+        );
+        setResult(cleanResult);
+        setStatus("running");
+        setProgress(busyEvent.progress || 0);
+        setProcessClock({
+          mode: "materials",
+          startedAt: Number(active.startedAt || startedAt),
+          elapsedMs: Math.max(0, Date.now() - Number(active.startedAt || startedAt))
+        });
+        appendQueueAndGlobalEvent(queueTaskId, busyEvent);
+        if (queueTaskId) {
+          updateQueueTask(queueTaskId, (task) => ({
+            ...task,
+            status: "queued",
+            phase: "queued",
+            progress: busyEvent.progress || task.progress || 0,
+            result: cleanResult,
+            finishedAt: 0
+          }));
+        }
+        setQueuePaused(true);
+        return cleanResult;
+      }
+      const finalStatus = response.cancelled ? "cancelled" : response.ok ? "success" : "error";
+      setResult(cleanResult);
       setProgress((current) => (response.ok ? 100 : current));
       setProcessClock((current) => ({ ...current, elapsedMs: Date.now() - startedAt }));
-      setStatus(response.ok ? "success" : "error");
+      setStatus(finalStatus);
+      if (queueTaskId) {
+        updateQueueTask(queueTaskId, (task) => ({
+          ...task,
+          status: finalStatus,
+          phase: response.ok ? "done" : task.phase || "materials",
+          progress: response.ok ? 100 : task.progress,
+          result: cleanResult,
+          finishedAt: Date.now()
+        }));
+        if (!response.ok || response.cancelled) setQueuePaused(true);
+      }
+      return cleanResult;
     } catch (error) {
-      setResult({
+      const failedResult = {
         ok: false,
         zipPath: "",
         outputDir: "",
         checks: {},
         warnings: [],
         stdout: "",
-        stderr: error?.message || "生成任务异常"
-      });
+        stderr: sanitizeErrorMessage(error?.message || "生成任务异常")
+      };
+      setResult(failedResult);
       setProcessClock((current) => ({ ...current, elapsedMs: Date.now() - startedAt }));
       setStatus("error");
+      if (queueTaskId) {
+        updateQueueTask(queueTaskId, {
+          status: "error",
+          result: failedResult,
+          finishedAt: Date.now()
+        });
+        setQueuePaused(true);
+      }
+      return failedResult;
     } finally {
+      setCancelRequested(false);
       await refreshModelAccount();
     }
+  }
+
+  async function handleCancelGeneration() {
+    if (!canCancelTask) return;
+    const cancelStage = status === "planning" ? "outline" : activeEvent?.stage || "start";
+    const startedAt = processClock.startedAt || Date.now();
+    setCancelRequested(true);
+    setEvents((current) => [
+      ...current,
+      createProcessEvent(cancelStage, progress || activeEvent?.progress || 0, "已请求中止生成任务，正在停止后台进程", startedAt)
+    ]);
+    try {
+      const response = await window.softCopyright.cancelGeneration();
+      if (!response?.ok) {
+        setCancelRequested(false);
+        setEvents((current) => [
+          ...current,
+          createProcessEvent(cancelStage, progress || activeEvent?.progress || 0, response?.message || "当前没有可中止的生成任务", startedAt)
+        ]);
+      }
+    } catch (error) {
+      setCancelRequested(false);
+      setEvents((current) => [
+        ...current,
+        createProcessEvent(cancelStage, progress || activeEvent?.progress || 0, sanitizeErrorMessage(error?.message || "中止请求发送失败"), startedAt)
+      ]);
+    }
+  }
+
+  async function handlePrimaryAction() {
+    if (isGeneratingStatus) {
+      if (canQueueQuickTask) {
+        enqueueQuickTask();
+        return;
+      }
+      await handleCancelGeneration();
+      return;
+    }
+    if (!canPrimaryAction) return;
+    if (!gptConfigured) {
+      setConfigStatus("请先选择文本模型供应商并配置 API Key");
+      setSettingsOpen(true);
+      return;
+    }
+    if (canRetryFromConfirmedOutline) {
+      await retryFromConfirmedOutline();
+      return;
+    }
+    if (outlineState !== "draft" && outlineState !== "confirmed") {
+      if (form.blueprintReviewBeforeGeneration) {
+        await regeneratePlan();
+      } else {
+        enqueueQuickTask(currentPromptText);
+      }
+      return;
+    }
+    if (outlineState === "draft") {
+      setOutlineState("confirmed");
+      await handleGenerate({}, "蓝图已确认，开始生成材料包", { force: true });
+      return;
+    }
+    await handleGenerate({}, "蓝图已确认，开始生成材料包");
+  }
+
+  async function retryFromConfirmedOutline() {
+    const outputDir = String(result?.outputDir || "").trim();
+    await handleGenerate(
+      outputDir
+        ? { resumeOutputDir: outputDir, seed: result?.seed || seedFromOutputDir(outputDir) }
+        : result?.seed
+          ? { seed: result.seed }
+          : {},
+      outputDir ? "保留已确认蓝图，从失败阶段续跑材料包" : "保留已确认蓝图，从失败阶段重新生成材料包",
+      { force: true, retry: true }
+    );
+  }
+
+  async function handleGenerate(overrides = {}, submitMessage = "任务已提交", options = {}) {
+    enqueueCurrentGeneration(overrides, submitMessage, options);
   }
 
   async function openZip() {
@@ -635,12 +1679,18 @@ function App() {
 
   function continueEditing() {
     setStatus("editing");
+    setResult(null);
+    setProgress(100);
+    setCancelRequested(false);
   }
 
   function newTask() {
     setForm((current) => ({
       ...current,
       name: "",
+      productType: "APP",
+      softwareCategory: "应用软件",
+      language: "自动选择",
       featureHint: "",
       version: "V1.0"
     }));
@@ -651,23 +1701,33 @@ function App() {
     setEvents([]);
     setResult(null);
     setProgress(0);
+    setCancelRequested(false);
     setProcessClock({ mode: "idle", startedAt: 0, elapsedMs: 0 });
     setStatus("idle");
   }
 
   return (
     <main className="workbench">
-      <header className="top-strip">
-        <div>
-          <p className="eyebrow">Soft Copyright AI Workbench</p>
-          <h1>软著材料 AI 工作台</h1>
+      <header className="top-shell">
+        <div className="top-strip">
+          <div className="brand-lockup">
+            <img src={appIcon} alt="" className="brand-icon" />
+            <div>
+              <p className="eyebrow">Soft Copyright AI Workbench</p>
+              <h1>软著材料 AI 工作台</h1>
+            </div>
+          </div>
+          <div className="top-actions">
+            <span className={`task-pill ${status}`}>{taskStatusText}</span>
+            <button className="model-summary-button" type="button" onClick={() => setSettingsOpen(true)} title="选择模型和推理强度">
+              <Sparkles size={16} />
+              <span>{modelConfig.modelName || "选择模型"}</span>
+              <em>{reasoningEffortLabels[modelConfig.reasoningEffort] || "中"}</em>
+              <ChevronDown size={15} />
+            </button>
+          </div>
         </div>
-        <div className="top-actions">
-          <span className={`task-pill ${status}`}>{statusLabel(status)}</span>
-          <button className="icon-button" type="button" onClick={() => setSettingsOpen(true)} title="高级设置">
-            <Settings2 size={19} />
-          </button>
-        </div>
+        <WorkflowNavigator status={status} outlineState={outlineState} planReady={planReady} />
       </header>
 
       <section className="workspace-stage">
@@ -684,7 +1744,15 @@ function App() {
           result={result}
           qualityItems={qualityItems}
           generatedFiles={generatedFiles}
+          taskQueue={taskQueue}
+          activeQueueTaskId={activeQueueTaskId}
+          queuePaused={queuePaused}
+          queueSummary={queueSummary}
+          recoverableTasks={recoverableTasks}
+          recoveryStatus={recoveryStatus}
           bridgeAvailable={bridgeAvailable}
+          canPlan={canPlan}
+          configStatus={configStatus}
           onRegeneratePlan={regeneratePlan}
           onAddModule={addModule}
           onRemoveModule={removeModule}
@@ -694,10 +1762,17 @@ function App() {
           onRemoveChild={removeChild}
           onUpdateChild={updateChild}
           onOpenFile={openGeneratedFile}
+          onToggleQueuePaused={toggleQueuePaused}
+          onRemoveQueueTask={removeQueueTask}
+          onRetryQueueTask={retryQueueTask}
+          onOpenQueueTaskOutput={openQueueTaskOutput}
+          onRestoreRecoverableTask={restoreRecoverableTask}
+          onDeleteRecoverableTask={deleteRecoverableTask}
+          canRetryGenerate={canRetryFromConfirmedOutline}
         />
       </section>
 
-      <footer className="command-bar">
+      <footer className={`command-bar ${status === "success" ? "completed" : ""}`}>
         {status === "success" && result?.ok ? (
           <div className="result-command-row">
             <button type="button" className="primary-result" onClick={openZip} disabled={!result?.zipPath || !bridgeAvailable}>
@@ -710,7 +1785,7 @@ function App() {
             </button>
             <button type="button" onClick={() => handleGenerate({}, "基于当前模块重新生成")} disabled={!canGenerate}>
               <RefreshCw size={18} />
-              <span>基于当前重新生成</span>
+              <span>基于当前加入队列</span>
             </button>
             <button type="button" onClick={continueEditing}>
               <FileText size={18} />
@@ -721,65 +1796,87 @@ function App() {
               <span>新建任务</span>
             </button>
           </div>
+        ) : status === "error" && result && !result.ok ? (
+          <div className="result-command-row failure-actions">
+            <button
+              type="button"
+              className="primary-result"
+              onClick={retryFromConfirmedOutline}
+              disabled={!canRetryFromConfirmedOutline}
+              title={result?.outputDir ? "保留已确认蓝图，从失败阶段续跑材料包" : "保留已确认蓝图，重新生成材料包"}
+            >
+              <RefreshCw size={18} />
+              <span>保留蓝图重试</span>
+            </button>
+            <button type="button" onClick={continueEditing} disabled={!planReady}>
+              <FileText size={18} />
+              <span>继续修改蓝图</span>
+            </button>
+            <button type="button" className="quiet-button" onClick={newTask}>
+              <Plus size={18} />
+              <span>新建任务</span>
+            </button>
+          </div>
         ) : (
-          <>
+          <div className="prompt-dock">
+            <div className="prompt-caption">
+              <span className="prompt-caption-icon">{isGeneratingStatus ? <Plus size={16} /> : <FileText size={16} />}</span>
+              <div>
+                <strong>{isGeneratingStatus ? "继续添加任务" : "创建软著材料任务"}</strong>
+                <small>{isGeneratingStatus ? "当前任务生成期间，新任务会进入顺序队列" : "只需输入软件名称，系统会自动规划并生成完整材料包"}</small>
+              </div>
+            </div>
             <div className="prompt-row">
               <textarea
-                value={inputText || form.name}
-                onChange={(event) => updateField("name", event.target.value)}
-                placeholder="输入软件名称，例如：小风点餐。也可以写补充要求。"
+                value={promptTextareaValue}
+                onChange={(event) => handlePromptTextChange(event.target.value)}
+                placeholder={promptPlaceholder}
               />
-              <button className="primary-action" type="button" disabled={!canPrimaryAction} onClick={handlePrimaryAction}>
-                {status === "running" || status === "planning" ? <Loader2 size={20} /> : <Sparkles size={20} />}
+              <button className={`primary-action ${isGeneratingStatus && !canQueueQuickTask ? "danger" : ""} ${cancelRequested ? "loading" : ""}`} type="button" disabled={!canPrimaryAction} onClick={handlePrimaryAction}>
+                {isGeneratingStatus ? canQueueQuickTask ? <Plus size={20} /> : cancelRequested ? <Loader2 size={20} /> : <Square size={20} /> : <Sparkles size={20} />}
                 <span>{primaryActionLabel}</span>
               </button>
             </div>
-            <div className="parameter-row">
-              <label>
-                <span>软件大类</span>
-                <select value={form.softwareCategory} onChange={(event) => updateField("softwareCategory", event.target.value)}>
-                  {softwareCategories.map((item) => (
-                    <option key={item} value={item}>
-                      {item}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                <span>技术特点</span>
-                <select value={form.productType} onChange={(event) => updateField("productType", event.target.value)}>
-                  {productTypes.map((item) => (
-                    <option key={item} value={item}>
-                      {item}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                <span>源码架构</span>
-                <input value="自动选择技术架构，可多语言生成" readOnly />
-              </label>
-            </div>
-          </>
+          </div>
         )}
       </footer>
 
-      {settingsOpen && (
-        <SettingsDrawer
-          form={form}
-          modelConfig={modelConfig}
-          account={account}
-          configStatus={configStatus}
-          bridgeAvailable={bridgeAvailable}
-          onClose={() => setSettingsOpen(false)}
-          onUpdateField={updateField}
-          onUpdateModelPlan={updateModelPlan}
-          onUpdateModelConfig={updateModelConfig}
-          onSaveModelConfig={saveModelConfig}
-          onRefreshAccount={refreshModelAccount}
-        />
-      )}
+      <SettingsDrawer
+        open={settingsOpen}
+        form={form}
+        modelConfig={modelConfig}
+        account={account}
+        modelCatalog={modelCatalog}
+        configStatus={configStatus}
+        bridgeAvailable={bridgeAvailable}
+        onClose={() => setSettingsOpen(false)}
+        onUpdateField={updateField}
+        onUpdateModelPlan={updateModelPlan}
+        onUpdateModelConfig={updateModelConfig}
+        onSaveModelConfig={saveModelConfig}
+        onRefreshAccount={refreshModelAccount}
+        onRefreshModels={refreshAvailableModels}
+      />
     </main>
+  );
+}
+
+function WorkflowNavigator({ status, outlineState, planReady }) {
+  const activeIndex = workflowStageIndex(status, outlineState, planReady);
+  return (
+    <nav className="workflow-nav" aria-label="材料生成流程">
+      {workflowStages.map((label, index) => {
+        const done = index < activeIndex || status === "success";
+        const active = index === activeIndex && status !== "success";
+        return (
+          <div className={`workflow-step ${done ? "done" : ""} ${active ? "active" : ""}`} key={label}>
+            <span className="workflow-index">{done ? <CheckCircle2 size={15} /> : index + 1}</span>
+            <b>{label}</b>
+            {index < workflowStages.length - 1 && <i />}
+          </div>
+        );
+      })}
+    </nav>
   );
 }
 
@@ -796,7 +1893,15 @@ function TaskTranscript({
   result,
   qualityItems,
   generatedFiles,
+  taskQueue,
+  activeQueueTaskId,
+  queuePaused,
+  queueSummary,
+  recoverableTasks,
+  recoveryStatus,
   bridgeAvailable,
+  canPlan,
+  configStatus,
   onRegeneratePlan,
   onAddModule,
   onRemoveModule,
@@ -805,33 +1910,59 @@ function TaskTranscript({
   onAddChild,
   onRemoveChild,
   onUpdateChild,
-  onOpenFile
+  onOpenFile,
+  onToggleQueuePaused,
+  onRemoveQueueTask,
+  onRetryQueueTask,
+  onOpenQueueTaskOutput,
+  onRestoreRecoverableTask,
+  onDeleteRecoverableTask,
+  canRetryGenerate
 }) {
   const planReady = businessPlan.modules.length > 0;
   const elapsedLabel = processClock.elapsedMs ? `已用 ${formatElapsed(processClock.elapsedMs)}` : "";
 
   return (
     <div className="transcript">
-      {(status === "planning" || status === "editing" || status === "idle") && (
+      <QueuePanel
+        taskQueue={taskQueue}
+        activeQueueTaskId={activeQueueTaskId}
+        queuePaused={queuePaused}
+        queueSummary={queueSummary}
+        recoverableTasks={recoverableTasks}
+        recoveryStatus={recoveryStatus}
+        bridgeAvailable={bridgeAvailable}
+        onToggleQueuePaused={onToggleQueuePaused}
+        onRemoveQueueTask={onRemoveQueueTask}
+        onRetryQueueTask={onRetryQueueTask}
+        onOpenQueueTaskOutput={onOpenQueueTaskOutput}
+        onRestoreRecoverableTask={onRestoreRecoverableTask}
+        onDeleteRecoverableTask={onDeleteRecoverableTask}
+      />
+
+      {(status === "planning" || status === "editing" || status === "idle") &&
+        (form.blueprintReviewBeforeGeneration || status === "planning" || planReady) && (
         <section className="work-section editor-section">
           <div className="section-toolbar">
             <div>
               <strong>详细蓝图</strong>
               <span>
                 {status === "planning" && elapsedLabel
-                  ? `GPT 生成中 · ${elapsedLabel}`
+                  ? `AI 生成中 · ${elapsedLabel}`
                   : planReady
                     ? `${businessPlan.modules.length} 个模块 · ${outlineStatusLabel(outlineState, planReady)}`
-                    : "点击生成大纲后开始生成"}
+                    : form.blueprintReviewBeforeGeneration
+                      ? "点击生成蓝图后开始审阅"
+                      : "系统会自动规划后直接生成材料"}
               </span>
             </div>
-            <button type="button" onClick={onRegeneratePlan} disabled={!extractSoftwareName(form.name) || status === "planning"}>
+            <button type="button" onClick={onRegeneratePlan} disabled={!canPlan || status === "planning"}>
               <RefreshCw size={15} />
-              <span>{status === "planning" ? "生成中" : "重新生成大纲"}</span>
+              <span>{status === "planning" ? "生成中" : "重新生成蓝图"}</span>
             </button>
           </div>
           {status === "planning" && <OutlineProgress progress={progress} events={events} elapsedMs={processClock.elapsedMs} />}
-          {planReady ? (
+          {status === "planning" ? null : planReady ? (
             <ModuleTreeEditor
               plan={businessPlan}
               onAddModule={onAddModule}
@@ -840,16 +1971,40 @@ function TaskTranscript({
               onRegenerateModule={onRegenerateModule}
             />
           ) : status === "planning" ? null : (
-            <div className="empty-plan compact-empty">
-              <Wand2 size={24} />
-              <strong>{form.name.trim() ? "等待生成大纲" : "等待输入软件名称"}</strong>
-              <p>{form.name.trim() ? "点击底部“生成大纲”后，这里会显示生成进度和可编辑的详细蓝图。" : "输入软件名称后，点击底部按钮生成详细蓝图。"}</p>
+            <div className="empty-plan compact-empty brand-empty">
+              <div className="empty-brand-visual">
+                <FileCheck2 size={42} />
+                <Sparkles size={20} />
+              </div>
+              <strong>
+                {canPlan && configStatus && configStatus !== "saved" && configStatus !== "saving"
+                  ? "蓝图生成未完成"
+                  : canPlan
+                    ? form.blueprintReviewBeforeGeneration
+                      ? "等待生成蓝图"
+                      : "等待开始生成"
+                    : "等待输入软件名称"}
+              </strong>
+              <p>
+                {canPlan && configStatus && configStatus !== "saved" && configStatus !== "saving"
+                  ? configStatus
+                  : canPlan
+                    ? form.blueprintReviewBeforeGeneration
+                      ? "点击底部“生成蓝图”后，这里会显示生成进度和可编辑的详细蓝图。"
+                      : "点击底部“开始生成”后，系统会自动完成规划、确认和材料生成。"
+                    : "输入软件名称后，点击底部按钮生成详细蓝图。"}
+              </p>
+              <div className="empty-feature-list">
+                <span>AI 业务蓝图</span>
+                <span>界面与手册</span>
+                <span>源码与材料包</span>
+              </div>
             </div>
           )}
         </section>
       )}
 
-      {(status === "running" || status === "success" || status === "error") && (
+      {(status === "running" || status === "success" || status === "error" || status === "cancelled") && (
         <section className="work-section log-section">
           <div className="section-toolbar">
             <div>
@@ -865,11 +2020,11 @@ function TaskTranscript({
       )}
 
       {result && (
-        <section className={`work-section result-message ${result.ok ? "success" : "error"}`}>
+        <section className={`work-section result-message ${result.ok ? "success" : result.cancelled ? "cancelled" : "error"}`}>
           <div className="section-toolbar">
             <div>
-              <strong>{result.ok ? "结果报告" : "失败报告"}</strong>
-              <span>{result.ok ? "已完成" : "需要处理"}</span>
+              <strong>{result.ok ? "结果报告" : result.cancelled ? "中止报告" : "失败报告"}</strong>
+              <span>{result.ok ? "已完成" : result.cancelled ? "已中止" : "需要处理"}</span>
             </div>
           </div>
           {result.ok ? (
@@ -879,15 +2034,37 @@ function TaskTranscript({
               generatedFiles={generatedFiles}
               bridgeAvailable={bridgeAvailable}
               onOpenFile={onOpenFile}
+              getDeliveryStatus={deliveryStatus}
+              renderQualityIcon={qualityIcon}
             />
           ) : (
             <div className="error-report">
-              <AlertTriangle size={22} />
-              <p>{result.stderr || "生成任务异常，请查看运行日志定位问题。"}</p>
+              {result.cancelled ? <Square size={22} /> : <AlertTriangle size={22} />}
+              <div>
+                <p>{result.stderr || (result.cancelled ? "生成任务已中止。" : "生成任务异常，请查看运行日志定位问题。")}</p>
+                <DomainProfileDiagnostic checks={result.checks} />
+                <VisualReferenceFailureHint result={result} />
+                {canRetryGenerate ? (
+                  <small>已保留当前确认的蓝图，重试会直接复用蓝图并继续生成材料包。</small>
+                ) : (
+                  <small>请先返回蓝图检查软件名称、模块和文本模型配置，再重新提交。</small>
+                )}
+              </div>
             </div>
           )}
         </section>
       )}
+    </div>
+  );
+}
+
+function DomainProfileDiagnostic({ checks = {} }) {
+  if (!checks || typeof checks !== "object" || !checks.ui_domain_profile_key) return null;
+  return (
+    <div className="domain-profile-diagnostic">
+      <b>领域判断：{domainProfileLabel(checks)}</b>
+      <span>{domainProfileDetail(checks)}</span>
+      {checks.ui_realism_missing_evidence && <small>缺失证据：{checks.ui_realism_missing_evidence}</small>}
     </div>
   );
 }
@@ -991,35 +2168,102 @@ function GenerationProcessBoard({ events, status, progress, elapsedMs, result })
   const latest = events.length ? events[events.length - 1] : null;
   const visibleEvents = events.length ? events : fallbackResultEvents(result);
   return (
-    <div className="process-board">
+    <div className="process-board compact">
+      <ProcessTextStream
+        events={visibleEvents}
+        status={status}
+        progress={progress}
+        elapsedMs={elapsedMs || latest?.elapsedMs || 0}
+      />
+    </div>
+  );
+}
+
+function ProcessTextStream({ events, status, progress, elapsedMs }) {
+  const messages = buildProcessConversation(events, status);
+  const latest = messages.length ? messages[messages.length - 1] : null;
+  const compactStages = compactStageStatus(events, status);
+  const currentProgress = Math.min(100, progress || latest?.event?.progress || 0);
+  const currentElapsed = formatElapsed(elapsedMs || latest?.event?.elapsedMs || 0);
+  return (
+    <section className="process-compact-panel">
       <div className={`process-current ${status}`}>
-        <span className="process-current-icon">
-          {status === "running" ? <Loader2 size={16} /> : status === "success" ? <CheckCircle2 size={16} /> : <AlertTriangle size={16} />}
-        </span>
+        <span className="process-current-icon">{processStatusIcon(status, latest?.event?.stage)}</span>
         <div>
-          <strong>{processTitle(status)}</strong>
-          <p>{latest?.message || (status === "success" ? "材料包生成完成" : status === "error" ? "生成过程出现异常" : "正在等待生成事件")}</p>
+          <strong>{latest?.event?.stage ? stageLabel(latest.event.stage) : processTitle(status)}</strong>
+          <p>{latest?.message || "等待生成过程开始"}</p>
         </div>
-        <b>{Math.min(100, progress || latest?.progress || 0)}%</b>
-        <small>{formatElapsed(elapsedMs || latest?.elapsedMs || 0)}</small>
+        <b>{currentProgress}%</b>
+        <small>{currentElapsed}</small>
       </div>
 
-      <StageDetailGrid events={events} status={status} />
-      <ProcessEventFeed events={visibleEvents} />
-
-      <details className="raw-log-details">
+      <details className="process-detail-details">
         <summary>
-          <TerminalSquare size={15} />
-          <span>原始运行日志</span>
+          <span>过程详情</span>
+          <b>{messages.length} 条</b>
           <ChevronDown size={15} />
         </summary>
-        <pre className="log-view">
-          {events.map((event) => `[${event.progress || 0}%] ${event.message}`).join("\n") ||
-            [result?.stdout, result?.stderr].filter(Boolean).join("\n") ||
-            "等待运行日志"}
-        </pre>
+        <div className="process-stage-strip">
+          {compactStages.map((item) => (
+            <span className={item.state} key={item.key}>{item.label}</span>
+          ))}
+        </div>
+        <div className="process-text-list">
+          {messages.map((item, index) => {
+            const latestRow = index === messages.length - 1;
+            const rowState = latestRow && ["planning", "running"].includes(status) ? "in-progress" : "completed";
+            const rowMeta = processRowMeta(item);
+            return (
+              <div className={`process-text-row ${rowState}`} key={`${item.event.at}-${item.event.stage}-${index}`}>
+                <span className={`process-text-node ${rowState}`} title={rowState === "completed" ? "已完成" : "进行中"}>
+                  {rowState === "completed" ? <CheckCircle2 size={15} /> : <Loader2 size={15} />}
+                </span>
+                <div>
+                  <p>
+                    <b>{item.actor}</b>
+                    <span>{item.message}</span>
+                  </p>
+                  {rowMeta && <small>{rowMeta}</small>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
       </details>
-    </div>
+    </section>
+  );
+}
+
+function ProcessConversation({ events, status }) {
+  const messages = buildProcessConversation(events, status);
+  return (
+    <section className="process-conversation">
+      <div className="process-conversation-head">
+        <div>
+          <strong>过程对话</strong>
+          <span>{conversationStatusLabel(status, messages)}</span>
+        </div>
+        <b>{messages.length} 条</b>
+      </div>
+      <div className="process-conversation-list">
+        {messages.map((item, index) => {
+          const latest = index === messages.length - 1;
+          return (
+            <article className={`process-message ${latest ? "latest" : ""}`} key={`${item.event.at}-${item.event.stage}-${index}`}>
+              <span className={`process-avatar ${item.tone}`}>{item.avatar}</span>
+              <div className="process-bubble">
+                <div className="process-bubble-meta">
+                  <strong>{item.actor}</strong>
+                  <span>{item.event.at || "--:--:--"} · {stageLabel(item.event.stage)} · {item.event.progress || 0}%</span>
+                </div>
+                <p>{item.message}</p>
+                {item.detail && <small>{item.detail}</small>}
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -1032,20 +2276,31 @@ function StageDetailGrid({ events, status }) {
         const stageEvents = groups.get(key) || [];
         const state = stageState(key, stageEvents, latestStage, status);
         const last = stageEvents.length ? stageEvents[stageEvents.length - 1] : null;
+        const plannedSteps = stagePlannedSteps[key] || [];
         return (
           <div className={`stage-detail ${state}`} key={key}>
             <div className="stage-detail-head">
               <span>{stageStateIcon(state)}</span>
               <strong>{label}</strong>
-              <em>{stageEvents.length ? `${stageEvents.length} 步` : "待开始"}</em>
+              <em>{stageCountLabel(key, stageEvents)}</em>
             </div>
-            <p>{last?.message || "等待上一阶段完成后自动进入"}</p>
-            {stageEvents.length > 1 && (
-              <div className="stage-mini-events">
-                {stageEvents.slice(-3).map((event, index) => (
-                  <span key={`${key}-${index}-${event.progress}`}>{event.message}</span>
+            <p>{stageSummary(key, last)}</p>
+            {plannedSteps.length > 0 ? (
+              <div className="stage-mini-events planned">
+                {plannedSteps.map((step, index) => (
+                  <span className={plannedStepState(key, stageEvents, step)} key={`${key}-planned-${index}`}>
+                    {step.label}
+                  </span>
                 ))}
               </div>
+            ) : (
+              stageEvents.length > 1 && (
+                <div className="stage-mini-events">
+                  {stageEvents.slice(-3).map((event, index) => (
+                    <span key={`${key}-${index}-${event.progress}`}>{event.message}</span>
+                  ))}
+                </div>
+              )
             )}
           </div>
         );
@@ -1105,184 +2360,6 @@ function StageTimeline({ events, status }) {
   );
 }
 
-function ResultReport({ result, qualityItems, generatedFiles, bridgeAvailable, onOpenFile }) {
-  return (
-    <div className="result-report">
-      <div className="report-paths">
-        <div>
-          <small>输出目录</small>
-          <b>{result.outputDir || "未返回"}</b>
-        </div>
-        <div>
-          <small>材料包</small>
-          <b>{result.zipPath || "未返回"}</b>
-        </div>
-      </div>
-      <DeliveryStatus result={result} />
-      <div className="quality-grid">
-        {qualityItems.slice(0, 6).map((item) => (
-          <div className={`quality-item ${item.state}`} key={item.label}>
-            <span>{qualityIcon(item.state)}</span>
-            <div>
-              <strong>{item.label}</strong>
-              <p>{item.value}</p>
-              {item.detail && <small>{item.detail}</small>}
-            </div>
-          </div>
-        ))}
-      </div>
-      <details className="report-details">
-        <summary>
-          <FileCheck2 size={16} />
-          <span>文件与校验详情</span>
-          <ChevronDown size={16} />
-        </summary>
-        <div className="file-list">
-          {generatedFiles.length ? (
-            generatedFiles.slice(0, 12).map((file) => (
-              <button
-                className="file-row"
-                key={file.path || file.name}
-                type="button"
-                title={bridgeAvailable ? file.path : "Electron 中可打开文件"}
-                disabled={!bridgeAvailable}
-                onClick={() => onOpenFile(file)}
-              >
-                {file.icon}
-                <span>{file.name}</span>
-              </button>
-            ))
-          ) : (
-            <p>本次未返回文件列表。</p>
-          )}
-        </div>
-      </details>
-    </div>
-  );
-}
-
-function SettingsDrawer({
-  form,
-  modelConfig,
-  account,
-  configStatus,
-  bridgeAvailable,
-  onClose,
-  onUpdateField,
-  onUpdateModelPlan,
-  onUpdateModelConfig,
-  onSaveModelConfig,
-  onRefreshAccount
-}) {
-  return (
-    <div className="drawer-backdrop" onClick={onClose}>
-      <aside className="settings-drawer" onClick={(event) => event.stopPropagation()}>
-        <header>
-          <div>
-            <p className="eyebrow">Advanced</p>
-            <h2>高级设置</h2>
-          </div>
-          <button className="icon-button" type="button" onClick={onClose}>
-            ×
-          </button>
-        </header>
-        <section>
-          <h3>生成参数</h3>
-          <div className="drawer-grid">
-            <label>
-              <span>版本号</span>
-              <input value={form.version} onChange={(event) => onUpdateField("version", event.target.value)} />
-            </label>
-            <label>
-              <span>随机性</span>
-              <select value={form.randomness} onChange={(event) => onUpdateField("randomness", event.target.value)}>
-                <option value="conservative">保守</option>
-                <option value="standard">标准</option>
-                <option value="high-variance">高差异</option>
-              </select>
-            </label>
-          </div>
-        </section>
-        <section>
-          <h3>模型模式</h3>
-          <div className="model-option-grid">
-            {modelProviders.map((item) => (
-              <button
-                key={item.value}
-                className={form.modelPlan === item.value ? "model-option selected" : "model-option"}
-                onClick={() => onUpdateModelPlan(item.value)}
-                type="button"
-              >
-                <span>
-                  <strong>{item.label}</strong>
-                  <small>{item.description}</small>
-                </span>
-                <em>{item.cost}</em>
-              </button>
-            ))}
-          </div>
-          <div className={`balance-card ${account.status || ""}`}>
-            {account.status === "refreshing" || account.status === "loading" ? <RefreshCw size={18} /> : <PackageCheck size={18} />}
-            <div>
-              <span>{account.accountName || "未连接"}</span>
-              <strong>{account.balanceLabel || "待配置"}</strong>
-              <small>{balanceHint(account)}</small>
-            </div>
-            <button type="button" onClick={onRefreshAccount} disabled={!bridgeAvailable}>
-              刷新
-            </button>
-          </div>
-        </section>
-        <section>
-          <h3>接口配置</h3>
-          <div className="drawer-grid">
-            <label className="full">
-              <span>请求地址</span>
-              <input
-                value={modelConfig.apiBaseUrl}
-                onChange={(event) => onUpdateModelConfig("apiBaseUrl", event.target.value)}
-              />
-            </label>
-            <label>
-              <span>模型名称</span>
-              <input
-                value={modelConfig.modelName}
-                onChange={(event) => onUpdateModelConfig("modelName", event.target.value)}
-              />
-            </label>
-            <label>
-              <span>API Key</span>
-              <input
-                value={modelConfig.apiKey}
-                onChange={(event) => onUpdateModelConfig("apiKey", event.target.value)}
-              />
-            </label>
-          </div>
-          <button
-            type="button"
-            className="config-save-button"
-            onClick={onSaveModelConfig}
-            disabled={
-              configStatus === "saving" ||
-              (modelConfig.mode === "gpt" && (!modelConfig.apiBaseUrl.trim() || !modelConfig.apiKey.trim()))
-            }
-          >
-            {configStatus === "saving" ? <Loader2 size={16} /> : <Save size={16} />}
-            <span>{configStatus === "saving" ? "保存中" : bridgeAvailable ? "保存配置" : "应用配置"}</span>
-          </button>
-          <small className={configStatus && configStatus !== "saved" && configStatus !== "saving" ? "config-message error" : "config-message"}>
-            {configStatus === "saved"
-              ? "模型配置已保存"
-              : configStatus === "saving"
-                ? "正在写入本地配置"
-                : "当前仅支持 GPT，请确认请求地址、模型名称和 API Key。"}
-          </small>
-        </section>
-      </aside>
-    </div>
-  );
-}
-
 function wait(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
@@ -1292,10 +2369,243 @@ function createProcessEvent(stage, progressValue, message, startedAt = Date.now(
   return {
     stage,
     progress: progressValue,
-    message,
+    message: sanitizeErrorMessage(message),
     at: new Date(now).toLocaleTimeString(),
     elapsedMs: Math.max(0, now - startedAt)
   };
+}
+
+function sanitizeErrorMessage(value) {
+  return String(value || "")
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[已隐藏]")
+    .replace(/\b(api[_-]?key|token|secret|authorization)(\s*[:=]\s*['"]?)[^'"\s,;，；)）\]}]+/gi, "$1$2[已隐藏]")
+    .replace(/(for url:\s*)https?:\/\/[^\s"'<>，。；;、)）\]}]+/gi, "$1[模型网关]")
+    .replace(/https?:\/\/[^\s"'<>，。；;、)）\]}]+/gi, "[模型网关]")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sanitizeResult(result) {
+  if (!result || typeof result !== "object") return result;
+  return {
+    ...result,
+    stdout: sanitizeErrorMessage(result.stdout || ""),
+    stderr: sanitizeErrorMessage(result.stderr || ""),
+    warnings: Array.isArray(result.warnings) ? result.warnings.map((item) => sanitizeErrorMessage(item)) : []
+  };
+}
+
+function resultFromGenerationEvent(event) {
+  if (!event || !["done", "error", "cancelled"].includes(String(event.stage || ""))) return null;
+  if (!event.result || typeof event.result !== "object") return null;
+  return sanitizeResult(event.result);
+}
+
+function seedFromOutputDir(outputDir) {
+  const name = fileName(outputDir || "");
+  const match = name.match(/(\d{8}-\d{6}-\d{4})$/);
+  return match ? match[1] : "";
+}
+
+function clonePlainObject(value) {
+  if (value == null) return value;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (_error) {
+    return value;
+  }
+}
+
+function loadPersistedQueueState() {
+  if (cachedQueueState) return cachedQueueState;
+  const empty = { tasks: [], paused: false };
+  if (typeof window === "undefined" || !window.localStorage) {
+    cachedQueueState = empty;
+    return cachedQueueState;
+  }
+  try {
+    const raw = window.localStorage.getItem(QUEUE_STORAGE_KEY);
+    if (!raw) {
+      cachedQueueState = empty;
+      return cachedQueueState;
+    }
+    const parsed = JSON.parse(raw);
+    const tasks = Array.isArray(parsed?.tasks) ? parsed.tasks.map(normalizePersistedQueueTask).filter(Boolean).slice(-30) : [];
+    const recoveredRunning = tasks.some((task) => task._restoredFromRunning);
+    cachedQueueState = {
+      tasks: tasks.map((task) => ({
+        ...task,
+        restoredFromRunning: Boolean(task.restoredFromRunning || task._restoredFromRunning)
+      })),
+      paused: Boolean(parsed?.paused || recoveredRunning || tasks.some((task) => task.status === "queued"))
+    };
+    return cachedQueueState;
+  } catch (_error) {
+    cachedQueueState = empty;
+    return cachedQueueState;
+  }
+}
+
+function normalizePersistedQueueTask(task) {
+  if (!task || typeof task !== "object") return null;
+  const status = ["queued", "success", "error", "cancelled"].includes(task.status) ? task.status : "queued";
+  const restoredFromRunning = Boolean(task.restoredFromRunning || task.status === "running" || task.status === "planning");
+  const events = Array.isArray(task.events) ? task.events.slice(-80) : [];
+  const restoreEvent = restoredFromRunning
+    ? createProcessEvent("start", 0, "应用重启后已恢复为等待中，请确认后继续队列", Date.now())
+    : null;
+  return {
+    id: String(task.id || createId("queue_restored")),
+    title: String(task.title || task.formSnapshot?.name || task.businessPlan?.softwareName || "恢复任务"),
+    promptText: String(task.promptText || task.title || ""),
+    formSnapshot: clonePlainObject(task.formSnapshot || {}),
+    businessPlan: task.businessPlan?.modules?.length ? clonePlainObject(task.businessPlan) : null,
+    overrides: clonePlainObject(task.overrides || {}),
+    submitMessage: String(task.submitMessage || "恢复队列任务，继续生成材料包"),
+    autoPlan: Boolean(task.autoPlan || !task.businessPlan?.modules?.length),
+    status: restoredFromRunning ? "queued" : status,
+    phase: restoredFromRunning ? "queued" : String(task.phase || "queued"),
+    progress: restoredFromRunning ? 0 : Number(task.progress || 0),
+    events: restoreEvent ? [...events, restoreEvent].slice(-80) : events,
+    result: task.result ? sanitizeResult(task.result) : null,
+    createdAt: Number(task.createdAt || Date.now()),
+    startedAt: 0,
+    finishedAt: status === "queued" ? 0 : Number(task.finishedAt || 0),
+    recovery: clonePlainObject(task.recovery || {}),
+    restoredFromRunning,
+    _restoredFromRunning: restoredFromRunning
+  };
+}
+
+function persistQueueState(tasks, paused) {
+  if (typeof window === "undefined" || !window.localStorage) return;
+  try {
+    const compactTasks = (tasks || []).slice(-30).map(compactQueueTaskForStorage);
+    window.localStorage.setItem(
+      QUEUE_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        savedAt: new Date().toISOString(),
+        paused: Boolean(paused),
+        tasks: compactTasks
+      })
+    );
+  } catch (_error) {
+    // Queue persistence is helpful, but must not block generation.
+  }
+}
+
+function compactQueueTaskForStorage(task) {
+  return {
+    id: task.id,
+    title: task.title,
+    promptText: task.promptText,
+    formSnapshot: compactFormSnapshot(task.formSnapshot || {}),
+    businessPlan: task.businessPlan ? clonePlainObject(task.businessPlan) : null,
+    overrides: clonePlainObject(task.overrides || {}),
+    submitMessage: task.submitMessage,
+    autoPlan: Boolean(task.autoPlan),
+    status: task.status,
+    phase: task.phase,
+    progress: Number(task.progress || 0),
+    events: Array.isArray(task.events) ? task.events.slice(-80).map(compactProcessEvent) : [],
+    result: task.result ? compactResultForStorage(task.result) : null,
+    createdAt: Number(task.createdAt || Date.now()),
+    startedAt: Number(task.startedAt || 0),
+    finishedAt: Number(task.finishedAt || 0),
+    recovery: clonePlainObject(task.recovery || {}),
+    restoredFromRunning: Boolean(task.restoredFromRunning)
+  };
+}
+
+function compactFormSnapshot(formSnapshot) {
+  const templateMode = formSnapshot.modelPlan === "template";
+  return {
+    name: formSnapshot.name || "",
+    version: formSnapshot.version || "V1.0",
+    language: formSnapshot.language || "自动选择",
+    productType: formSnapshot.productType || "APP",
+    softwareCategory: formSnapshot.softwareCategory || "应用软件",
+    featureHint: formSnapshot.featureHint || "",
+    modelPlan: templateMode ? "template" : "gpt",
+    modelProvider: templateMode ? "local-template" : "custom",
+    modelName: templateMode ? "template-v1" : formSnapshot.modelName || "gpt-5.5",
+    randomness: formSnapshot.randomness || "standard"
+  };
+}
+
+function compactProcessEvent(event) {
+  return {
+    stage: event.stage || "start",
+    progress: Number(event.progress || 0),
+    message: sanitizeErrorMessage(event.message || ""),
+    at: event.at || "",
+    elapsedMs: Number(event.elapsedMs || 0)
+  };
+}
+
+function compactResultForStorage(result) {
+  return {
+    ok: Boolean(result.ok),
+    cancelled: Boolean(result.cancelled),
+    zipPath: result.zipPath || "",
+    outputDir: result.outputDir || "",
+    checks: result.checks || {},
+    warnings: Array.isArray(result.warnings) ? result.warnings.slice(0, 20).map((item) => sanitizeErrorMessage(item)) : [],
+    stdout: sanitizeErrorMessage(result.stdout || "").slice(0, 1200),
+    stderr: sanitizeErrorMessage(result.stderr || "").slice(0, 1200),
+    seed: result.seed || "",
+    randomness: result.randomness || ""
+  };
+}
+
+function buildCancelledResult(message = "已中止生成任务") {
+  return {
+    ok: false,
+    cancelled: true,
+    zipPath: "",
+    outputDir: "",
+    checks: {},
+    warnings: [],
+    stdout: "",
+    stderr: message
+  };
+}
+
+function summarizeQueue(tasks = []) {
+  return tasks.reduce(
+    (summary, task) => {
+      summary.total += 1;
+      if (task.status === "queued") summary.queued += 1;
+      else if (task.status === "running" || task.status === "planning") summary.running += 1;
+      else if (task.status === "success") summary.success += 1;
+      else if (task.status === "error") summary.error += 1;
+      else if (task.status === "cancelled") summary.cancelled += 1;
+      return summary;
+    },
+    { total: 0, queued: 0, running: 0, success: 0, error: 0, cancelled: 0 }
+  );
+}
+
+function queueTaskStatusLabel(task) {
+  if (task.status === "queued") return "等待中";
+  if (task.status === "planning") return "生成蓝图";
+  if (task.status === "running") return "生成材料";
+  if (task.status === "success") return "已完成";
+  if (task.status === "error") return "失败";
+  if (task.status === "cancelled") return "已中止";
+  return "待处理";
+}
+
+function queueTaskMeta(task) {
+  if (task.recovery?.outputDir && task.status === "queued") return "从上次失败输出恢复，等待继续生成";
+  if (task.status === "queued") return task.autoPlan ? "等待自动生成蓝图后进入材料生成" : "等待使用已确认蓝图生成";
+  if (task.status === "success") return task.result?.zipPath ? "材料包已生成，可打开输出目录" : "任务已完成";
+  if (task.status === "error") return task.result?.stderr || "任务失败，队列已暂停";
+  if (task.status === "cancelled") return "任务已中止，队列已暂停";
+  if (task.phase === "outline") return "正在生成产品蓝图";
+  if (task.phase === "materials") return "正在生成源码、截图、手册和材料包";
+  return "正在处理";
 }
 
 function extractSoftwareName(value) {
@@ -1321,7 +2631,8 @@ async function inferFeatureHintThroughDevApi(payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       ...payload,
-      modelName: payload.modelName || "gpt-4o-mini",
+      modelName: payload.modelName || "gpt-5.5",
+      timeoutSeconds: payload.timeoutSeconds || 60,
       apiBaseUrl: payload.apiBaseUrl || "",
       apiKey: payload.apiKey || ""
     })
@@ -1329,12 +2640,26 @@ async function inferFeatureHintThroughDevApi(payload) {
   if (!response.ok) {
     return {
       ok: false,
-      message: `GPT 大纲生成失败：HTTP ${response.status}`,
+      message: `GPT 蓝图生成失败：HTTP ${response.status}`,
       featureHint: "",
       meta: {}
     };
   }
   return response.json();
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => window.clearTimeout(timer));
+}
+
+function normalizeOutlineTimeout(value) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return 60;
+  return Math.min(120, Math.max(10, parsed));
 }
 
 function formatElapsed(ms) {
@@ -1370,6 +2695,11 @@ function buildBusinessPlan(name, productType, featureHint, meta = {}) {
         dataObjects: module.dataObjects,
         userFlow: module.userFlow,
         screens: module.screens,
+        operations: module.operations,
+        operationSpecs: module.operationSpecs,
+        dataFields: module.dataFields,
+        rules: module.rules,
+        entities: module.entities,
         children: buildChildren(module.title)
       }))
     : (keywords.length ? keywords : splitTerms(featureHint)).slice(0, 10).map((keyword, index) => ({
@@ -1410,13 +2740,45 @@ function normalizeBlueprintModule(item) {
   if (title.length < 2 || description.length < 12) return null;
   const category = String(item.category || item.group || "业务模块").trim();
   return {
+    key: String(item.key || item.module_key || item.moduleKey || "").trim(),
     category: category && category !== "核心模块" ? category : "业务模块",
     title,
     description,
     dataObjects: normalizeDetailList(item.data_objects || item.dataObjects || item.objects, 6),
     userFlow: normalizeDetailList(item.user_flow || item.userFlow || item.flow || item.steps, 6),
-    screens: normalizeDetailList(item.screens || item.pages, 5)
+    screens: normalizeDetailList(item.screens || item.pages, 5),
+    operations: normalizeDetailList(item.operations || item.actions, 7),
+    operationSpecs: normalizeOperationSpecs(item.operation_specs || item.operationSpecs),
+    dataFields: normalizeDetailList(item.data_fields || item.dataFields || item.fields, 10),
+    rules: normalizeDetailList(item.rules || item.quality_rules || item.qualityRules, 5),
+    entities: normalizeDetailList(item.entities, 4)
   };
+}
+
+function normalizeOperationSpecs(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const label = String(item.label || item.action || item.name || "").trim();
+      if (!label) return null;
+      return {
+        actionKey: String(item.action_key || item.actionKey || "").trim(),
+        label,
+        category: String(item.category || "").trim(),
+        role: String(item.role || "").trim(),
+        trigger: String(item.trigger || "").trim(),
+        inputFields: normalizeDetailList(item.input_fields || item.inputFields, 8),
+        preState: String(item.pre_state || item.preState || "").trim(),
+        postState: String(item.post_state || item.postState || "").trim(),
+        resultEvidence: String(item.result_evidence || item.resultEvidence || "").trim(),
+        requiresConfirmation: Boolean(
+          item.requires_confirmation !== undefined ? item.requires_confirmation : item.requiresConfirmation
+        )
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 7);
 }
 
 function normalizeDetailList(value, maxCount) {
@@ -1586,29 +2948,74 @@ function guessDomain(name, productType, hint) {
   return productType || "软件服务";
 }
 
-function statusLabel(status) {
+function inferProductType(name, hint = "") {
+  const text = `${name} ${hint}`;
+  if (/医疗|医院|诊疗|处方|病历|药品|随访|护理|患者|检验|手术|手术室|术前|术后|麻醉|科室|医生|排班|排程|气道|插管|急救|临床|医护/.test(text)) return "医疗软件";
+  if (/VR|虚拟现实|三维|沉浸|仿真/.test(text)) return "VR软件";
+  if (/教育|学习|课程|作业|考试|题库|学情|课堂|教务|培训/.test(text)) return "教育软件";
+  if (/游戏|手游|小游戏|消除|点消|三消|连消|糖果|玩家|道具背包|关卡地图|对局|一笔画|猜词|涂鸦/.test(text)) return "游戏软件";
+  if (/金融|贷款|信贷|支付|清算|账单|授信|风控|银行|保险|理财/.test(text)) return "金融软件";
+  if (/地图|地理|GIS|定位|测绘|轨迹|空间|坐标/.test(text)) return "地理信息软件";
+  if (/云计算|云资源|云主机|云平台|容器|集群|Kubernetes|K8S|k8s|资源编排|弹性伸缩|租户|SaaS/.test(text)) return "云计算软件";
+  if (/安全|漏洞|审计|加密|防护|入侵|认证|权限|风控/.test(text)) return "信息安全软件";
+  if (/大数据|数据湖|数仓|实时计算|指标|画像|趋势|分析/.test(text)) return "大数据软件";
+  if (/人工智能|AI|模型|识别|预测|推荐|训练|智能/.test(text)) return "人工智能软件";
+  if (/5G|基站|切片|边缘网络|通信/.test(text)) return "5G软件";
+  if (/小程序|微信|公众号|轻应用/.test(text)) return "小程序";
+  if (/物联网|IoT|传感器|设备接入|边缘|网关|采集/.test(text)) return "物联网软件";
+  if (/城市|园区|社区|政务|网格|指挥|水文|河流|电力|线路|巡检|运维|调度/.test(text)) return "智慧城市软件";
+  return "APP";
+}
+
+function inferSoftwareCategory(name, hint = "") {
+  const text = `${name} ${hint}`;
+  if (/嵌入式|固件|边缘设备|单片机|控制器|工控|采集终端/.test(text)) return "嵌入式软件";
+  if (/中间件|网关|消息队列|接口服务|服务总线|调度引擎/.test(text)) return "中间件";
+  if (/操作系统|内核|驱动|文件系统|桌面环境/.test(text)) return "操作系统";
+  return "应用软件";
+}
+
+function statusLabel(status, context = {}) {
   if (status === "planning") return "理解中";
   if (status === "editing") return "可编辑";
   if (status === "running") return "生成中";
   if (status === "success") return "已完成";
   if (status === "error") return "失败";
+  if (status === "cancelled") return "已中止";
+  if (context.hasOutlineError) return "待重试";
+  if (context.canPlan) return "待生成";
   return "待输入";
 }
 
 function outlineStatusLabel(outlineState, planReady) {
-  if (!planReady || outlineState === "empty") return "未生成大纲";
-  if (outlineState === "draft") return "大纲待确认";
-  if (outlineState === "confirmed") return "大纲已确认";
-  return "未生成大纲";
+  if (!planReady || outlineState === "empty") return "未生成蓝图";
+  if (outlineState === "draft") return "蓝图待确认";
+  if (outlineState === "confirmed") return "蓝图已确认";
+  return "未生成蓝图";
 }
 
-function primaryButtonLabel(status, outlineState, planReady, gptConfigured) {
+function workflowStageIndex(status, outlineState, planReady) {
+  if (status === "success") return 3;
+  if (["running", "error", "cancelled"].includes(status)) return 2;
+  if (status === "planning" || planReady || outlineState === "draft" || outlineState === "confirmed" || status === "editing") return 1;
+  return 0;
+}
+
+function primaryButtonLabel(
+  status,
+  outlineState,
+  planReady,
+  gptConfigured,
+  canRetryFromConfirmedOutline = false,
+  blueprintReviewBeforeGeneration = false
+) {
   if (status === "running") return "生成中";
-  if (status === "planning") return "生成大纲中";
-  if (!gptConfigured) return "配置 GPT";
-  if (!planReady || outlineState === "empty") return "生成大纲";
-  if (outlineState === "draft") return "确认大纲并生成";
-  return "确认生成";
+  if (status === "planning") return "自动规划中";
+  if (canRetryFromConfirmedOutline) return "保留蓝图重试";
+  if (!gptConfigured) return "配置 AI";
+  if (!planReady || outlineState === "empty") return blueprintReviewBeforeGeneration ? "生成蓝图" : "开始生成";
+  if (outlineState === "draft") return "确认并开始生成";
+  return "加入生成队列";
 }
 
 function currentEvent(events) {
@@ -1618,7 +3025,32 @@ function currentEvent(events) {
 function processTitle(status) {
   if (status === "success") return "材料包生成完成";
   if (status === "error") return "生成失败，等待处理";
+  if (status === "cancelled") return "生成已中止";
   return "AI 正在生成材料包";
+}
+
+function processStatusIcon(status, stage = "") {
+  if (status === "success") return <CheckCircle2 size={15} />;
+  if (status === "cancelled") return <Square size={15} />;
+  if (status === "error") return <AlertTriangle size={15} />;
+  if (["visual_reference", "screenshots"].includes(stage)) return <ImageIcon size={17} />;
+  if (stage === "source") return <Code2 size={17} />;
+  if (["manual_content", "manual", "source_doc", "pdf", "info"].includes(stage)) return <FileText size={17} />;
+  if (stage === "package") return <PackageCheck size={17} />;
+  return <Sparkles size={17} />;
+}
+
+function compactStageStatus(events, status) {
+  const seen = new Set(events.map((event) => event.stage).filter(Boolean));
+  const latestStage = events.length ? events[events.length - 1].stage : "";
+  return generationStages.map(([key, label]) => {
+    let state = "pending";
+    if (status === "success" && seen.has(key)) state = "done";
+    else if ((status === "error" || status === "cancelled") && latestStage === key) state = "error";
+    else if (latestStage === key && status === "running") state = "active";
+    else if (seen.has(key)) state = "done";
+    return { key, label, state };
+  });
 }
 
 function fallbackResultEvents(result) {
@@ -1637,6 +3069,123 @@ function fallbackResultEvents(result) {
     .filter((event) => event.message.trim());
 }
 
+function buildProcessConversation(events, status) {
+  const source = events.length
+    ? events
+    : [
+        {
+          stage: "start",
+          progress: status === "success" ? 100 : 0,
+          message: status === "success" ? "材料包生成完成" : "等待生成过程开始",
+          at: "",
+          elapsedMs: 0
+        }
+      ];
+  return source.slice(-36).map((event) => {
+    const actor = processActor(event);
+    const detailParts = [];
+    const detail = processEventDetail(event);
+    if (detail) detailParts.push(detail);
+    return {
+      event,
+      actor: actor.name,
+      avatar: actor.avatar,
+      tone: actor.tone,
+      message: conversationMessage(event),
+      detail: detailParts.join(" · ")
+    };
+  });
+}
+
+function processRowMeta(item) {
+  const time = item?.event?.at || "";
+  const detail = String(item?.detail || "").trim();
+  if (time && detail) return `${time} · ${detail}`;
+  if (time) return time;
+  return detail;
+}
+
+function processActor(event) {
+  const stage = String(event.stage || "");
+  const message = String(event.message || "");
+  if (stage === "visual_reference") {
+    if (message.includes("暂不写入界面代码") || message.includes("页面清单")) return { name: "页面规划", avatar: "单", tone: "plan" };
+    if (message.includes("视觉提示词")) return { name: "视觉设计", avatar: "视", tone: "design" };
+    if (message.includes("gpt-image-2") || message.includes("视觉参考")) return { name: "图片模型", avatar: "图", tone: "image" };
+    return { name: "视觉参考", avatar: "图", tone: "image" };
+  }
+  if (stage === "screenshots") {
+    if (message.includes("复用") || message.includes("参考图")) return { name: "前端生成", avatar: "码", tone: "code" };
+    if (message.includes("界面代码")) return { name: "前端生成", avatar: "码", tone: "code" };
+    if (message.includes("运行截图") || message.includes("渲染界面截图") || message.includes("生成项目服务")) {
+      return { name: "截图运行", avatar: "截", tone: "run" };
+    }
+    return { name: "界面链路", avatar: "界", tone: "design" };
+  }
+  if (stage === "prepare") return { name: "业务分析", avatar: "析", tone: "plan" };
+  if (stage === "blueprint") return { name: "产品规划", avatar: "蓝", tone: "plan" };
+  if (stage === "manual_content" || stage === "manual") return { name: "文档撰写", avatar: "文", tone: "doc" };
+  if (stage === "source") return { name: "业务工程", avatar: "源", tone: "code" };
+  if (stage === "source_doc") return { name: "源码材料", avatar: "材", tone: "code" };
+  if (stage === "pdf" || stage === "info" || stage === "package") return { name: "校验打包", avatar: "验", tone: "check" };
+  return { name: "任务调度", avatar: "启", tone: "plan" };
+}
+
+function conversationMessage(event) {
+  const message = String(event.message || "");
+  if (message.includes("先生成全局风格参考图")) {
+    return "先生成一张 gpt-image-2 全局风格参考图；后面的业务工程源码和界面代码都会沿用这张图的视觉方向。";
+  }
+  if (message.includes("先生成参考图，暂不写入源码工程")) {
+    return "正在整理视觉参考需要的页面角色；此时还没有生成业务工程源码。";
+  }
+  if (
+    message.includes("生成业务后端与运行接口")
+    || message.includes("生成业务源码与运行接口")
+    || message.includes("生成真实源码工程")
+  ) {
+    return "正在根据已生成的全局风格参考图准备业务工程源码、本地接口服务和视觉契约文件。";
+  }
+  if (message.includes("根据参考图生成界面代码并运行源码截图")) {
+    return "参考图和业务工程已准备好，正在按图生成可运行界面代码，并从源码工程服务重新截图。";
+  }
+  if (message.includes("复用全局风格参考图")) {
+    return "正在复用前面生成的风格参考图，下一步按图写界面 HTML/CSS。";
+  }
+  if (message.includes("生成风格参考图、界面代码与运行截图") || message.includes("生成视觉参考稿与运行截图")) {
+    return "进入截图链路：按全局风格参考图写全部界面代码，最后运行页面重新截图。";
+  }
+  if (message.includes("暂不写入界面代码")) {
+    return "正在整理截图页面清单；此时只确定页面角色和文件名，暂不写入界面 HTML/CSS。";
+  }
+  if (message.includes("准备截图页面清单")) {
+    return "正在整理本次需要截图的页面清单，后面会生成一张全局风格参考图并逐页运行截图。";
+  }
+  if (message.includes("全局视觉风格提示词") || message.includes("生成视觉提示词")) {
+    return "正在把产品壳、配色、导航和控件密度整理成全局风格提示词。";
+  }
+  if (message.includes("gpt-image-2") && (message.includes("视觉参考稿") || message.includes("视觉风格参考图"))) {
+    return "正在请求 gpt-image-2 生成一张全局视觉风格参考图。";
+  }
+  if (message.includes("生成界面代码")) {
+    return "正在读取全局风格参考图，并生成当前页面的可运行 HTML/CSS 代码。";
+  }
+  if (message.includes("启动生成项目服务")) {
+    return "正在启动本次生成的源码项目，准备从真实运行页面重新截图。";
+  }
+  if (message.includes("渲染界面截图")) {
+    return "正在用 Playwright 截取最终写入手册的运行截图。";
+  }
+  return message || "正在处理当前步骤";
+}
+
+function conversationStatusLabel(status, messages) {
+  if (status === "success") return "已完成";
+  if (status === "error") return "已停止在异常步骤";
+  if (status === "cancelled") return "已中止";
+  return messages.length ? "实时更新" : "等待事件";
+}
+
 function groupEventsByStage(events) {
   const groups = new Map(generationStages.map(([key]) => [key, []]));
   for (const event of events) {
@@ -1649,6 +3198,7 @@ function groupEventsByStage(events) {
 function stageState(stage, stageEvents, latestStage, status) {
   if (status === "success" && stageEvents.length) return "done";
   if (status === "error" && latestStage === stage) return "error";
+  if (status === "cancelled" && latestStage === stage) return "error";
   if (latestStage === stage && status === "running") return "active";
   if (stageEvents.length) return "done";
   return "pending";
@@ -1659,6 +3209,38 @@ function stageStateIcon(state) {
   if (state === "done") return <CheckCircle2 size={14} />;
   if (state === "error") return <AlertTriangle size={14} />;
   return null;
+}
+
+function stageCountLabel(stage, stageEvents) {
+  if (stageEvents.length) return `${stageEvents.length} 步`;
+  const planned = stagePlannedSteps[stage] || [];
+  if (planned.length) return `${planned.length} 子步骤`;
+  return "待开始";
+}
+
+function stageSummary(stage, last) {
+  if (last?.message) return last.message;
+  if (stage === "visual_reference") {
+    return "等待先生成全局风格参考图";
+  }
+  if (stage === "screenshots") {
+    return "等待复用风格参考图、按图生成代码和运行截图";
+  }
+  return "等待上一阶段完成后自动进入";
+}
+
+function plannedStepState(stage, stageEvents, step) {
+  const matchedIndex = stageEvents.findIndex((event) =>
+    (step.match || []).some((pattern) => String(event.message || "").includes(pattern))
+  );
+  if (matchedIndex >= 0) return "done";
+  if (!stageEvents.length) return "";
+  const previousSteps = stagePlannedSteps[stage] || [];
+  const stepIndex = previousSteps.findIndex((item) => item.label === step.label);
+  const previousDone = stepIndex <= 0 || previousSteps
+    .slice(0, stepIndex)
+    .every((item) => plannedStepState(stage, stageEvents, item) === "done");
+  return previousDone ? "active" : "";
 }
 
 function stageLabel(stage) {
@@ -1692,16 +3274,39 @@ function buildCommandPreview(form) {
   ].join(" `\n");
 }
 
-function DeliveryStatus({ result }) {
-  const status = deliveryStatus(result);
+function VisualReferenceFailureHint({ result }) {
+  const checks = result?.checks || {};
+  if (checks.ui_visual_reference_ready || !checks.ui_visual_reference_image_model && !checks.ui_visual_reference_error) {
+    return null;
+  }
+  const model = checks.ui_visual_reference_image_model || "gpt-image-2";
+  const failedPage = checks.ui_visual_reference_failed_page || "当前页面";
+  const retryCount = Number(checks.ui_visual_reference_retry_count || 0);
+  const referenceCount = Number(checks.ui_visual_reference_count || 0);
+  const pageCount = Number(checks.ui_visual_reference_page_count || 0);
+  const source = String(checks.ui_visual_reference_source || "");
+  const isStyleReference = checks.ui_visual_reference_mode === "style_reference"
+    || failedPage === "style_reference"
+    || source.includes("style-reference")
+    || source.includes("style_reference")
+    || source.includes("gpt-style-reference");
+  const mode = isStyleReference ? "style_reference" : (checks.ui_visual_reference_mode || "per_page");
+  const targetCount = Number(checks.ui_visual_reference_target_count || (mode === "style_reference" ? 1 : pageCount));
+  const appliesToPageCount = Number(checks.ui_visual_reference_applies_to_page_count || pageCount || 0);
+  const failedPageLabel = mode === "style_reference" && failedPage === "style_reference" ? "全局风格参考图" : failedPage;
+  const retryLabel = retryCount > 0 ? `已按图片链路重试 ${retryCount} 次` : "图片链路未配置额外重试";
+  const countLabel = mode === "style_reference"
+    ? referenceCount > 0
+      ? `全局风格参考图已生成（${referenceCount}/${targetCount || 1}），将覆盖 ${appliesToPageCount || "全部"} 个页面`
+      : `全局风格参考图未完成（${referenceCount}/${targetCount || 1}），该图将覆盖 ${appliesToPageCount || "全部"} 个页面`
+    : pageCount
+      ? `已完成 ${referenceCount}/${pageCount} 张参考稿`
+      : "参考稿未完成";
   return (
-    <div className={`delivery-status ${status.state}`}>
-      <span className="quality-state">{qualityIcon(status.state)}</span>
-      <div>
-        <strong>{status.title}</strong>
-        <p>{status.detail}</p>
-      </div>
-    </div>
+    <small>
+      视觉参考稿阶段未完成：失败项 {failedPageLabel}，图片模型 {model}，{retryLabel}，{countLabel}。
+      {checks.ui_visual_reference_directory ? ` 参考稿目录：${checks.ui_visual_reference_directory}` : ""}
+    </small>
   );
 }
 
@@ -1729,6 +3334,50 @@ function deliveryStatus(result) {
   };
 }
 
+function domainProfileChecks(profile) {
+  if (!profile || typeof profile !== "object") return {};
+  return {
+    ui_domain_profile_key: profile.key || "",
+    ui_domain_profile_confidence: profile.confidence || 0,
+    ui_domain_profile_source: profile.source || "",
+    ui_domain_profile_evidence: profile.evidence || "",
+    ui_domain_profile_weak_evidence: profile.weakEvidence || "",
+    ui_domain_profile_excluded_evidence: profile.excludedEvidence || "",
+    ui_domain_gate_keys: profile.gateKeys || "",
+    ui_domain_gate_reasons: profile.gateReasons || "",
+    ui_route_topology_required: Boolean(profile.routeTopologyRequired),
+    ui_route_topology_ready: !profile.routeTopologyRequired
+  };
+}
+
+function domainProfileLabel(checks = {}) {
+  const key = String(checks.ui_domain_profile_key || "").trim();
+  if (!key) return "未识别";
+  const confidence = Number(checks.ui_domain_profile_confidence || 0);
+  return `${domainProfileKeyLabel(key)}${confidence ? ` · ${Math.round(confidence * 100)}%` : ""}`;
+}
+
+function domainProfileKeyLabel(key) {
+  const labels = {
+    transport_route: "交通线路",
+    download_manager: "下载管理",
+    workforce_attendance: "考勤人力",
+    medical: "医疗",
+    survey_mapping: "测绘地理",
+    smart_manufacturing: "智能制造",
+    rail_construction_quality: "轨道施工质量",
+    general_business: "通用业务"
+  };
+  return labels[key] || key;
+}
+
+function domainProfileDetail(checks = {}) {
+  const reason = String(checks.ui_domain_gate_reasons || "").trim();
+  const evidence = String(checks.ui_domain_profile_evidence || "").trim();
+  const excluded = String(checks.ui_domain_profile_excluded_evidence || "").trim();
+  return reason || (evidence ? `证据：${evidence}` : excluded ? `排除证据：${excluded}` : "未启用行业专属硬门禁。");
+}
+
 function buildQualityItems(result) {
   if (!result?.checks) return [];
   const checks = result.checks;
@@ -1742,16 +3391,30 @@ function buildQualityItems(result) {
   const selectedPages = Number(checks.source_selected_pages || 0);
   return [
     {
+      label: "领域门禁",
+      value: domainProfileLabel(checks),
+      detail: domainProfileDetail(checks),
+      state: checks.ui_route_topology_required && !checks.ui_route_topology_ready ? "fail" : "pass"
+    },
+    {
       label: "生成策略",
-      value: checks.generation_quality_profile === "authenticity-first" ? "真实性优先" : "快速批量",
+      value: generationProfileLabel(checks.generation_quality_profile),
       detail: `蓝图目标 ${checks.blueprint_quality_target || 78}，实际 ${checks.blueprint_quality_score || 0}`,
-      state: checks.generation_quality_profile === "authenticity-first" ? "pass" : "warn"
+      state: checks.generation_quality_profile === "fast" ? "warn" : "pass"
+    },
+    {
+      label: "阶段复用",
+      value: stageCacheHitValue(checks.stage_cache_hits),
+      detail: checks.stage_cache_enabled
+        ? `缓存键 ${String(checks.stage_cache_key || "").slice(0, 8) || "已启用"}`
+        : "阶段缓存未启用",
+      state: Array.isArray(checks.stage_cache_hits) && checks.stage_cache_hits.length ? "pass" : "warn"
     },
     {
       label: "技术架构",
       value: checks.technical_architecture || "自动选择",
-      detail: `${checks.software_category || "应用软件"} / ${checks.source_language || "多语言源码"}`,
-      state: checks.technical_architecture ? "pass" : "warn"
+      detail: `${checks.technical_architecture_source === "llm" ? "GPT选择" : "规则选择"} / ${checks.source_strategy || "源码策略"} / ${checks.source_language || "多语言源码"}`,
+      state: checks.technical_architecture_source === "llm" || checks.technical_architecture ? "pass" : "warn"
     },
     {
       label: "真实性评分",
@@ -1818,6 +3481,23 @@ function findingSummary(findings) {
     .join("；");
 }
 
+function generationProfileLabel(profile) {
+  if (profile === "authenticity-first") return "真实性优先";
+  if (profile === "fast") return "快速批量";
+  return "平衡加速";
+}
+
+function stageCacheHitValue(hits) {
+  if (!Array.isArray(hits) || !hits.length) return "未复用";
+  const labels = {
+    blueprint: "产品蓝图",
+    technical_architecture: "技术架构",
+    manual_content: "说明书正文",
+    ui_blueprint: "界面蓝图"
+  };
+  return hits.map((item) => labels[item] || item).join("、");
+}
+
 function buildGeneratedFiles(result) {
   if (!result) return [];
   const items = [];
@@ -1850,13 +3530,6 @@ function qualityIcon(state) {
   return <AlertTriangle size={15} />;
 }
 
-function balanceHint(account) {
-  if (account.status === "connected") return account.updatedAt ? `更新于 ${account.updatedAt}` : "模型账户可用";
-  if (account.status === "unconfigured") return account.message || "请先配置 GPT 请求地址和 API Key";
-  if (account.status === "error") return account.message || "账户接口异常";
-  return "保存 GPT 配置后可读取账户状态";
-}
-
 function inferFeatureHint(name, productType = "") {
   const text = `${name} ${productType}`;
   if (/点餐|订餐|外卖|餐饮|菜单|菜品/.test(text)) {
@@ -1880,4 +3553,10 @@ function inferFeatureHint(name, productType = "") {
     : "用户入口、首页导航、核心工作台、业务表单处理、记录查询、统计分析、消息提醒、系统设置";
 }
 
-createRoot(document.getElementById("root")).render(<App />);
+const rootElement = document.getElementById("root");
+if (!rootElement) throw new Error("应用根节点不存在");
+createRoot(rootElement).render(
+  <RendererErrorBoundary>
+    <App />
+  </RendererErrorBoundary>
+);

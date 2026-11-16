@@ -10,9 +10,25 @@ from typing import Any
 
 from .blueprint import ProductBlueprint
 from .industry_subtypes import build_ui_design_brief
-from .llm.provider import LLMProvider, LocalTemplateProvider
+from .domain_profile import has_transport_domain_signal as _has_transport_domain_signal
+from .llm.provider import LLMProvider, LocalTemplateProvider, TextProviderError, TextRetryPolicy
 from .llm.trace import trace_event
+from .llm.json_response import parse_json_object
 from .models import GenerationTask
+from .product_experience import (
+    ProductExperienceSpec,
+    build_product_experience_spec,
+    design_brief_experience_fields,
+    design_brief_matches_experience,
+    expected_renderer_for_experience,
+    layout_overrides_for_experience,
+)
+from .ui_visual_identity import (
+    build_visual_identity_spec,
+    identity_design_brief_fields,
+    visual_identity_matches_task,
+)
+from .ui_roles import screenshot_role_contract
 
 
 @dataclass
@@ -62,25 +78,116 @@ def build_ui_blueprint(
     blueprint: ProductBlueprint,
     provider: LLMProvider | None = None,
     emit=None,
+    require_llm: bool = False,
+    visual_identity_attempt: int = 0,
 ) -> UiBlueprint:
-    fallback = _typed_ui_blueprint(task, blueprint)
+    fallback = _typed_ui_blueprint(task, blueprint, visual_identity_attempt=visual_identity_attempt)
     if provider is None or isinstance(provider, LocalTemplateProvider):
+        if require_llm:
+            raise RuntimeError("当前版本要求由 GPT 生成界面蓝图，请配置 GPT/OpenAI-compatible。")
         return fallback
 
     try:
-        llm_blueprint = _generate_ui_blueprint_with_llm(task, blueprint, provider, fallback, emit=emit)
+        llm_blueprint = _generate_ui_blueprint_with_llm(
+            task,
+            blueprint,
+            provider,
+            fallback,
+            emit=emit,
+            require_llm=require_llm,
+            visual_identity_attempt=visual_identity_attempt,
+        )
     except Exception as exc:
+        if require_llm:
+            raise RuntimeError(f"GPT 界面蓝图生成失败：{exc}") from exc
         fallback.warnings.append(f"模型界面蓝图生成失败，已回退本地规则：{exc}")
         return fallback
     return llm_blueprint
 
 
-def _typed_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> UiBlueprint:
-    if is_game_like(task, blueprint):
-        return _game_ui_blueprint(task, blueprint)
-    if is_mobile_app_like(task, blueprint):
-        return _mobile_app_ui_blueprint(task, blueprint)
-    return _admin_ui_blueprint(task, blueprint)
+def _typed_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint, visual_identity_attempt: int = 0) -> UiBlueprint:
+    renderer = _expected_renderer(task, blueprint)
+    if renderer == "game":
+        return _game_ui_blueprint(task, blueprint, visual_identity_attempt=visual_identity_attempt)
+    if renderer == "mobile_app":
+        return _mobile_app_ui_blueprint(task, blueprint, visual_identity_attempt=visual_identity_attempt)
+    return _admin_ui_blueprint(task, blueprint, visual_identity_attempt=visual_identity_attempt)
+
+
+def complete_ui_blueprint_coverage(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    current: UiBlueprint,
+) -> UiBlueprint:
+    fallback = _typed_ui_blueprint(task, blueprint)
+    existing_module_keys = {screen.module_key for screen in current.screens if screen.module_key}
+    missing = [
+        screen
+        for screen in fallback.screens
+        if screen.module_key and screen.module_key not in existing_module_keys
+    ]
+    if not missing:
+        return current
+    statistics = [screen for screen in current.screens if screen.key == "statistics"]
+    base = [screen for screen in current.screens if screen.key != "statistics"]
+    return UiBlueprint(
+        renderer=current.renderer,
+        visual_style=current.visual_style,
+        screens=base + missing + statistics,
+        source=current.source,
+        warnings=list(current.warnings),
+        design_brief=dict(current.design_brief or fallback.design_brief),
+    )
+
+
+def repair_ui_blueprint_contract(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    current: UiBlueprint,
+) -> UiBlueprint | None:
+    """Repair polluted metadata while preserving already-correct business screens."""
+    expected_experience = build_product_experience_spec(task, blueprint)
+    expected_renderer = _expected_renderer(task, blueprint, expected_experience)
+    if current.renderer != expected_renderer or not current.screens:
+        return None
+    ui_text = " ".join(
+        [current.visual_style]
+        + [
+            " ".join(
+                [
+                    screen.title,
+                    screen.caption,
+                    " ".join(screen.components),
+                    json.dumps(screen.sample_data, ensure_ascii=False),
+                ]
+            )
+            for screen in current.screens
+        ]
+    )
+    subtype_key = expected_experience.industry_subtype_key
+    medical_terms = r"手术|麻醉|患者|病历|处方|住院|病区|床位|生命体征|医嘱"
+    rail_terms = r"轨道交通|地铁|铁路|施工质量|检验批|材料复检|工程部位|单位工程|标段"
+    game_terms = r"消除棋盘|关卡地图|道具背包|剩余步数|玩家战力"
+    if subtype_key not in {"inpatient_monitoring", "surgery_schedule", "clinic_emr", "hospital_inventory"} and re.search(medical_terms, ui_text):
+        return None
+    if subtype_key != "rail_construction_quality" and re.search(rail_terms, ui_text):
+        return None
+    if expected_renderer != "game" and re.search(game_terms, ui_text):
+        return None
+    old_brief = current.design_brief if isinstance(current.design_brief, dict) else {}
+    attempt = int(old_brief.get("visual_identity_attempt") or 0)
+    fresh_brief = _ui_design_brief_with_contract(task, blueprint, expected_renderer, visual_identity_attempt=attempt)
+    reference = old_brief.get("pre_source_visual_reference")
+    if isinstance(reference, dict) and reference.get("ready"):
+        fresh_brief["pre_source_visual_reference"] = reference
+    return UiBlueprint(
+        renderer=current.renderer,
+        visual_style=current.visual_style,
+        screens=list(current.screens),
+        source=current.source,
+        warnings=list(current.warnings) + ["已修复与当前业务领域不一致的界面蓝图元数据。"],
+        design_brief=fresh_brief,
+    )
 
 
 def _generate_ui_blueprint_with_llm(
@@ -89,6 +196,8 @@ def _generate_ui_blueprint_with_llm(
     provider: LLMProvider,
     fallback: UiBlueprint,
     emit=None,
+    require_llm: bool = False,
+    visual_identity_attempt: int = 0,
 ) -> UiBlueprint:
     expected_renderer = _expected_renderer(task, blueprint)
     warnings: list[str] = []
@@ -98,13 +207,15 @@ def _generate_ui_blueprint_with_llm(
             provider,
             [
                 {"role": "system", "content": _ui_system_prompt()},
-                {"role": "user", "content": _build_ui_style_prompt(task, blueprint, expected_renderer)},
+                {"role": "user", "content": _build_ui_style_prompt(task, blueprint, expected_renderer, visual_identity_attempt)},
             ],
             max_tokens=700,
             label="界面风格蓝图",
         )
         visual_style = str(style_data.get("visual_style") or fallback.visual_style)
     except Exception as exc:
+        if require_llm:
+            raise RuntimeError(f"界面风格生成失败：{exc}") from exc
         visual_style = fallback.visual_style
         warnings.append(f"模型界面风格生成失败，已沿用本地风格：{exc}")
 
@@ -118,7 +229,7 @@ def _generate_ui_blueprint_with_llm(
             provider,
             [
                 {"role": "system", "content": _ui_system_prompt()},
-                {"role": "user", "content": _build_ui_screen_batch_prompt(task, blueprint, expected_renderer, batch)},
+                {"role": "user", "content": _build_ui_screen_batch_prompt(task, blueprint, expected_renderer, batch, visual_identity_attempt)},
             ],
             max_tokens=1200,
             label=f"界面截图蓝图批次{index}",
@@ -139,6 +250,8 @@ def _generate_ui_blueprint_with_llm(
             try:
                 screen_results[index] = run_batch(index, batch)
             except Exception as exc:
+                if require_llm:
+                    raise RuntimeError(f"界面截图批次 {index} 生成失败：{exc}") from exc
                 warnings.append(f"模型界面截图批次 {index} 生成失败，已沿用本地截图定义：{exc}")
     else:
         with ThreadPoolExecutor(max_workers=min(workers, len(batches))) as executor:
@@ -151,6 +264,8 @@ def _generate_ui_blueprint_with_llm(
                 try:
                     screen_results[index] = future.result()
                 except Exception as exc:
+                    if require_llm:
+                        raise RuntimeError(f"界面截图批次 {index} 生成失败：{exc}") from exc
                     warnings.append(f"模型界面截图批次 {index} 生成失败，已沿用本地截图定义：{exc}")
 
     for index in sorted(screen_results):
@@ -164,7 +279,7 @@ def _generate_ui_blueprint_with_llm(
         "visual_style": visual_style,
         "screens": screens,
     }
-    candidate = _ui_blueprint_from_data(data, fallback, expected_renderer)
+    candidate = _ui_blueprint_from_data(data, fallback, expected_renderer, require_complete_model=require_llm)
     candidate.source = "llm"
     candidate.warnings.extend(warnings)
     return candidate
@@ -177,9 +292,9 @@ def _emit(emit, progress: int, message: str, **extra) -> None:
 
 def _llm_batch_workers() -> int:
     try:
-        value = int(os.getenv("SOFT_LLM_BATCH_WORKERS", "1"))
+        value = int(os.getenv("SOFT_LLM_BATCH_WORKERS", "2"))
     except ValueError:
-        value = 1
+        value = 2
     return max(1, min(3, value))
 
 
@@ -187,7 +302,9 @@ def _generation_quality_profile(task: GenerationTask) -> str:
     value = os.getenv("SOFT_GENERATION_PROFILE", "").strip().lower()
     if value in {"fast", "speed", "batch"}:
         return "fast"
-    return "authenticity-first"
+    if value in {"authenticity-first", "authenticity", "quality", "strict"}:
+        return "authenticity-first"
+    return "balanced"
 
 
 def _authenticity_first(task: GenerationTask) -> bool:
@@ -244,9 +361,15 @@ def _ui_system_prompt() -> str:
     )
 
 
-def _build_ui_style_prompt(task: GenerationTask, blueprint: ProductBlueprint, expected_renderer: str) -> str:
+def _build_ui_style_prompt(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    expected_renderer: str,
+    visual_identity_attempt: int = 0,
+) -> str:
+    design_brief = _ui_design_brief_with_contract(task, blueprint, expected_renderer, visual_identity_attempt)
     if expected_renderer == "mobile_app":
-        renderer_note = _renderer_note(expected_renderer)
+        renderer_note = _renderer_note(expected_renderer, design_brief)
         return f"""
 请为软著截图生成整体界面风格。只返回 JSON。
 软件名称：{task.software_name}
@@ -257,20 +380,21 @@ def _build_ui_style_prompt(task: GenerationTask, blueprint: ProductBlueprint, ex
 具体场景：{blueprint.scenario or "未提供"}
 产品定位：{blueprint.positioning or "未提供"}
 模块标题：{"、".join(module.title for module in blueprint.modules[:8])}
-本次界面设计 brief：{json.dumps(build_ui_design_brief(task, blueprint), ensure_ascii=False, indent=2)}
+本次界面设计 brief：{json.dumps(design_brief, ensure_ascii=False, indent=2)}
 
 强制要求：
 - renderer 必须为 "{expected_renderer}"
 - 风格应符合：{renderer_note}
+- 必须严格执行 visual_identity_spec；同产品小类也要根据 identity_signature 改变导航、布局、密度、图表和模块角色
 - visual_style 用中文短语，体现软件名称和真实业务领域，不要写通用风格
 
 返回 JSON：
 {{"renderer":"{expected_renderer}","visual_style":"中文短语"}}
 """.strip()
     renderer_note = (
-        "手机游戏 9:16 竖屏界面，强调玩家、关卡、棋盘、道具、结算等游戏元素。"
+        _renderer_note("game", design_brief)
         if expected_renderer == "game"
-        else "桌面业务系统界面，强调业务看板、表格列表、筛选、流程状态和统计报表。"
+        else _renderer_note("admin", design_brief)
     )
     return f"""
 请为软著截图生成整体界面风格。只返回 JSON。
@@ -284,11 +408,12 @@ def _build_ui_style_prompt(task: GenerationTask, blueprint: ProductBlueprint, ex
 产品定位：{blueprint.positioning or "未提供"}
 模块标题：{"、".join(module.title for module in blueprint.modules[:8])}
 本次界面设计 brief：
-{json.dumps(build_ui_design_brief(task, blueprint), ensure_ascii=False, indent=2)}
+{json.dumps(design_brief, ensure_ascii=False, indent=2)}
 
 强制要求：
 - renderer 必须为 "{expected_renderer}"
 - 风格应符合：{renderer_note}
+- 必须严格执行 visual_identity_spec；同产品小类也要根据 identity_signature 改变导航、布局、密度、图表和模块角色
 - visual_style 用中文短语，体现软件业务领域，不要写通用风格
 
 返回 JSON：
@@ -301,21 +426,26 @@ def _build_ui_screen_batch_prompt(
     blueprint: ProductBlueprint,
     expected_renderer: str,
     screens: list[UiScreenBlueprint],
+    visual_identity_attempt: int = 0,
 ) -> str:
+    design_brief = _ui_design_brief_with_contract(task, blueprint, expected_renderer, visual_identity_attempt)
     if expected_renderer == "mobile_app":
+        renderer_note = _renderer_note(expected_renderer, design_brief)
         return f"""
 请为本批软著说明书截图补齐内容。只返回 JSON。
 
 软件上下文：
 {_compact_ui_context(task, blueprint)}
 
-本次界面设计 brief：{json.dumps(build_ui_design_brief(task, blueprint), ensure_ascii=False, indent=2)}
+本次界面设计 brief：{json.dumps(design_brief, ensure_ascii=False, indent=2)}
 
 本批截图固定结构：{json.dumps(_screen_batch_payload(screens, blueprint), ensure_ascii=False, indent=2)}
 
 强制要求：
 - renderer 必须为 "{expected_renderer}"
-- 本批截图必须保持面向普通用户的手机 App 场景，不能出现后台侧边栏、审批流、表格台账、复核发布、工单看板或质量复盘。
+- 本批截图必须保持{renderer_note}，不能出现后台侧边栏、审批流、表格台账、复核发布、工单看板或质量复盘。
+- 必须执行 visual_identity_spec：导航模型、页面结构、图表风格、表格密度和模块 view_type 不得泛化成同一套模板。
+- 截图角色合同只约束用途，不固定文案；title/caption/components/sample_data 必须每次根据当前软件重写，不能照抄合同文本。
 - 每个 screen 的 key、view_type、module_key 必须原样返回，不能新增或改名。
 - title/caption/components/sample_data 必须来自软件名称、用户任务、内容对象、交互动作和真实 App 页面。
 - caption 要像说明书图注，说明这张截图展示了什么用户功能。
@@ -327,9 +457,9 @@ def _build_ui_screen_batch_prompt(
 {{"renderer":"{expected_renderer}","screens":[{{"key":"...","title":"...","caption":"...","view_type":"...","module_key":"...","components":["..."],"sample_data":{{"字段":"值"}}}}]}}
 """.strip()
     if expected_renderer == "game":
-        renderer_note = "本批截图必须保持手机游戏场景，不能出现后台管理表格。"
+        renderer_note = f"本批截图必须保持{_renderer_note('game', design_brief)}，不能出现后台管理表格。"
     else:
-        renderer_note = "本批截图必须保持桌面业务系统场景，不能出现游戏棋盘、道具背包或关卡画面。"
+        renderer_note = f"本批截图必须保持{_renderer_note('admin', design_brief)}，不能出现游戏棋盘、道具背包或关卡画面。"
     return f"""
 请为本批软著说明书截图补齐内容。只返回 JSON。
 
@@ -337,7 +467,7 @@ def _build_ui_screen_batch_prompt(
 {_compact_ui_context(task, blueprint)}
 
 本次界面设计 brief：
-{json.dumps(build_ui_design_brief(task, blueprint), ensure_ascii=False, indent=2)}
+{json.dumps(design_brief, ensure_ascii=False, indent=2)}
 
 本批截图固定结构：
 {json.dumps(_screen_batch_payload(screens, blueprint), ensure_ascii=False, indent=2)}
@@ -345,6 +475,8 @@ def _build_ui_screen_batch_prompt(
 强制要求：
 - renderer 必须为 "{expected_renderer}"
 - {renderer_note}
+- 必须执行 visual_identity_spec：导航模型、页面结构、图表风格、表格密度和模块 view_type 不得泛化成同一套模板。
+- 截图角色合同只约束用途，不固定文案；title/caption/components/sample_data 必须每次根据当前软件重写，不能照抄合同文本。
 - 每个 screen 的 key、view_type、module_key 必须原样返回，不能新增或改名
 - title/caption/components/sample_data 必须来自软件场景、业务对象、模块操作、字段、规则或统计指标
 - caption 要像说明书图注，说明这张截图展示了什么业务功能
@@ -365,7 +497,9 @@ def _compact_ui_context(task: GenerationTask, blueprint: ProductBlueprint) -> st
             workflows.append(f"{item.get('name', '业务流程')}：{steps}")
     context = {
         "software_name": task.software_name,
+        "software_category": getattr(task, "software_category", "应用软件"),
         "product_type": task.product_type,
+        "product_experience_spec": build_product_experience_spec(task, blueprint).to_dict(),
         "feature_hint": task.feature_hint,
         "scenario": blueprint.scenario,
         "positioning": blueprint.positioning,
@@ -385,6 +519,135 @@ def _compact_ui_context(task: GenerationTask, blueprint: ProductBlueprint) -> st
         ],
     }
     return json.dumps(context, ensure_ascii=False, indent=2)[:4200]
+
+
+def _ui_design_brief_with_contract(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    expected_renderer: str,
+    visual_identity_attempt: int = 0,
+) -> dict[str, Any]:
+    design_brief = dict(build_ui_design_brief(task, blueprint))
+    _sanitize_design_brief_for_task(task, blueprint, design_brief)
+    experience_spec = build_product_experience_spec(task, blueprint)
+    design_brief.update(design_brief_experience_fields(experience_spec))
+    # 顶层行业标识与产品体验规格必须来自同一次推断，避免出现
+    # “surgery_schedule key + 交通标题 + 制造业页面”这类合并污染。
+    design_brief["industry_subtype_key"] = experience_spec.industry_subtype_key
+    design_brief["industry_subtype"] = experience_spec.industry_subtype
+    design_brief.update(layout_overrides_for_experience(experience_spec))
+    visual_identity = build_visual_identity_spec(task, blueprint, experience_spec, attempt=visual_identity_attempt)
+    identity_fields = identity_design_brief_fields(visual_identity)
+    identity_spec = identity_fields.get("visual_identity_spec")
+    if isinstance(identity_spec, dict):
+        identity_spec["attempt"] = int(visual_identity_attempt)
+        identity_spec["creative_seed"] = str(getattr(task, "seed", "") or "")
+    design_brief.update(identity_fields)
+    design_brief["creative_seed"] = str(getattr(task, "seed", "") or "")
+    design_brief["frontend_framework"] = "react-vite"
+    design_brief["visual_identity_attempt"] = int(visual_identity_attempt)
+    design_brief["expected_renderer"] = expected_renderer
+    design_brief["screenshot_role_contract"] = screenshot_role_contract(task, blueprint, expected_renderer)
+    return design_brief
+
+
+def _sanitize_design_brief_for_task(task: GenerationTask, blueprint: ProductBlueprint, design_brief: dict[str, Any]) -> None:
+    primary_text = " ".join(
+        str(item)
+        for item in [
+            task.software_name,
+            task.product_type,
+            task.feature_hint,
+            getattr(blueprint, "industry", ""),
+            getattr(blueprint, "summary", ""),
+        ]
+        if str(item).strip()
+    )
+    if not _has_transport_domain_signal(primary_text):
+        return
+    banned = ("医疗", "医院", "手术", "手术室", "术前", "术后", "术式", "麻醉", "科室", "医生", "护士", "患者", "病历", "处方", "诊疗", "排班", "排程")
+    replacement = {
+        "industry_subtype_key": "transport_route",
+        "industry_subtype": "交通干支线路径适配系统",
+        "real_scenario": "干线支线维护、路径适配、站点接驳、班次衔接、换乘规则和线路运行统计",
+        "product_positioning": "面向交通运输管理单位的干支线路径适配与协同调度平台",
+        "visual_mood": "交通线路调度台",
+        "dashboard_pattern": "线路地图+班次指标",
+        "module_pattern": "路径适配",
+        "domain_terms": ["干线线路", "支线线路", "站点接驳", "路径适配", "班次计划", "换乘规则", "运行统计"],
+        "metrics": ["线路覆盖率", "班次准点率", "接驳成功率", "路径匹配率", "换乘耗时", "异常班次数"],
+        "layout_signature": "transport_route:map:side_menu:freeform_grid:split_brand:线路地图+班次指标:路径适配",
+    }
+    for key, value in replacement.items():
+        if key in {"industry_subtype_key", "industry_subtype"} or key not in design_brief or _contains_banned_text(design_brief.get(key), banned):
+            design_brief[key] = value
+    for key in ["optimized_prompt", "visual_style"]:
+        if _contains_banned_text(design_brief.get(key), banned):
+            design_brief[key] = "围绕交通运输干线支线路径适配管理组织线路、节点、接驳、匹配评估、规则发布和运行统计界面。"
+    dna = design_brief.get("design_dna")
+    if isinstance(dna, dict):
+        if _contains_banned_text(dna, banned):
+            dna["optimized_prompt"] = "围绕交通运输干线支线路径适配管理生成真实交通线路调度界面，体现干线、支线、节点、接驳、匹配评估和运行统计。"
+            dna["semantic_terms"] = ["交通运输干线支线路径适配管理", "干线线路", "支线线路", "运输节点", "路径匹配评估", "衔接规则", "适配问题处置", "方案发布"]
+            dna["domain_bias"] = "geo_monitor"
+    structure = design_brief.get("structure_blueprint")
+    if isinstance(structure, dict) and _contains_banned_text(structure, banned):
+        design_brief["structure_blueprint"] = _transport_structure_blueprint(structure)
+
+
+def _contains_banned_text(value: Any, banned: tuple[str, ...]) -> bool:
+    return any(term in json.dumps(value, ensure_ascii=False) for term in banned)
+
+
+def _transport_structure_blueprint(previous: dict[str, Any] | None = None) -> dict[str, Any]:
+    base_id = str((previous or {}).get("id") or "transport_route_ui")
+    return {
+        "id": base_id,
+        "grammar": "freeform_grid",
+        "domain_bias": "geo_monitor",
+        "dashboard": {
+            "layout": "dense_console",
+            "slots": [
+                {"kind": "map", "title": "干支线路径分布", "span": 7, "role": "identity"},
+                {"kind": "metrics", "title": "接驳运行指标", "span": 5, "role": "primary"},
+                {"kind": "queue", "title": "路径匹配待办", "span": 6, "role": "support"},
+                {"kind": "focus", "title": "衔接规则看板", "span": 6, "role": "evidence"},
+            ],
+        },
+        "module": {
+            "layout": "document_desk",
+            "slots": [
+                {"kind": "map", "title": "线路节点定位", "span": 4, "role": "filters"},
+                {"kind": "table", "title": "路径适配清单", "span": 5, "role": "primary"},
+                {"kind": "queue", "title": "问题处置队列", "span": 3, "role": "actions"},
+                {"kind": "timeline", "title": "评估发布流程", "span": 6, "role": "detail"},
+                {"kind": "focus", "title": "衔接规则依据", "span": 6, "role": "primary"},
+            ],
+        },
+        "statistics": {
+            "layout": "wide_board",
+            "slots": [
+                {"kind": "map", "title": "区域适配分布", "span": 6, "role": "summary"},
+                {"kind": "chart", "title": "准点衔接趋势", "span": 6, "role": "trend"},
+                {"kind": "table", "title": "线路运行统计", "span": 6, "role": "breakdown"},
+                {"kind": "timeline", "title": "问题闭环流程", "span": 6, "role": "evidence"},
+            ],
+        },
+    }
+
+
+def screenshot_role_contract_from_fallback(fallback: UiBlueprint, expected_renderer: str) -> dict[str, Any]:
+    design_brief = getattr(fallback, "design_brief", {}) or {}
+    contract = design_brief.get("screenshot_role_contract")
+    if isinstance(contract, dict):
+        return contract
+    return {
+        "strategy": "quality-guardrails-with-variable-content",
+        "renderer": expected_renderer,
+        "role_signature": "",
+        "roles": [],
+        "variation_rules": [],
+    }
 
 
 def _screen_batch_payload(screens: list[UiScreenBlueprint], blueprint: ProductBlueprint) -> list[dict[str, Any]]:
@@ -422,12 +685,11 @@ def _chat_json(
     *,
     max_tokens: int,
     label: str,
-    attempts: int = 3,
+    attempts: int = 2,
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     current_messages = messages
-    provider_retries = int(getattr(getattr(provider, "config", None), "retry_count", 0) or 0)
-    total_attempts = 1 if provider_retries > 0 else max(1, attempts)
+    total_attempts = max(1, min(2, attempts))
     for attempt in range(total_attempts):
         started_at = time.perf_counter()
         trace_event(
@@ -447,6 +709,7 @@ def _chat_json(
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"},
                 trace_label=f"ui_blueprint:{label}",
+                retry_policy=TextRetryPolicy(max_retries=1),
             )
             data = _parse_json(content)
             trace_event(
@@ -459,6 +722,8 @@ def _chat_json(
             )
             return data
         except Exception as exc:
+            if isinstance(exc, TextProviderError) and exc.category.value != "format_error":
+                raise
             last_error = exc
             trace_event(
                 "chat_json_error",
@@ -500,7 +765,7 @@ def _build_ui_prompt(task: GenerationTask, blueprint: ProductBlueprint, expected
             "截图必须按手机游戏 9:16 竖屏画幅组织，呈现玩家登录、游戏主界面、关卡/棋盘/道具/结算/玩家资料等游戏场景，不能输出后台管理表格风格。"
         )
     else:
-        view_types = "admin_login, admin_dashboard, admin_module, admin_statistics"
+        view_types = ", ".join(sorted(_admin_allowed_view_types()))
         renderer_note = (
             "本软件不是游戏类，renderer 必须是 admin。"
             "截图应呈现业务系统、运营后台、数据管理、统计报表等软件界面，不能输出游戏棋盘、关卡、道具背包等游戏场景。"
@@ -559,21 +824,16 @@ def _build_ui_prompt(task: GenerationTask, blueprint: ProductBlueprint, expected
 
 
 def _parse_json(content: str) -> dict[str, Any]:
-    cleaned = content.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
-        cleaned = re.sub(r"```$", "", cleaned).strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start >= 0 and end > start:
-        cleaned = cleaned[start : end + 1]
-    data = json.loads(cleaned)
-    if not isinstance(data, dict):
-        raise ValueError("界面蓝图不是 JSON 对象")
-    return data
+    return parse_json_object(content, label="ui_blueprint")
 
 
-def _ui_blueprint_from_data(data: dict[str, Any], fallback: UiBlueprint, expected_renderer: str) -> UiBlueprint:
+def _ui_blueprint_from_data(
+    data: dict[str, Any],
+    fallback: UiBlueprint,
+    expected_renderer: str,
+    *,
+    require_complete_model: bool = False,
+) -> UiBlueprint:
     renderer = str(data.get("renderer") or "").strip().lower()
     if renderer != expected_renderer:
         raise ValueError(f"模型界面蓝图 renderer={renderer or '空'}，预期 {expected_renderer}")
@@ -596,15 +856,23 @@ def _ui_blueprint_from_data(data: dict[str, Any], fallback: UiBlueprint, expecte
         if not item and fallback_screen.module_key:
             item = model_screens.get(fallback_screen.module_key)
         if not item:
+            if require_complete_model:
+                raise ValueError(f"模型界面蓝图缺少截图 key={fallback_screen.key}")
             screens.append(fallback_screen)
             continue
+        if require_complete_model:
+            _ensure_model_screen_complete(item, fallback_screen)
         view_type = _normalize_view_type(
             expected_renderer,
             fallback_screen.key,
             str(item.get("view_type") or ""),
             fallback_screen.view_type,
         )
-        title = _clean_text(str(item.get("title") or fallback_screen.title), fallback_screen.title, 32)
+        title = _normalize_screen_title(
+            str(item.get("title") or fallback_screen.title),
+            fallback_screen,
+            fallback_screen.title,
+        )
         caption = _clean_text(str(item.get("caption") or fallback_screen.caption), fallback_screen.caption, 120)
         components = _clean_list(item.get("components"), fallback_screen.components)
         sample_data = item.get("sample_data") if isinstance(item.get("sample_data"), dict) else fallback_screen.sample_data
@@ -623,12 +891,25 @@ def _ui_blueprint_from_data(data: dict[str, Any], fallback: UiBlueprint, expecte
         )
 
     visual_style = _clean_text(str(data.get("visual_style") or fallback.visual_style), fallback.visual_style, 40)
+    design_brief = dict(getattr(fallback, "design_brief", {}) or {})
+    design_brief.setdefault("screenshot_role_contract", screenshot_role_contract_from_fallback(fallback, expected_renderer))
     return UiBlueprint(
         renderer=expected_renderer,
         visual_style=visual_style,
         screens=screens,
-        design_brief=dict(getattr(fallback, "design_brief", {}) or {}),
+        design_brief=design_brief,
     )
+
+
+def _ensure_model_screen_complete(item: dict[str, Any], fallback_screen: UiScreenBlueprint) -> None:
+    if not str(item.get("title") or "").strip() or not str(item.get("caption") or "").strip():
+        raise ValueError(f"模型界面蓝图 {fallback_screen.key} 缺少标题或图注")
+    components = item.get("components")
+    if not isinstance(components, list) or len([value for value in components if str(value).strip()]) < 4:
+        raise ValueError(f"模型界面蓝图 {fallback_screen.key} 组件不足")
+    sample_data = item.get("sample_data")
+    if not isinstance(sample_data, dict) or len([key for key, value in sample_data.items() if str(key).strip() and str(value).strip()]) < 3:
+        raise ValueError(f"模型界面蓝图 {fallback_screen.key} 样例数据不足")
 
 
 def _safe_screen_key(value: str) -> str:
@@ -649,6 +930,19 @@ def _clean_text(value: str, fallback: str, limit: int) -> str:
     return value[:limit]
 
 
+def _normalize_screen_title(value: str, fallback_screen: UiScreenBlueprint, fallback: str) -> str:
+    title = _clean_text(value, fallback, 32)
+    if fallback_screen.key == "login":
+        return fallback
+    if fallback_screen.key == "dashboard":
+        return fallback
+    if fallback_screen.key == "statistics":
+        return fallback
+    if fallback_screen.module_key:
+        return fallback
+    return title
+
+
 def _clean_list(value: Any, fallback: list[str]) -> list[str]:
     if not isinstance(value, list):
         return fallback
@@ -667,7 +961,7 @@ def _normalize_view_type(renderer: str, key: str, value: str, fallback: str) -> 
         allowed = {"mobile_login", "mobile_home", "mobile_module", "mobile_search", "mobile_detail", "mobile_player", "mobile_profile", "mobile_statistics"}
     else:
         forced = {"login": "admin_login", "dashboard": "admin_dashboard", "statistics": "admin_statistics"}
-        allowed = {"admin_login", "admin_dashboard", "admin_module", "admin_statistics"}
+        allowed = _admin_allowed_view_types()
     if key in forced:
         return forced[key]
     if value in allowed:
@@ -702,15 +996,36 @@ def _coerce_game_view_type(
     return view_type
 
 
-def _expected_renderer(task: GenerationTask, blueprint: ProductBlueprint) -> str:
-    if is_game_like(task, blueprint):
+def _expected_renderer(task: GenerationTask, blueprint: ProductBlueprint, experience_spec: ProductExperienceSpec | None = None) -> str:
+    spec = experience_spec or build_product_experience_spec(task, blueprint)
+    spec_renderer = expected_renderer_for_experience(spec)
+    if spec_renderer == "game":
         return "game"
-    if is_mobile_app_like(task, blueprint):
+    if spec_renderer == "mobile_app":
         return "mobile_app"
     return "admin"
 
 
-def _renderer_note(renderer: str) -> str:
+def _admin_allowed_view_types() -> set[str]:
+    return {
+        "admin_login",
+        "admin_dashboard",
+        "admin_module",
+        "admin_table",
+        "admin_map",
+        "admin_pipeline",
+        "admin_board",
+        "admin_case",
+        "admin_risk",
+        "admin_form",
+        "admin_matrix",
+        "admin_statistics",
+    }
+
+
+def _renderer_note(renderer: str, design_brief: dict[str, Any] | None = None) -> str:
+    if design_brief and design_brief.get("visual_direction"):
+        return str(design_brief.get("visual_direction") or "")
     if renderer == "game":
         return "手机游戏 9:16 竖屏界面，强调玩家、关卡、棋盘、道具、结算等游戏元素。"
     if renderer == "mobile_app":
@@ -719,44 +1034,103 @@ def _renderer_note(renderer: str) -> str:
 
 
 def is_game_like(task: GenerationTask, blueprint: ProductBlueprint) -> bool:
+    text = _game_detection_text(task, blueprint)
+    explicit_text = _game_detection_text(task, blueprint, include_product_type=False)
     if task.product_type == "游戏软件":
+        if _has_non_game_training_or_business_context(explicit_text):
+            return _has_explicit_game_terms(explicit_text) or _looks_like_game_board_text(explicit_text)
         return True
-    text = " ".join([task.software_name, task.product_type, task.feature_hint])
-    keywords = ["游戏", "消除", "点消", "关卡", "棋盘", "步数", "道具", "玩家", "星级", "得分", "连消"]
-    return any(keyword in text for keyword in keywords)
+    if _has_non_game_training_or_business_context(text):
+        return False
+    if _has_explicit_game_terms(text):
+        return True
+    return _looks_like_game_board_text(text)
+
+
+def _has_explicit_game_terms(text: str) -> bool:
+    strong_keywords = [
+        "游戏",
+        "手游",
+        "小游戏",
+        "消除",
+        "点消",
+        "三消",
+        "连消",
+        "糖果",
+        "对局",
+        "玩家",
+        "道具背包",
+        "关卡地图",
+        "排行榜",
+    ]
+    return any(keyword in text for keyword in strong_keywords)
+
+
+def _game_detection_text(task: GenerationTask, blueprint: ProductBlueprint, include_product_type: bool = True) -> str:
+    parts = [
+        task.software_name,
+        task.feature_hint,
+        getattr(blueprint, "industry", ""),
+        getattr(blueprint, "scenario", ""),
+        getattr(blueprint, "positioning", ""),
+        getattr(blueprint, "summary", ""),
+        " ".join(getattr(blueprint, "roles", []) or []),
+        " ".join(getattr(blueprint, "target_users", []) or []),
+        " ".join(getattr(blueprint, "business_objects", []) or []),
+    ]
+    if include_product_type:
+        parts.insert(1, task.product_type)
+    for module in getattr(blueprint, "modules", []) or []:
+        parts.extend(
+            [
+                str(getattr(module, "title", "") or ""),
+                str(getattr(module, "description", "") or ""),
+                " ".join(str(item) for item in (getattr(module, "operations", []) or [])[:5]),
+                " ".join(str(item) for item in (getattr(module, "data_fields", []) or [])[:5]),
+            ]
+        )
+    return " ".join(part for part in parts if str(part).strip())
+
+
+def _has_non_game_training_or_business_context(text: str) -> bool:
+    return bool(
+        re.search(
+            r"医疗|医院|诊疗|护理|患者|气道|插管|急救|培训|实训|演练|考核|评分|技能|仿真|VR|虚拟现实|管理|平台|系统|后台|审批|审核|工单|台账|归档|质控|统计报表",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def is_mobile_app_like(task: GenerationTask, blueprint: ProductBlueprint) -> bool:
-    if task.product_type.upper() in {"APP", "MOBILE", "ANDROID", "IOS"}:
-        return True
-    text = " ".join(
-        [
-            task.software_name,
-            task.product_type,
-            task.feature_hint,
-            blueprint.industry,
-            blueprint.scenario,
-            blueprint.positioning,
-            " ".join(blueprint.target_users or []),
-            " ".join(module.title for module in blueprint.modules[:10]),
-            " ".join(module.description for module in blueprint.modules[:10]),
-        ]
-    )
-    consumer_terms = [
-        "听歌", "音乐", "歌曲", "歌单", "播放器", "歌词", "歌手", "专辑", "电台", "音质",
-        "阅读", "听书", "小说", "书架", "书城", "章节", "朗读",
-        "短视频", "相册", "拍照", "修图", "剪辑", "滤镜",
-        "健身", "打卡", "运动", "课程", "食谱", "睡眠",
-        "日记", "记账", "清单", "便签", "天气", "闹钟",
-        "外卖", "商城", "购物", "会员", "收藏", "推荐", "搜索", "播放", "下载", "离线",
-    ]
-    admin_terms = ["后台", "管理系统", "OA", "ERP", "CRM", "工单", "审批", "审核", "复核", "风控", "库存", "仓储", "调度", "监管"]
-    if any(term in text for term in consumer_terms):
-        return not any(term in task.software_name for term in admin_terms[:4])
-    return False
+    spec = build_product_experience_spec(task, blueprint)
+    return expected_renderer_for_experience(spec) == "mobile_app"
 
 
 def ui_matches_software_type(task: GenerationTask, blueprint: ProductBlueprint, ui_blueprint: UiBlueprint) -> bool:
+    if _contains_off_domain_ui_terms(task, blueprint, ui_blueprint):
+        return False
+    expected_experience = build_product_experience_spec(task, blueprint)
+    design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
+    if not design_brief_matches_experience(design_brief, expected_experience):
+        return False
+    if (
+        str(design_brief.get("industry_subtype_key") or "") != expected_experience.industry_subtype_key
+        or str(design_brief.get("industry_subtype") or "") != expected_experience.industry_subtype
+    ):
+        return False
+    identity_data = design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else None
+    cached_seed = str(design_brief.get("creative_seed") or "") if isinstance(design_brief, dict) else ""
+    identity_matches = visual_identity_matches_task(identity_data, task, blueprint, expected_experience)
+    if not identity_matches and not (
+        bool(getattr(task, "resume_existing_output", False))
+        and cached_seed
+        and cached_seed == str(getattr(task, "seed", "") or "")
+    ):
+        return False
+    expected_renderer = _expected_renderer(task, blueprint, expected_experience)
+    if ui_blueprint.renderer != expected_renderer:
+        return False
     if is_game_like(task, blueprint):
         allowed = {"game_login", "game_home", "game_level", "game_board", "game_inventory", "game_statistics", "game_profile", "game_shop"}
         required_any = {"game_level", "game_board", "game_inventory", "game_statistics"}
@@ -781,7 +1155,10 @@ def ui_matches_software_type(task: GenerationTask, blueprint: ProductBlueprint, 
             [ui_blueprint.visual_style]
             + [screen.title + screen.caption + " ".join(screen.components) for screen in ui_blueprint.screens]
         )
-        forbidden = ["审核", "复核", "工单", "审批", "风控", "台账", "后台", "批量输出", "质量复盘"]
+        forbidden = [
+            "管理后台", "运营后台", "审核台", "审批台", "风控控制台", "批量输出",
+            "质量复盘", "桌面控制台", "PC端工作台",
+        ]
         return (
             ui_blueprint.renderer == "mobile_app"
             and bool(view_types)
@@ -794,8 +1171,30 @@ def ui_matches_software_type(task: GenerationTask, blueprint: ProductBlueprint, 
     return ui_blueprint.renderer == "admin" and not any(view_type.startswith("game_") for view_type in view_types)
 
 
-def _game_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> UiBlueprint:
-    design_brief = build_ui_design_brief(task, blueprint)
+def _contains_off_domain_ui_terms(task: GenerationTask, blueprint: ProductBlueprint, ui_blueprint: UiBlueprint) -> bool:
+    text = " ".join(
+        [
+            task.software_name,
+            task.product_type,
+            task.feature_hint,
+            getattr(blueprint, "industry", ""),
+            getattr(blueprint, "summary", ""),
+        ]
+    )
+    ui_text = json.dumps(ui_blueprint.to_dict(), ensure_ascii=False)
+    if _has_transport_domain_signal(text):
+        medical_context = r"医疗系统|医院管理|手术|手术室|术前|术后|术式|麻醉|科室|医生|护士|患者|病历|处方|诊疗"
+        game_context = r"消除棋盘|剩余步数|道具背包|关卡地图"
+        return bool(re.search(medical_context, ui_text) or re.search(game_context, ui_text))
+    return False
+
+
+def _game_ui_blueprint(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    visual_identity_attempt: int = 0,
+) -> UiBlueprint:
+    design_brief = _ui_design_brief_with_contract(task, blueprint, "game", visual_identity_attempt)
     screens = [
         UiScreenBlueprint(
             key="login",
@@ -814,7 +1213,7 @@ def _game_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> UiB
             sample_data={"energy": "25/30", "coins": "12,860", "level": "36"},
         ),
     ]
-    for module in blueprint.modules[:6]:
+    for module in blueprint.modules[:10]:
         view_type, title, caption, components = _game_module_screen(module)
         screens.append(
             UiScreenBlueprint(
@@ -841,27 +1240,47 @@ def _game_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> UiB
     return UiBlueprint(renderer="game", visual_style=visual_style, screens=screens, design_brief=design_brief)
 
 
-def _mobile_app_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> UiBlueprint:
-    design_brief = build_ui_design_brief(task, blueprint)
+def _mobile_app_ui_blueprint(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    visual_identity_attempt: int = 0,
+) -> UiBlueprint:
+    design_brief = _ui_design_brief_with_contract(task, blueprint, "mobile_app", visual_identity_attempt)
+    attendance_app = str(getattr(blueprint, "industry_subtype_key", "") or "") == "workforce_attendance"
+    login_caption = (
+        "员工通过手机号和短信验证码登录应用，进入个人考勤与申请入口。"
+        if attendance_app
+        else "用户通过手机号和验证码进入应用，完成个人服务入口初始化。"
+    )
+    home_caption = (
+        "首页展示今日班次、上下班打卡入口、请假补卡进度和出勤概览。"
+        if attendance_app
+        else "首页根据软件名称和业务场景展示常用功能入口、搜索入口和个人使用进度。"
+    )
+    home_components = (
+        ["今日班次", "上班打卡", "下班打卡", "请假补卡", "出勤概览"]
+        if attendance_app
+        else ["顶部搜索", "常用功能", "快捷入口", "最近使用", "底部导航"]
+    )
     screens = [
         UiScreenBlueprint(
             key="login",
             title=f"{task.software_name}登录界面",
-            caption="用户通过手机号、验证码或第三方账号进入应用，完成个人服务入口初始化。",
+            caption=login_caption,
             view_type="mobile_login",
-            components=["应用标识", "手机号输入", "验证码登录", "隐私协议", "快速体验入口"],
+            components=["应用标识", "手机号输入", "验证码登录", "隐私协议"],
             sample_data={"登录方式": "手机号验证码", "状态": "可进入应用"},
         ),
         UiScreenBlueprint(
             key="dashboard",
             title=f"{task.software_name}首页",
-            caption="首页根据软件名称和业务场景展示推荐内容、常用功能入口、搜索入口和个人使用进度。",
+            caption=home_caption,
             view_type="mobile_home",
-            components=["顶部搜索", "推荐内容", "快捷入口", "最近使用", "底部导航"],
+            components=home_components,
             sample_data={"推荐": blueprint.modules[0].title if blueprint.modules else task.software_name, "入口": "首页"},
         ),
     ]
-    for module in blueprint.modules[:6]:
+    for module in blueprint.modules[:10]:
         view_type = _mobile_module_view_type(module)
         screens.append(
             UiScreenBlueprint(
@@ -874,14 +1293,29 @@ def _mobile_app_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) 
                 sample_data=_mobile_sample_data(task, module, view_type),
             )
         )
+    profile_caption = (
+        "个人中心展示员工资料、考勤设置、打卡记录、请假补卡记录和应用设置。"
+        if attendance_app
+        else "个人中心展示用户资料、使用记录、消息设置、隐私安全和应用设置。"
+    )
+    profile_components = (
+        ["员工资料", "考勤设置", "打卡记录", "请假补卡记录", "应用设置"]
+        if attendance_app
+        else ["用户资料", "使用记录", "消息设置", "隐私与安全", "应用设置"]
+    )
+    profile_sample_data = (
+        {"员工": blueprint.roles[0] if blueprint.roles else "员工", "本月打卡": "已同步", "申请记录": "可查询"}
+        if attendance_app
+        else {"使用记录": "12次", "消息设置": "已开启", "隐私状态": "已保护"}
+    )
     screens.append(
         UiScreenBlueprint(
             key="statistics",
             title=f"{task.software_name}个人中心界面",
-            caption="个人中心展示用户资料、收藏记录、使用历史、会员权益和应用设置。",
+            caption=profile_caption,
             view_type="mobile_profile",
-            components=["用户资料", "收藏记录", "使用历史", "会员权益", "应用设置"],
-            sample_data={"收藏": "28项", "最近使用": "12次", "会员": "有效"},
+            components=profile_components,
+            sample_data=profile_sample_data,
         )
     )
     visual_style = str(design_brief.get("visual_mood") or "mobile-consumer-app")
@@ -925,8 +1359,12 @@ def _mobile_sample_data(task: GenerationTask, module, view_type: str) -> dict[st
     return {"模块": module.title, "状态": "可用", "最近使用": "今天"}
 
 
-def _admin_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> UiBlueprint:
-    design_brief = build_ui_design_brief(task, blueprint)
+def _admin_ui_blueprint(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    visual_identity_attempt: int = 0,
+) -> UiBlueprint:
+    design_brief = _ui_design_brief_with_contract(task, blueprint, "admin", visual_identity_attempt)
     screens = [
         UiScreenBlueprint(
             key="login",
@@ -943,16 +1381,17 @@ def _admin_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> Ui
             components=["指标卡片", "待办事项", "快捷入口"],
         ),
     ]
-    for module in blueprint.modules[:6]:
+    for index, module in enumerate(blueprint.modules[:10]):
+        view_type = _admin_module_view_type(task, blueprint, module, index, design_brief)
         screens.append(
             UiScreenBlueprint(
                 key=_module_screen_key(module.key),
                 title=module.title,
                 caption=module.description,
-                view_type="admin_module",
+                view_type=view_type,
                 module_key=module.key,
-                components=["条件筛选", "业务列表", "状态标签", "操作按钮", "模块说明"],
-                sample_data={"entities": module.entities},
+                components=_admin_components_for_module(module, view_type),
+                sample_data=_admin_sample_data_for_module(module, view_type),
             )
         )
     screens.append(
@@ -966,6 +1405,134 @@ def _admin_ui_blueprint(task: GenerationTask, blueprint: ProductBlueprint) -> Ui
     )
     visual_style = str(design_brief.get("visual_mood") or "desktop-admin")
     return UiBlueprint(renderer="admin", visual_style=visual_style, screens=screens, design_brief=design_brief)
+
+
+def _admin_module_view_type(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    module,
+    index: int,
+    design_brief: dict[str, Any] | None = None,
+) -> str:
+    title_text = " ".join(
+        str(item)
+        for item in [
+            getattr(module, "key", ""),
+            getattr(module, "title", ""),
+        ]
+        if str(item).strip()
+    )
+    description_text = str(getattr(module, "description", "") or "")
+    strong_text = f"{title_text} {description_text}"
+    operation_text = " ".join(str(item) for item in (getattr(module, "operations", []) or []) if str(item).strip())
+    layout_family = str((design_brief or {}).get("layout_family") or "")
+    module_pattern = str((design_brief or {}).get("module_pattern") or "")
+    context_text = f"{task.software_name} {task.product_type} {task.feature_hint} {getattr(blueprint, 'industry', '')} {getattr(blueprint, 'scenario', '')} {getattr(blueprint, 'positioning', '')} {layout_family} {module_pattern}"
+    identity_cycle = _visual_identity_module_cycle(design_brief)
+    if identity_cycle:
+        return identity_cycle[index % len(identity_cycle)]
+
+    if re.search(r"风险|风控|安全|告警|漏洞|审计|合规|征信|授信|反欺诈|预警|权限|监管", strong_text, re.IGNORECASE):
+        return "admin_risk"
+    if re.search(r"地图|图层|地理|GIS|定位|轨迹|点位|区域|网格|站点|车辆|基站|线路|路径|接驳|换乘|门禁|客流", title_text, re.IGNORECASE) or ("空间" in title_text and "命名空间" not in title_text):
+        return "admin_map"
+    if re.search(r"配置|规则|模板|参数|策略|排班|预约|上架", title_text, re.IGNORECASE) or re.search(r"配置|登记|新增|编辑|申请", operation_text, re.IGNORECASE):
+        return "admin_form"
+    if re.search(r"患者|病历|档案|客户|会员|资料|角色|账号|画像|处方|随访|门诊|科室|资产", title_text, re.IGNORECASE):
+        return "admin_case"
+    if re.search(r"看板|工单|派单|作业|批改|测评|课堂|班级|课程|通知|事件|处置|售后|回访", title_text, re.IGNORECASE) or re.search(r"分派|处置|批改|确认|归档", operation_text, re.IGNORECASE):
+        return "admin_board"
+    if re.search(r"流水线|链路|调度|任务编排|训练|模型|部署|资源|集群|容器|云主机|数据源|入仓|血缘|作业实例|作业调度|边缘|计划|班次|命名空间", title_text, re.IGNORECASE) or re.search(r"调度|训练|重跑|部署", operation_text, re.IGNORECASE):
+        return "admin_pipeline"
+    if re.search(r"统计|报表|指标|分析|矩阵|质量|评分|趋势", title_text, re.IGNORECASE) or re.search(r"统计|分析|导出图表", operation_text, re.IGNORECASE):
+        return "admin_matrix"
+    family_cycles = {
+        "map": ["admin_map", "admin_board", "admin_table", "admin_risk", "admin_form", "admin_matrix"],
+        "risk": ["admin_risk", "admin_case", "admin_board", "admin_table", "admin_form", "admin_matrix"],
+        "pipeline": ["admin_pipeline", "admin_board", "admin_table", "admin_risk", "admin_form", "admin_matrix"],
+        "workflow": ["admin_board", "admin_form", "admin_case", "admin_table", "admin_risk", "admin_matrix"],
+        "kanban": ["admin_board", "admin_case", "admin_table", "admin_form", "admin_risk", "admin_matrix"],
+        "matrix": ["admin_matrix", "admin_table", "admin_case", "admin_form", "admin_board", "admin_risk"],
+        "command": ["admin_risk", "admin_table", "admin_pipeline", "admin_board", "admin_form", "admin_case"],
+    }
+    if layout_family in family_cycles:
+        return family_cycles[layout_family][index % len(family_cycles[layout_family])]
+    if re.search(r"地图|GIS|空间|线路|路径|物联网|基站|车辆|站点", context_text, re.IGNORECASE):
+        cycle = ["admin_map", "admin_table", "admin_board", "admin_form", "admin_risk", "admin_matrix"]
+        return cycle[index % len(cycle)]
+    if re.search(r"云|数据|算法|模型|训练|调度|5G|边缘", context_text, re.IGNORECASE):
+        cycle = ["admin_pipeline", "admin_table", "admin_board", "admin_risk", "admin_form", "admin_matrix"]
+        return cycle[index % len(cycle)]
+    cycle = ["admin_table", "admin_board", "admin_form", "admin_case", "admin_pipeline", "admin_risk"]
+    return cycle[index % len(cycle)]
+
+
+def _visual_identity_module_cycle(design_brief: dict[str, Any] | None) -> list[str]:
+    if not isinstance(design_brief, dict):
+        return []
+    values = design_brief.get("module_composition_cycle")
+    if not isinstance(values, list):
+        identity = design_brief.get("visual_identity_spec")
+        values = identity.get("module_composition_cycle") if isinstance(identity, dict) else []
+    allowed = _admin_allowed_view_types() - {"admin_login", "admin_dashboard", "admin_statistics"}
+    cycle = [str(value).strip() for value in values if str(value).strip() in allowed]
+    return cycle
+
+
+def _admin_components_for_module(module, view_type: str) -> list[str]:
+    fields = [str(field) for field in (getattr(module, "data_fields", []) or [])[:4] if str(field).strip()]
+    operations = [str(operation) for operation in (getattr(module, "operations", []) or [])[:3] if str(operation).strip()]
+    if view_type == "admin_map":
+        base = ["空间/区域画布", "点位详情抽屉", "状态图例", "区域筛选", "业务列表"]
+    elif view_type == "admin_pipeline":
+        base = ["阶段链路", "任务队列", "执行日志", "指标趋势", "发布操作"]
+    elif view_type == "admin_risk":
+        base = ["风险指标", "复核队列", "规则命中", "处置时间线", "导出留痕"]
+    elif view_type == "admin_case":
+        base = ["档案摘要", "字段详情", "关联记录", "处理轨迹", "附件留痕"]
+    elif view_type == "admin_board":
+        base = ["流程看板", "待办卡片", "状态泳道", "任务筛选", "批量操作"]
+    elif view_type == "admin_form":
+        base = ["参数表单", "字段校验", "预览结果", "保存操作", "操作日志"]
+    elif view_type == "admin_matrix":
+        base = ["指标矩阵", "趋势图", "分组明细", "统计口径", "导出按钮"]
+    else:
+        base = ["条件筛选", "业务列表", "详情侧栏", "状态标签", "操作按钮"]
+    return _merge_ui_items(base, fields + operations, 7)
+
+
+def _admin_sample_data_for_module(module, view_type: str) -> dict[str, Any]:
+    fields = [str(field) for field in (getattr(module, "data_fields", []) or [])[:4] if str(field).strip()]
+    sample: dict[str, Any] = {
+        "模块": getattr(module, "title", "") or "业务模块",
+        "状态": "处理中" if view_type in {"admin_pipeline", "admin_board"} else "已启用",
+        "记录数": "128",
+    }
+    for index, field in enumerate(fields[:3], start=1):
+        sample[field] = f"{getattr(module, 'title', '业务')}{index:02d}"
+    if view_type == "admin_map":
+        sample["区域"] = "核心服务区"
+        sample["点位"] = "A-102"
+    elif view_type == "admin_risk":
+        sample["风险等级"] = "中风险"
+        sample["处置结论"] = "待复核"
+    elif view_type == "admin_pipeline":
+        sample["当前阶段"] = "校验通过"
+        sample["执行批次"] = "B20260629"
+    elif view_type == "admin_case":
+        sample["档案编号"] = "DA-20260629-001"
+    elif view_type == "admin_form":
+        sample["校验结果"] = "通过"
+    return sample
+
+
+def _merge_ui_items(primary: list[str], secondary: list[str], limit: int) -> list[str]:
+    result: list[str] = []
+    for item in primary + secondary:
+        value = str(item).strip()
+        if value and value not in result:
+            result.append(value)
+    return result[:limit] or primary[:limit]
 
 
 def _game_module_screen(module) -> tuple[str, str, str, list[str]]:

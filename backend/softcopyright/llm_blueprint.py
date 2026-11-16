@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 import hashlib
 import json
 import os
 import re
+import threading
 import time
 from typing import Any
 
 from .blueprint import FeatureModule, ProductBlueprint, _environment_for_language, _runtime_for_language
-from .llm.provider import LLMProvider, LocalTemplateProvider
+from .llm.provider import LLMProvider, LocalTemplateProvider, TextProviderError, TextRetryPolicy
 from .llm.trace import trace_event
+from .llm.json_response import parse_json_object
 from .models import GenerationTask
+from .module_keys import normalize_entity_names, semantic_module_key
+from .operation_coverage import operation_category
 
 
 def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | None, emit=None) -> ProductBlueprint | None:
@@ -23,7 +28,8 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
     best_blueprint: ProductBlueprint | None = None
     best_score = 0
     quality_floor = _blueprint_quality_floor(task)
-    attempt_count = 5 if _authenticity_first(task) else 2
+    attempt_count = _blueprint_attempt_count(task)
+    setattr(provider, "_blueprint_request_budget", {"count": 0, "limit": 8, "lock": threading.Lock()})
     for _attempt in range(attempt_count):
         started_at = time.perf_counter()
         trace_event(
@@ -39,16 +45,24 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
             _emit(emit, 15, f"生成产品蓝图 {_attempt + 1}/{attempt_count}")
             core_plan = _generate_core_plan(task, provider, rejection_reasons, emit=emit)
             module_plan = _generate_modules(task, provider, core_plan, rejection_reasons, emit=emit)
-            data = _merge_plan(core_plan, module_plan)
+            data = _normalize_plan_terminal_semantics(
+                task,
+                _reconcile_plan_with_contract(task, _merge_plan(core_plan, module_plan)),
+            )
             blueprint = _blueprint_from_data(task, data)
+            repair_blueprint_contract(task, blueprint)
             score, reasons = _quality_review(task, blueprint)
             blueprint.quality_score = score
 
             if score < quality_floor:
                 try:
                     _emit(emit, 21, f"修复产品蓝图质量，当前评分 {score}/{quality_floor}")
-                    repaired_data = _repair_plan(task, provider, data, score, reasons)
+                    repaired_data = _normalize_plan_terminal_semantics(
+                        task,
+                        _reconcile_plan_with_contract(task, _repair_plan(task, provider, data, score, reasons)),
+                    )
                     repaired_blueprint = _blueprint_from_data(task, repaired_data)
+                    repair_blueprint_contract(task, repaired_blueprint)
                     repaired_score, repaired_reasons = _quality_review(task, repaired_blueprint)
                     repaired_blueprint.quality_score = repaired_score
                     if repaired_score >= score:
@@ -63,6 +77,7 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
                 best_blueprint = blueprint
                 best_score = score
             if score >= quality_floor:
+                setattr(blueprint, "request_count", _blueprint_request_count(provider))
                 trace_event(
                     "blueprint_attempt_success",
                     attempt=_attempt + 1,
@@ -93,6 +108,7 @@ def generate_blueprint_with_llm(task: GenerationTask, provider: LLMProvider | No
                 error=str(exc)[:500],
             )
     if best_blueprint and not _authenticity_first(task) and best_score >= 72:
+        setattr(best_blueprint, "request_count", _blueprint_request_count(provider))
         return best_blueprint
     if last_error:
         raise last_error
@@ -212,7 +228,9 @@ def _generate_module_batches(
         raise ValueError(f"LLM 模块轮廓不足，无法分批生成模块{detail}")
 
     modules: list[dict[str, Any]] = []
-    batch_size = 1 if _authenticity_first(task) else 2
+    # Four two-module requests keep the normal blueprint request contract at
+    # identity + business details + 4 module batches = 6 requests.
+    batch_size = 2
     batch_count = (min(len(outline), 8) + batch_size - 1) // batch_size
     batches: list[tuple[int, list[Any]]] = []
     for start in range(0, min(len(outline), 8), batch_size):
@@ -220,7 +238,7 @@ def _generate_module_batches(
         batch_index = start // batch_size + 1
         batches.append((batch_index, batch))
 
-    def run_batch(batch_index: int, batch: list[Any]) -> list[dict[str, Any]]:
+    def run_batch(batch_index: int, batch: list[Any]) -> dict[str, Any]:
         title = _batch_title(batch)
         _emit(emit, 17 + batch_index, f"细分功能模块 {batch_index}/{batch_count}：{title}")
         data = _chat_json(
@@ -236,30 +254,21 @@ def _generate_module_batches(
         batch_modules = data.get("modules")
         if not isinstance(batch_modules, list):
             raise ValueError("LLM 分批模块方案不是 modules 数组")
-        modules = [item for item in batch_modules if isinstance(item, dict)]
-        if _authenticity_first(task):
-            reasons = _module_batch_quality_reasons(task, modules, expected_count=len(batch))
-            if reasons:
-                _emit(emit, 17 + batch_index, f"修复功能模块 {batch_index}/{batch_count}：{title}")
-                repair_data = _chat_json(
-                    provider,
-                    [
-                        {"role": "system", "content": _system_prompt()},
-                        {"role": "user", "content": _build_module_repair_prompt(task, core_plan, batch, modules, reasons)},
-                    ],
-                    temperature=min(_temperature(task.randomness) + 0.03, 0.85),
-                    max_tokens=1500,
-                    label=f"模块明细修复批次{batch_index}",
-                )
-                repaired_modules = repair_data.get("modules")
-                if isinstance(repaired_modules, list):
-                    modules = [item for item in repaired_modules if isinstance(item, dict)]
-        reasons = _module_batch_quality_reasons(task, modules, expected_count=len(batch))
-        if reasons:
-            raise ValueError("模块明细质量不足：" + "；".join(reasons[:4]))
-        return modules
+        batch_modules = _align_modules_to_outline(
+            [item for item in batch_modules if isinstance(item, dict)],
+            batch,
+        )
+        batch_modules = _locally_complete_generated_modules(
+            task,
+            core_plan,
+            batch_modules,
+            batch,
+            start_index=(batch_index - 1) * batch_size + 1,
+        )
+        reasons = _module_batch_quality_reasons(task, batch_modules, expected_count=len(batch))
+        return {"outline": batch, "modules": batch_modules, "reasons": reasons}
 
-    batch_results: dict[int, list[dict[str, Any]]] = {}
+    batch_results: dict[int, dict[str, Any]] = {}
     workers = 1 if _authenticity_first(task) else _llm_batch_workers()
     if workers <= 1 or len(batches) <= 1:
         for batch_index, batch in batches:
@@ -271,18 +280,214 @@ def _generate_module_batches(
                 batch_index = futures[future]
                 batch_results[batch_index] = future.result()
 
+    failed_outline: list[Any] = []
+    failed_modules: list[dict[str, Any]] = []
+    failed_reasons: list[str] = []
     for batch_index in sorted(batch_results):
-        modules.extend(batch_results[batch_index])
+        result = batch_results[batch_index]
+        batch_modules = list(result.get("modules") or [])
+        modules.extend(batch_modules)
+        reasons = list(result.get("reasons") or [])
+        if reasons:
+            failed_outline.extend(list(result.get("outline") or []))
+            failed_modules.extend(batch_modules)
+            failed_reasons.extend(f"批次{batch_index}：{reason}" for reason in reasons)
+    if failed_outline:
+        _emit(emit, 22, f"聚合修复 {len(failed_outline)} 个不合格模块")
+        repair_data = _chat_json(
+            provider,
+            [
+                {"role": "system", "content": _system_prompt()},
+                {
+                    "role": "user",
+                    "content": _build_module_repair_prompt(
+                        task,
+                        core_plan,
+                        failed_outline,
+                        failed_modules,
+                        failed_reasons,
+                    ),
+                },
+            ],
+            temperature=min(_temperature(task.randomness) + 0.03, 0.85),
+            max_tokens=2600,
+            label="模块明细聚合修复",
+        )
+        repaired_modules = repair_data.get("modules")
+        if isinstance(repaired_modules, list):
+            repaired = _locally_complete_generated_modules(
+                task,
+                core_plan,
+                _align_modules_to_outline(
+                    [item for item in repaired_modules if isinstance(item, dict)],
+                    failed_outline,
+                ),
+                failed_outline,
+                start_index=1,
+            )
+            repaired_by_key = {str(item.get("key") or ""): item for item in repaired}
+            modules = [repaired_by_key.get(str(item.get("key") or ""), item) for item in modules]
+    final_reasons = _module_batch_quality_reasons(task, modules, expected_count=min(len(outline), 8))
+    if final_reasons:
+        raise ValueError("模块明细质量不足：" + "；".join(final_reasons[:6]))
     if len(modules) < 6:
         raise ValueError(f"LLM 分批模块方案数量不足：{len(modules)}")
     return modules[:8]
 
 
+def _align_modules_to_outline(modules: list[dict[str, Any]], outline_batch: list[Any]) -> list[dict[str, Any]]:
+    aligned: list[dict[str, Any]] = []
+    for index, module in enumerate(modules):
+        item = dict(module)
+        outline = outline_batch[index] if index < len(outline_batch) and isinstance(outline_batch[index], dict) else {}
+        outline_key = str(outline.get("key") or "").strip()
+        outline_title = str(outline.get("title") or "").strip()
+        if outline_key:
+            item["key"] = outline_key
+        if outline_title:
+            item["title"] = outline_title
+        aligned.append(item)
+    return aligned
+
+
+def _locally_complete_generated_modules(
+    task: GenerationTask,
+    core_plan: dict[str, Any],
+    modules: list[dict[str, Any]],
+    outline_batch: list[Any],
+    *,
+    start_index: int,
+) -> list[dict[str, Any]]:
+    completed: list[dict[str, Any]] = []
+    for offset, raw_outline in enumerate(outline_batch):
+        outline = raw_outline if isinstance(raw_outline, dict) else {}
+        source = dict(modules[offset]) if offset < len(modules) and isinstance(modules[offset], dict) else {}
+        index = start_index + offset
+        title = _clean_text(str(outline.get("title") or source.get("title") or f"业务模块{index}"), 28)
+        category = _clean_text(str(source.get("category") or outline.get("focus") or title), 24)
+        key = str(outline.get("key") or source.get("key") or "").strip()
+        if not key:
+            key = semantic_module_key(title, index, context_terms=[category, task.software_name, task.feature_hint])
+        entities = _ensure_min_strings(
+            [_safe_entity(_entity_name_from_item(item)) for item in (source.get("entities") or []) if _entity_name_from_item(item)],
+            _contract_entities(key),
+            minimum=2,
+            limit=4,
+        )
+        operations = _ensure_min_strings(
+            _clean_list(source.get("operations"), 7, 28),
+            _contract_operations(title, category, []),
+            minimum=5,
+            limit=7,
+        )
+        data_fields = _ensure_min_strings(
+            _clean_list(source.get("data_fields") or source.get("dataFields"), 10, 24),
+            _contract_data_fields(title, category, entities),
+            minimum=7,
+            limit=10,
+        )
+        pages = _ensure_min_strings(
+            _clean_list(source.get("pages"), 4, 28),
+            _contract_pages(title, []),
+            minimum=2,
+            limit=4,
+        )
+        rules = _ensure_min_strings(
+            _clean_list(source.get("rules"), 5, 80),
+            _contract_rules(title, category, entities, operations),
+            minimum=3,
+            limit=5,
+        )
+        operation_specs = _clean_operation_specs(source.get("operation_specs") or source.get("operationSpecs"))
+        if len(operation_specs) < 3:
+            operation_specs = _complete_local_operation_specs(
+                task,
+                title=title,
+                module_key=key,
+                operations=operations,
+                data_fields=data_fields,
+                existing=operation_specs,
+            )
+        data_objects = _clean_list(source.get("data_objects") or source.get("dataObjects"), 6, 26) or entities
+        completed.append(
+            {
+                **source,
+                "key": key,
+                "title": title,
+                "description": _contract_description(source, title, category, data_objects, operations, pages, core_plan),
+                "entities": entities,
+                "operations": operations,
+                "operation_specs": operation_specs[:5],
+                "data_fields": data_fields,
+                "pages": pages,
+                "rules": rules,
+            }
+        )
+    return completed
+
+
+def _complete_local_operation_specs(
+    task: GenerationTask,
+    *,
+    title: str,
+    module_key: str,
+    operations: list[str],
+    data_fields: list[str],
+    existing: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    specs = list(existing)
+    labels = [str(item.get("label") or "") for item in specs]
+    candidates = list(operations)
+    prioritized: list[str] = []
+    if not any(operation_category(label) == "lookup" for label in labels):
+        lookup = next((label for label in candidates if operation_category(label) == "lookup"), f"筛选{title}记录")
+        prioritized.append(lookup)
+    if not any(operation_category(label) != "lookup" for label in labels):
+        business = next((label for label in candidates if operation_category(label) != "lookup"), "")
+        if not business:
+            subject = title.replace("查看", "").replace("检查", "").strip() or title
+            business = f"记录{subject}处理结果"
+        prioritized.append(business)
+    candidates = prioritized + candidates
+    role = "当前用户" if _is_consumer_app_text(f"{task.software_name} {task.product_type}") else "业务经办人员"
+    for label in candidates:
+        if len(specs) >= 3:
+            break
+        label = _clean_text(label, 28)
+        if not label or label in labels:
+            continue
+        category = operation_category(label)
+        action_key = semantic_module_key(
+            label,
+            len(specs) + 1,
+            raw_key=f"{module_key}_{len(specs) + 1}",
+            context_terms=[title, label],
+        )
+        high_risk = any(term in label for term in ("删除", "作废", "失效", "覆盖", "正式发布", "清空"))
+        input_fields = data_fields[:2] or [f"{title}编号", f"{title}状态"]
+        specs.append(
+            {
+                "action_key": action_key,
+                "label": label,
+                "category": category,
+                "role": role,
+                "trigger": f"需要执行{label}时",
+                "input_fields": input_fields,
+                "pre_state": f"{title}处于待处理状态",
+                "post_state": f"{label}结果已更新",
+                "result_evidence": f"页面显示{label}结果、更新时间和处理状态",
+                "requires_confirmation": high_risk,
+            }
+        )
+        labels.append(label)
+    return specs
+
+
 def _llm_batch_workers() -> int:
     try:
-        value = int(os.getenv("SOFT_LLM_BATCH_WORKERS", "1"))
+        value = int(os.getenv("SOFT_LLM_BATCH_WORKERS", "2"))
     except ValueError:
-        value = 1
+        value = 2
     return max(1, min(3, value))
 
 
@@ -290,20 +495,36 @@ def _generation_quality_profile(task: GenerationTask) -> str:
     value = os.getenv("SOFT_GENERATION_PROFILE", "").strip().lower()
     if value in {"fast", "speed", "batch"}:
         return "fast"
-    return "authenticity-first"
+    if value in {"authenticity-first", "authenticity", "quality", "strict"}:
+        return "authenticity-first"
+    return "balanced"
 
 
 def _authenticity_first(task: GenerationTask) -> bool:
     return _generation_quality_profile(task) == "authenticity-first"
 
 
+def _blueprint_attempt_count(task: GenerationTask) -> int:
+    # Successful subrequests are retained within one attempt. Network retries
+    # happen inside provider.chat and format/quality repair is limited to one
+    # targeted request, so the whole six-request plan is never restarted.
+    return 1
+
+
 def _blueprint_quality_floor(task: GenerationTask) -> int:
-    if _authenticity_first(task):
+    profile = _generation_quality_profile(task)
+    if profile == "authenticity-first":
         raw = os.getenv("SOFT_BLUEPRINT_QUALITY_FLOOR", "92").strip() or "92"
         try:
             return max(78, min(95, int(raw)))
         except ValueError:
             return 92
+    if profile == "balanced":
+        raw = os.getenv("SOFT_BLUEPRINT_QUALITY_FLOOR", "86").strip() or "86"
+        try:
+            return max(82, min(92, int(raw)))
+        except ValueError:
+            return 86
     return 78
 
 
@@ -384,7 +605,7 @@ def _contract_blueprint_modules(task: GenerationTask) -> list[dict[str, Any]]:
 
 def _outline_from_contract_modules(modules: list[dict[str, Any]]) -> list[dict[str, str]]:
     outline: list[dict[str, str]] = []
-    for index, item in enumerate(modules[:8], start=1):
+    for index, item in enumerate(_select_contract_modules(modules, limit=8), start=1):
         title = _clean_text(str(item.get("title") or ""), 28)
         if not title:
             continue
@@ -400,12 +621,37 @@ def _outline_from_contract_modules(modules: list[dict[str, Any]]) -> list[dict[s
     return outline
 
 
+def _select_contract_modules(modules: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    candidates = [item for item in modules if isinstance(item, dict) and str(item.get("title") or "").strip()]
+    if len(candidates) <= limit:
+        return candidates
+    selected_indexes: list[int] = []
+    selected_categories: set[str] = set()
+    remaining = set(range(len(candidates)))
+    while remaining and len(selected_indexes) < limit:
+        def score(index: int) -> tuple[int, int]:
+            item = candidates[index]
+            category = str(item.get("category") or "").strip()
+            diversity = 20 if category and category not in selected_categories else 0
+            detail = min(6, len(item.get("data_objects") or [])) + min(5, len(item.get("screens") or []))
+            structured = 6 if len(item.get("operation_specs") or item.get("operationSpecs") or []) >= 3 else 0
+            return diversity + detail + structured, -index
+
+        chosen = max(remaining, key=score)
+        selected_indexes.append(chosen)
+        category = str(candidates[chosen].get("category") or "").strip()
+        if category:
+            selected_categories.add(category)
+        remaining.remove(chosen)
+    return [candidates[index] for index in sorted(selected_indexes)]
+
+
 def _modules_from_contract(task: GenerationTask, core_plan: dict[str, Any]) -> list[dict[str, Any]]:
-    contract_modules = _contract_blueprint_modules(task)
+    contract_modules = _select_contract_modules(_contract_blueprint_modules(task), limit=8)
     if len(contract_modules) < 6:
         return []
     modules: list[dict[str, Any]] = []
-    for index, item in enumerate(contract_modules[:8], start=1):
+    for index, item in enumerate(contract_modules, start=1):
         title = _clean_text(str(item.get("title") or ""), 28)
         if not title:
             continue
@@ -414,9 +660,11 @@ def _modules_from_contract(task: GenerationTask, core_plan: dict[str, Any]) -> l
         user_flow = _clean_list(item.get("user_flow"), 6, 34)
         screens = _clean_list(item.get("screens"), 5, 28)
         key = _contract_module_key(item, index)
+        operation_specs = _clean_operation_specs(item.get("operation_specs") or item.get("operationSpecs"))
+        source_operations = _clean_list(item.get("operations") or item.get("actions"), 7, 28)
         operations = _ensure_min_strings(
-            _clean_list(item.get("operations") or item.get("actions"), 7, 28),
-            _contract_operations(title, category, user_flow),
+            source_operations if operation_specs else _contract_operations(title, category, user_flow),
+            source_operations or _contract_operations(title, category, user_flow),
             minimum=5,
             limit=7,
         )
@@ -425,6 +673,21 @@ def _modules_from_contract(task: GenerationTask, core_plan: dict[str, Any]) -> l
             _contract_data_fields(title, category, data_objects),
             minimum=7,
             limit=10,
+        )
+        if len(operation_specs) < 3:
+            operation_specs = _complete_local_operation_specs(
+                task,
+                title=title,
+                module_key=key,
+                operations=operations,
+                data_fields=data_fields,
+                existing=operation_specs,
+            )
+        operations = _ensure_min_strings(
+            [str(spec.get("label") or "") for spec in operation_specs],
+            operations,
+            minimum=5,
+            limit=7,
         )
         pages = _ensure_min_strings(
             _clean_list(item.get("pages") or item.get("screens"), 4, 28),
@@ -451,6 +714,7 @@ def _modules_from_contract(task: GenerationTask, core_plan: dict[str, Any]) -> l
                 "description": _contract_description(item, title, category, data_objects, operations, pages, core_plan),
                 "entities": entities,
                 "operations": operations,
+                "operation_specs": operation_specs[:5],
                 "data_fields": data_fields,
                 "pages": pages,
                 "rules": rules,
@@ -459,15 +723,103 @@ def _modules_from_contract(task: GenerationTask, core_plan: dict[str, Any]) -> l
     return modules
 
 
+def _reconcile_plan_with_contract(task: GenerationTask, data: dict[str, Any]) -> dict[str, Any]:
+    """Remove exact off-domain phrases that contradict an approved name contract."""
+    blocked = _contract_avoid_terms(task)
+    contract = _semantic_contract(task)
+    domain = _clean_text(str(contract.get("feature_hint_domain") or ""), 40)
+    keywords = [
+        str(item).strip()
+        for item in (contract.get("feature_hint_keywords") or [])
+        if str(item).strip()
+    ]
+
+    def replacement(term: str) -> str:
+        if term == "搜索引擎":
+            return "设计资源检索" if any(value in domain for value in ("设计", "Figma")) else "站内业务检索"
+        if term == "通用网页浏览器":
+            return domain or "业务内容浏览工具"
+        return keywords[0] if keywords else domain or "核心业务"
+
+    def reconcile(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: reconcile(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [reconcile(item) for item in value]
+        if isinstance(value, str):
+            text = value
+            for term in blocked:
+                if term:
+                    text = text.replace(term, replacement(term))
+            return text
+        return value
+
+    reconciled = reconcile(data)
+    if not isinstance(reconciled, dict):
+        return data
+    modules = _contract_blueprint_modules(task)
+    if not modules:
+        return reconciled
+
+    titles = [str(item.get("title") or "").strip() for item in modules if str(item.get("title") or "").strip()]
+    objects = _dedupe_strings(
+        [
+            str(value)
+            for item in modules
+            for value in (item.get("data_objects") or item.get("dataObjects") or [])
+        ],
+        12,
+    )
+    pages = _dedupe_strings(
+        [str(value) for item in modules for value in (item.get("pages") or item.get("screens") or [])],
+        12,
+    )
+    current_summary = str(reconciled.get("summary") or "").strip()
+    if len(current_summary) < 180:
+        title_text = "、".join(titles[:8]) or domain or task.software_name
+        object_text = "、".join(objects[:6]) or "核心业务对象"
+        supplement = (
+            f"系统围绕{title_text}组织完整使用链路，统一处理{object_text}，"
+            "记录每次访问、操作、状态变化和结果证据，并通过一致的页面入口、权限规则和历史轨迹"
+            "支撑日常处理、协作复核、进度跟踪和结果追溯。"
+        )
+        reconciled["summary"] = f"{current_summary} {supplement}".strip()
+    if len(reconciled.get("business_objects") or []) < 6:
+        reconciled["business_objects"] = objects
+    if len(reconciled.get("pages") or []) < 8:
+        reconciled["pages"] = _dedupe_strings(["登录页", "工作台首页", *pages], 12)
+    if len(reconciled.get("report_metrics") or []) < 6:
+        reconciled["report_metrics"] = [f"{title}处理量" for title in titles[:6]]
+    if len(reconciled.get("quality_rules") or []) < 5:
+        reconciled["quality_rules"] = [
+            str(rule)
+            for item in modules
+            for rule in (item.get("rules") or [])
+        ][:8] or [
+            "访问业务对象前必须完成身份与权限校验",
+            "关键操作必须记录操作人、操作时间和结果状态",
+            "状态变化必须保留变更前后值和关联依据",
+            "异常结果必须提供可见提示并允许重新处理",
+            "导出和共享内容必须遵循当前数据访问范围",
+        ]
+    if len(reconciled.get("uniqueness_notes") or []) < 4:
+        reconciled["uniqueness_notes"] = [f"{title}保留独立业务状态与结果证据" for title in titles[:4]]
+    return reconciled
+
+
 def _contract_module_key(item: dict[str, Any], index: int) -> str:
     raw = str(item.get("key") or item.get("id") or "").strip()
-    key = _safe_key(raw)
-    generic = {"module", "business", "data", "manage", "management", "system", "common", "businessrecord"}
-    if not raw or key in generic or re.fullmatch(r"module_\d+", key or ""):
-        title = str(item.get("title") or item.get("category") or index)
-        digest = hashlib.md5(title.encode("utf-8", errors="ignore")).hexdigest()[:6]
-        key = f"semantic_{index:02d}_{digest}"
-    return key
+    title = str(item.get("title") or item.get("category") or "")
+    context_terms: list[str] = []
+    for field in ("category", "description"):
+        value = item.get(field)
+        if isinstance(value, str):
+            context_terms.append(value)
+    for field in ("data_objects", "dataObjects", "entities", "operations", "data_fields", "dataFields", "pages"):
+        value = item.get(field)
+        if isinstance(value, list):
+            context_terms.extend(str(entry) for entry in value[:6])
+    return semantic_module_key(title, index, raw_key=raw, context_terms=context_terms)
 
 
 def _contract_operations(title: str, category: str, user_flow: list[str]) -> list[str]:
@@ -490,6 +842,24 @@ def _operation_label(value: str) -> str:
 
 def _operation_templates_for(seed: str, title: str) -> list[str]:
     templates = [
+        ("下载链接解析", ["查询链接解析结果", "解析下载链接", "核对资源元信息", "确认可用下载地址", "排除失效资源"]),
+        ("新建下载任务", ["查询待确认资源", "创建单个下载任务", "批量创建下载任务", "选择文件保存位置", "确认任务执行参数"]),
+        ("下载队列编排", ["筛选排队任务", "调整任务优先级", "批量开始下载", "批量暂停下载", "移除队列任务"]),
+        ("加速与后台下载", ["查看传输会话", "启动分段并发下载", "切换后台持续传输", "调整并发连接数", "记录实时传输速度"]),
+        ("下载进度跟踪", ["按状态筛选下载任务", "查看单项传输明细", "刷新下载进度", "暂停当前下载", "打开传输详情"]),
+        ("断点续传与重试", ["筛选失败下载任务", "从有效断点续传", "重新解析失效链接", "重试失败任务", "更换文件保存位置"]),
+        ("已下载文件", ["按名称类型查找文件", "打开已下载文件", "重命名已下载文件", "移动已下载文件", "删除已下载文件"]),
+        ("下载记录", ["按时间状态检索历史", "查看历史任务详情", "基于历史再次下载", "核对原下载来源", "关联新旧下载任务"]),
+        ("下载规则配置", ["查看当前下载规则", "设置并发任务数量", "切换移动网络权限", "选择默认保存位置", "启用后台下载规则"]),
+        ("任务状态提醒", ["筛选未读任务提醒", "查看关联下载任务", "标记任务提醒已读", "进入失败任务处理", "清理已完成提醒"]),
+        ("Figma文件接入", ["查询文件访问状态", "导入Figma文件链接", "校验文件访问权限", "更新账号授权", "记录最近打开文件"]),
+        ("设计资源导航", ["筛选团队项目资源", "切换项目文件层级", "打开设计文件", "收藏资源入口", "查看最近访问"]),
+        ("页面与画板预览", ["查询页面画板", "切换设计页面", "定位目标画板", "调整画布视口", "进入全屏预览"]),
+        ("图层与组件检查", ["搜索页面图层", "展开图层层级", "定位画布对象", "检查组件属性", "追踪组件实例来源"]),
+        ("原型流程演示", ["选择原型起点", "启动原型演示", "执行画板跳转", "重置演示流程", "记录跳转路径"]),
+        ("评论与评审查看", ["筛选评审评论", "定位评论锚点", "查看评论回复", "标记评论状态", "记录评审上下文"]),
+        ("设计版本追踪", ["筛选设计版本", "预览历史版本", "比对版本变化", "标记当前版本", "返回最新版本"]),
+        ("浏览记录与收藏", ["筛选浏览记录", "再次打开文件", "添加设计收藏", "取消设计收藏", "按时间整理入口"]),
         ("建档", ["登记建档", "补全档案", "核对参数", "提交复核"]),
         ("档案", ["登记建档", "补全档案", "核对参数", "变更留痕"]),
         ("采集", ["采集接入", "样本校验", "记录同步", "异常标注"]),
@@ -617,15 +987,41 @@ def _is_reading_audio_like_text(text: str) -> bool:
 
 
 def _is_consumer_app_text(text: str) -> bool:
-    if "APP" in text.upper() and not any(term in text for term in ["后台", "管理系统", "OA", "ERP", "CRM"]):
+    if _is_enterprise_accounting_text(text) or _is_design_viewer_text(text):
+        return False
+    if _is_download_manager_text(text):
         return True
-    return any(
+    admin_terms = [
+        "后台", "管理系统", "平台", "OA", "ERP", "CRM", "客服", "工单", "派单", "协同",
+        "调度", "投诉", "回访", "SLA", "审计", "审批", "运营工作台",
+    ]
+    if "APP" in text.upper() and not any(term in text for term in admin_terms):
+        return True
+    if any(
         term in text
         for term in [
             "听歌", "音乐", "歌曲", "歌单", "阅读", "听书", "小说", "短视频", "相册", "拍照", "修图",
-            "健身", "打卡", "运动", "日记", "记账", "清单", "便签", "外卖", "商城", "购物",
+            "健身", "打卡", "运动", "日记", "记账", "便签", "外卖", "商城", "购物",
         ]
-    )
+    ):
+        return True
+    return any(term in text for term in ("待办清单", "购物清单", "生活清单", "个人清单"))
+
+
+def _is_enterprise_accounting_text(text: str) -> bool:
+    return any(term in str(text or "") for term in ("代理记账", "代账", "企业财税", "税务申报", "核算账套"))
+
+
+def _is_design_viewer_text(text: str) -> bool:
+    value = str(text or "")
+    signals = ("Figma", "设计文件", "页面与画板", "图层与组件", "原型流程演示", "设计版本")
+    return "Figma" in value or sum(term in value for term in signals[1:]) >= 2
+
+
+def _is_download_manager_text(text: str) -> bool:
+    value = str(text or "")
+    signals = ("下载链接", "下载任务", "下载队列", "后台下载", "下载进度", "断点续传", "已下载文件", "下载记录")
+    return "download_manager" in value or sum(term in value for term in signals) >= 2
 
 
 def _consumer_app_forbidden_terms() -> list[str]:
@@ -787,10 +1183,11 @@ def _module_batch_quality_reasons(task: GenerationTask, modules: list[dict[str, 
         key = str(module.get("key") or "").strip()
         description = str(module.get("description") or "").strip()
         operations = [str(item).strip() for item in module.get("operations") or [] if str(item).strip()]
+        operation_specs = _clean_operation_specs(module.get("operation_specs") or module.get("operationSpecs"))
         fields = [str(item).strip() for item in module.get("data_fields") or [] if str(item).strip()]
         rules = [str(item).strip() for item in module.get("rules") or [] if str(item).strip()]
         module_text = " ".join([title, key, description, " ".join(operations), " ".join(fields), " ".join(rules)])
-        if not key or re.fullmatch(r"module_\d+|module|business|data|manage|management", key):
+        if not key or re.fullmatch(r"module_\d+|module|business|data|manage|management|domain_(?:\d+_)?[0-9a-f]{4,}", key):
             reasons.append(f"第 {index} 个模块 key 过于泛化")
         if not title or title in generic_titles:
             reasons.append(f"第 {index} 个模块标题过于泛化")
@@ -803,6 +1200,25 @@ def _module_batch_quality_reasons(task: GenerationTask, modules: list[dict[str, 
             reasons.append(f"{title or key or index} 描述不足 70 字")
         if len(set(operations) - generic_ops) < 3:
             reasons.append(f"{title or key or index} 业务操作不够具体")
+        if task.product_type != "游戏软件":
+            if len(operation_specs) < 3:
+                reasons.append(f"{title or key or index} 缺少结构化操作契约")
+            else:
+                categories = {str(spec.get("category") or "") for spec in operation_specs}
+                if "lookup" not in categories or len(categories - {"lookup"}) < 1:
+                    reasons.append(f"{title or key or index} 操作契约未覆盖查询和业务处理/结果动作")
+                for spec in operation_specs:
+                    if (
+                        not str(spec.get("action_key") or "").strip()
+                        or str(spec.get("action_key") or "") in {"business", "module", "action"}
+                        or not str(spec.get("role") or "").strip()
+                        or not str(spec.get("trigger") or "").strip()
+                        or not list(spec.get("input_fields") or [])
+                        or not str(spec.get("post_state") or "").strip()
+                        or not str(spec.get("result_evidence") or "").strip()
+                    ):
+                        reasons.append(f"{title or key or index} 存在不完整的结构化操作")
+                        break
         if len(set(fields) - generic_fields) < 4:
             reasons.append(f"{title or key or index} 业务字段不够具体")
         if len(rules) < 3:
@@ -850,6 +1266,421 @@ def _merge_plan(core_plan: dict[str, Any], module_plan: dict[str, Any]) -> dict[
     return merged
 
 
+_ADMIN_TERMINAL_REPLACEMENTS = (
+    ("个人消费记账", "企业客户账务处理"),
+    ("个人账本", "企业客户账套"),
+    ("消费级移动应用", "企业财税工作台"),
+    ("移动端人工智能应用", "浏览器端工业生产智能应用"),
+    ("移动端生产效率工作入口", "工业生产运营工作台"),
+    ("移动 App", "工业生产运营工作台"),
+    ("移动APP", "工业生产运营工作台"),
+    ("手机 App", "工业生产运营工作台"),
+    ("手机APP", "工业生产运营工作台"),
+    ("移动端", "桌面工作台"),
+    ("手机端", "桌面工作台"),
+    ("会员状态", "客户服务状态"),
+    ("会员权益", "客户服务权益"),
+    ("底部导航", "侧边导航"),
+    ("首页推荐", "首页预警"),
+    ("推荐提醒", "预警提醒"),
+    ("个人中心", "权限与审计中心"),
+    ("个人关注", "重点关注"),
+    ("收藏清单", "重点标记清单"),
+    ("离线缓存", "导出留存"),
+    ("缓存甘特图", "导出甘特图"),
+    ("缓存供现场离线查看", "导出供现场复核"),
+    ("离线查看", "导出复核"),
+    ("离线记录", "导出记录"),
+    ("使用记录", "操作记录"),
+    ("岗位偏好", "岗位权限"),
+    ("弱网环境", "受控网络环境"),
+    ("收藏", "重点标记"),
+    ("订阅", "配置预警"),
+)
+
+_DOWNLOAD_MANAGER_TERMINAL_REPLACEMENTS = (
+    ("浏览器工业工作台", "移动下载应用"),
+    ("浏览器端操作工作台", "移动端下载工作区"),
+    ("浏览器工作台", "移动端下载界面"),
+    ("工业工作台", "移动下载应用"),
+    ("工作台关闭或切换", "应用切换至后台"),
+    ("工作台退出", "应用切换至后台"),
+    ("一线操作员", "下载用户"),
+    ("操作人员", "下载用户"),
+    ("操作员", "用户"),
+    ("生产资料管理员", "批量下载用户"),
+    ("手机 App", "移动下载应用"),
+    ("手机APP", "移动下载应用"),
+    ("会员并发权益", "并发下载规则"),
+    ("会员状态", "下载配置状态"),
+    ("会员权益", "下载功能设置"),
+    ("个人中心", "下载设置"),
+)
+
+
+def _normalize_plan_terminal_semantics(task: GenerationTask, value: Any) -> Any:
+    terminal = _expected_plan_terminal(task)
+    if isinstance(value, dict):
+        return {key: _normalize_plan_terminal_semantics(task, item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_plan_terminal_semantics(task, item) for item in value]
+    if not isinstance(value, str):
+        return value
+    text = value
+    replacements = (
+        _ADMIN_TERMINAL_REPLACEMENTS
+        if terminal == "admin"
+        else _DOWNLOAD_MANAGER_TERMINAL_REPLACEMENTS
+        if terminal == "mobile_app" and _is_download_manager_text(f"{task.software_name} {task.feature_hint}")
+        else ()
+    )
+    for source, target in replacements:
+        text = text.replace(source, target)
+    return text
+
+
+def normalize_cached_blueprint_candidate(task: GenerationTask, blueprint: ProductBlueprint) -> ProductBlueprint:
+    """Apply current semantic gates to a cached LLM candidate without another model call."""
+    normalized_data = _normalize_plan_terminal_semantics(task, blueprint.to_dict())
+    normalized = _blueprint_from_data(task, normalized_data)
+    _repair_download_manager_operation_contracts(task, normalized)
+    repair_blueprint_contract(task, normalized)
+    normalized.quality_score = _quality_review(task, normalized)[0]
+    if getattr(blueprint, "technical_architecture", None):
+        normalized.technical_architecture = dict(blueprint.technical_architecture)
+    return normalized
+
+
+def _repair_download_manager_operation_contracts(task: GenerationTask, blueprint: ProductBlueprint) -> None:
+    context = " ".join(
+        [
+            task.software_name,
+            task.product_type,
+            task.feature_hint,
+            str(_semantic_contract(task).get("feature_hint_product_profile") or ""),
+            " ".join(module.title for module in blueprint.modules),
+        ]
+    )
+    if not _is_download_manager_text(context):
+        return
+    for module in blueprint.modules:
+        templates = _operation_templates_for(module.title, module.title)
+        if not templates or templates[0].endswith("登记"):
+            continue
+        labels = [str(spec.get("label") or "") for spec in (module.operation_specs or []) if isinstance(spec, dict)]
+        generic_count = sum(
+            1
+            for label in labels
+            if (
+                (label.startswith(("查询", "搜索", "筛选")) and label.endswith("记录"))
+                or any(term in label for term in ("登记", "校验", "跟踪"))
+            )
+        )
+        if len(labels) >= 3 and generic_count < 2:
+            continue
+        module.operation_specs = _complete_local_operation_specs(
+            task,
+            title=module.title,
+            module_key=module.key,
+            operations=templates,
+            data_fields=list(module.data_fields or []),
+            existing=[],
+        )
+        module.operations = _ensure_min_strings(
+            [str(spec.get("label") or "") for spec in module.operation_specs],
+            templates,
+            minimum=5,
+            limit=7,
+        )
+
+
+@dataclass(frozen=True)
+class BlueprintContractReview:
+    blocking_issues: tuple[str, ...] = ()
+    quality_warnings: tuple[str, ...] = ()
+
+    @property
+    def all_issues(self) -> tuple[str, ...]:
+        return self.blocking_issues + self.quality_warnings
+
+
+_CONTRACT_BLOCKING_MARKERS = (
+    "使用弱语义模块 key",
+    "缺少至少 3 个结构化操作契约",
+    "未同时覆盖查询和业务处理/结果动作",
+    "的结构化操作信息不完整",
+    "后台/工业软件蓝图混入移动消费端语义",
+)
+
+
+def blueprint_contract_review(task: GenerationTask, blueprint: ProductBlueprint) -> BlueprintContractReview:
+    issues = blueprint_contract_issues(task, blueprint)
+    blocking = tuple(
+        issue for issue in issues if any(marker in issue for marker in _CONTRACT_BLOCKING_MARKERS)
+    )
+    warnings = tuple(issue for issue in issues if issue not in blocking)
+    return BlueprintContractReview(blocking_issues=blocking, quality_warnings=warnings)
+
+
+def repair_blueprint_contract(task: GenerationTask, blueprint: ProductBlueprint) -> ProductBlueprint:
+    """Repair structural operation contracts without assuming a known industry subtype."""
+    repair_actions: list[str] = list(getattr(blueprint, "contract_repair_actions", []) or [])
+    used_keys: set[str] = set()
+    for index, module in enumerate(blueprint.modules, start=1):
+        previous_key = str(module.key or "")
+        repaired_key = semantic_module_key(
+            module.title,
+            index,
+            raw_key=previous_key,
+            used=used_keys,
+            context_terms=[module.description, *module.operations[:4], *module.data_fields[:6]],
+        )
+        if repaired_key != previous_key:
+            module.key = repaired_key
+            module.entities = normalize_entity_names(module.entities, repaired_key, index, old_key=previous_key)
+            repair_actions.append(f"修复模块键：{module.title}")
+        used_keys.add(module.key)
+        if _repair_module_operation_contract(task, module):
+            repair_actions.append(f"补齐结构化操作：{module.title}")
+
+    initial_review = blueprint_contract_review(task, blueprint)
+    needs_diversity_repair = any(
+        marker in issue
+        for issue in initial_review.quality_warnings
+        for marker in ("跨模块操作重复度过高", "跨模块结构化操作缺少语义差异")
+    )
+    if needs_diversity_repair:
+        for module in blueprint.modules:
+            if _repair_module_operation_contract(task, module, force_domain_actions=True):
+                repair_actions.append(f"差异化结构化操作：{module.title}")
+
+    second_review = blueprint_contract_review(task, blueprint)
+    if any("跨模块说明仅替换业务对象" in issue for issue in second_review.quality_warnings):
+        for module in blueprint.modules:
+            module.description = _generic_contract_description(module)
+        repair_actions.append("重建跨模块差异化说明")
+
+    setattr(blueprint, "contract_repair_actions", list(dict.fromkeys(repair_actions)))
+    return blueprint
+
+
+def _repair_module_operation_contract(
+    task: GenerationTask,
+    module: FeatureModule,
+    *,
+    force_domain_actions: bool = False,
+) -> bool:
+    specs = _clean_operation_specs(module.operation_specs)
+    labels = [str(spec.get("label") or "") for spec in specs]
+    categories = {str(spec.get("category") or "") for spec in specs}
+    incomplete = any(
+        not str(spec.get("action_key") or "").strip()
+        or not str(spec.get("role") or "").strip()
+        or not str(spec.get("trigger") or "").strip()
+        or not list(spec.get("input_fields") or [])
+        or not str(spec.get("post_state") or "").strip()
+        or not str(spec.get("result_evidence") or "").strip()
+        for spec in specs
+    )
+    generic_count = sum(_operation_label_is_generic(label, module.title) for label in labels)
+    needs_rebuild = bool(
+        force_domain_actions
+        or len(specs) < 3
+        or "lookup" not in categories
+        or not (categories - {"lookup"})
+        or incomplete
+        or generic_count >= 2
+    )
+    if not needs_rebuild:
+        return False
+
+    candidates = _generic_operation_candidates(module)
+    role = next((str(spec.get("role") or "").strip() for spec in specs if str(spec.get("role") or "").strip()), "")
+    if not role:
+        role = "当前用户" if _is_consumer_app_text(f"{task.software_name} {task.product_type}") else "业务经办人员"
+    module.operation_specs = [
+        _generic_operation_spec(module, label, category, role, index)
+        for index, (label, category) in enumerate(candidates[:3], start=1)
+    ]
+    module.operations = _ensure_min_strings(
+        [label for label, _category in candidates],
+        list(module.operations or []),
+        minimum=5,
+        limit=7,
+    )
+    return True
+
+
+def _operation_label_is_generic(label: str, module_title: str) -> bool:
+    shape = _normalized_action_label(label, module_title)
+    return bool(
+        shape in {
+            "查询", "搜索", "筛选", "查看", "新增", "登记", "校验", "验证", "确认", "跟踪", "追踪", "处理",
+            "{对象}登记", "{对象}校验", "{对象}确认", "{对象}跟踪", "{对象}追踪",
+        }
+        or re.fullmatch(r"(?:查询|搜索|筛选|查看)\{对象\}(?:记录|列表|详情)?", shape)
+    )
+
+
+def _generic_operation_candidates(module: FeatureModule) -> list[tuple[str, str]]:
+    title = str(module.title or "业务对象").strip()
+    subject = _operation_subject(title)
+    fields = _domain_operation_fields(module.data_fields, subject)
+    primary_field = fields[0] if fields else f"{subject}编号"
+    secondary_field = fields[1] if len(fields) > 1 else f"{subject}状态"
+    primary_object = _field_subject(primary_field) or subject
+    verb = _infer_operation_verb(title)
+    if verb == "处理":
+        verb = _infer_operation_verb(" ".join([module.description, *module.operations]))
+    lookup = f"按{primary_field}筛选{subject}"
+    business = f"{verb}{primary_object}" if not primary_object.startswith(verb) else primary_object
+    result = f"记录{secondary_field}处理结果"
+    candidates: list[tuple[str, str]] = [
+        (_clean_text(lookup, 28), "lookup"),
+        (_clean_text(business, 28), operation_category(business)),
+        (_clean_text(result, 28), "result"),
+    ]
+    for label in module.operations:
+        cleaned = _clean_text(str(label or ""), 28)
+        if cleaned and not _operation_label_is_generic(cleaned, title):
+            candidates.append((cleaned, operation_category(cleaned)))
+    candidates.extend(
+        [
+            (_clean_text(f"核对{primary_field}与{secondary_field}", 28), "workflow"),
+            (_clean_text(f"查看{subject}状态轨迹", 28), "lookup"),
+        ]
+    )
+    result_items: list[tuple[str, str]] = []
+    for label, category in candidates:
+        if label and label not in {item[0] for item in result_items}:
+            result_items.append((label, category))
+    return result_items
+
+
+def _operation_subject(title: str) -> str:
+    subject = str(title or "").strip()
+    for suffix in ("管理模块", "业务模块", "工作台", "管理", "模块", "中心", "平台", "系统"):
+        subject = subject.removesuffix(suffix)
+    return subject or str(title or "业务对象")
+
+
+def _domain_operation_fields(data_fields: list[str], subject: str) -> list[str]:
+    generic = {"名称", "编号", "状态", "类型", "时间", "结果", "来源", "备注", "备注说明", "处理人员", "更新时间"}
+    result: list[str] = []
+    for value in data_fields:
+        field = _clean_text(str(value or ""), 24)
+        if not field or field in generic:
+            continue
+        if field not in result:
+            result.append(field)
+    fallbacks = [f"{subject}编号", f"{subject}状态", f"{subject}结果"]
+    return _ensure_min_strings(result, fallbacks, minimum=3, limit=6)
+
+
+def _field_subject(field: str) -> str:
+    value = str(field or "").strip()
+    for suffix in ("编号", "标识", "状态", "时间", "日期", "类型", "结果", "数量", "记录"):
+        value = value.removesuffix(suffix)
+    return value or str(field or "")
+
+
+def _infer_operation_verb(text: str) -> str:
+    verbs = (
+        "解析", "创建", "编排", "调序", "下载", "传输", "续传", "重试", "交付", "接入", "采集", "导入",
+        "核验", "校验", "比对", "检测", "监测", "巡检", "点检", "标定", "计算", "识别", "训练", "预测",
+        "派发", "下达", "受理", "审核", "复核", "审批", "结算", "核销", "排班", "预约", "发布", "配置",
+        "绑定", "归档", "整改", "复验", "处置", "评估", "分析", "汇总", "同步", "匹配", "定位", "生成",
+    )
+    return next((verb for verb in verbs if verb in str(text or "")), "处理")
+
+
+def _generic_operation_spec(
+    module: FeatureModule,
+    label: str,
+    category: str,
+    role: str,
+    index: int,
+) -> dict[str, Any]:
+    fields = _domain_operation_fields(module.data_fields, _operation_subject(module.title))
+    selected_fields = fields[(index - 1) % len(fields) :] + fields[: (index - 1) % len(fields)]
+    selected_fields = selected_fields[:2]
+    high_risk = category == "destructive" or any(
+        term in label for term in ("删除", "作废", "失效", "覆盖", "正式发布", "清空")
+    )
+    if category == "lookup":
+        pre_state = "尚未应用查询条件"
+        post_state = f"显示匹配的{_operation_subject(module.title)}"
+        evidence = f"页面显示{selected_fields[0]}筛选条件、结果数量和更新时间"
+    else:
+        pre_state = f"{_operation_subject(module.title)}处于待处理状态"
+        post_state = f"{label}已完成"
+        evidence = f"页面显示{label}结果、{selected_fields[-1]}和状态变化记录"
+    return {
+        "action_key": semantic_module_key(
+            label,
+            index,
+            raw_key=f"{module.key}_{index}",
+            context_terms=[module.title, label, *selected_fields],
+        ),
+        "label": label,
+        "category": category,
+        "role": role,
+        "trigger": f"需要{label}时",
+        "input_fields": selected_fields,
+        "pre_state": pre_state,
+        "post_state": post_state,
+        "result_evidence": evidence,
+        "requires_confirmation": high_risk,
+    }
+
+
+def _generic_contract_description(module: FeatureModule) -> str:
+    subject = _operation_subject(module.title)
+    labels = [str(spec.get("label") or "") for spec in module.operation_specs[:3]]
+    fields = _domain_operation_fields(module.data_fields, subject)[:4]
+    pages = [str(item) for item in module.pages[:2] if str(item).strip()]
+    return _clean_text(
+        f"围绕{subject}，业务人员可依次{'、'.join(labels)}；系统依据{'、'.join(fields)}校验输入与状态变化，"
+        f"并在{'、'.join(pages) or subject + '页面'}展示处理结果、更新时间和可追溯记录。",
+        220,
+    )
+
+
+def _expected_plan_terminal(task: GenerationTask) -> str:
+    text = " ".join(
+        str(item or "")
+        for item in (
+            task.software_name,
+            task.product_type,
+            task.feature_hint,
+            _semantic_contract(task).get("feature_hint_domain"),
+            _semantic_contract(task).get("feature_hint_profile"),
+        )
+    )
+    if task.product_type == "游戏软件" or "游戏" in text:
+        return "game"
+    if _is_enterprise_accounting_text(text) or _is_design_viewer_text(text):
+        return "admin"
+    if _is_download_manager_text(text):
+        return "mobile_app"
+    if _is_music_like_text(text) or _is_consumer_app_text(text):
+        return "mobile_app"
+    return "admin"
+
+
+def _terminal_guidance(task: GenerationTask) -> str:
+    terminal = _expected_plan_terminal(task)
+    if terminal == "game":
+        return "- 当前软件是游戏终端，页面与流程必须使用玩家、关卡、对局或游戏配置语义。"
+    if terminal == "mobile_app":
+        return "- 当前软件是移动应用，可以使用手机 App、收藏、离线缓存和个人中心等真实用户端语义。"
+    return (
+        "- 当前软件是浏览器端/工业工作台，不是消费级移动 App。"
+        "禁止写移动 App、手机 App、个人中心、收藏、离线缓存、会员权益或底部导航；"
+        "对应能力应写成岗位权限、重点标记、导出留存、操作审计和工业生产运营工作台。"
+    )
+
+
 def _build_core_prompt(task: GenerationTask, rejection_reasons: list[str] | None = None) -> str:
     retry_note = ""
     if rejection_reasons:
@@ -865,13 +1696,17 @@ def _build_core_prompt(task: GenerationTask, rejection_reasons: list[str] | None
 软件技术特点/产品类型：{task.product_type}
 业务补充：{task.feature_hint or "无"}
 随机差异要求：{task.randomness}
+本次创意种子：{task.seed}（只用于形成独立的产品角度、信息架构和业务流程，不得出现在成品文字中）
 {retry_note}
 
 本次生成的差异化产品策略：
 {variation_strategy}
 
-领域边界要求：
-{domain_guidance}
+    领域边界要求：
+    {domain_guidance}
+
+    终端边界要求：
+    {_terminal_guidance(task)}
 
 返回 JSON 字段必须包含：
 - industry: 面向领域/行业，中文短语
@@ -896,6 +1731,7 @@ module_outline 规则：
 - 至少 70% 模块轮廓和页面必须体现软件名称或业务补充中的具体领域
 - 必须按“本次生成的差异化产品策略”组织产品角度、流程重心、模块边界和页面命名
 - 同类软件再次生成时也不能复用固定的“首页+数据管理+统计+权限”套壳结构
+- 必须把本次创意种子解释成一套独立的信息架构；新 seed 应产生不同的模块边界、页面角色、核心流程和指标组合，而不是只改名称
 - 说明书读者应能看出这是一个可申请软著的具体软件，不是泛型后台管理系统
 
 只返回 JSON。
@@ -926,6 +1762,9 @@ def _build_business_detail_prompt(
 
 领域边界要求：
 {domain_guidance}
+
+终端边界要求：
+{_terminal_guidance(task)}
 
 软件身份定位：
 {_compact_identity_plan(identity_plan)}
@@ -974,12 +1813,16 @@ def _build_module_prompt(
 领域边界要求：
 {domain_guidance}
 
+终端边界要求：
+{_terminal_guidance(task)}
+
 modules 必须包含 6-8 个功能模块，每个对象包含：
 - key: 小写英文或英文下划线，适合作为源码目录/类名前缀
 - title: 中文模块名，必须贴合软件名称、业务补充和核心场景
 - description: 90-180字，具体写出业务对象、业务动作、状态流转、权限/校验点和输出结果
 - entities: 2-4个英文实体名，必须能用于源码类名
 - operations: 4-7个中文操作名称，必须来自当前软件领域；阅读听书类可使用“打开章节”“加入书架”“播放音频”“同步进度”
+- operation_specs: 至少3个结构化操作，覆盖查询和业务处理/结果动作；每项包含 action_key/label/category/role/trigger/input_fields/pre_state/post_state/result_evidence/requires_confirmation
 - data_fields: 6-10个中文业务字段，必须来自当前软件领域；阅读听书类可使用“书籍名称”“章节标题”“播放进度”“收藏状态”
 - pages: 2-4个当前模块相关页面名
 - rules: 3-5条当前模块业务规则，包含校验、权限、状态流转或审计要求
@@ -1024,12 +1867,17 @@ def _build_module_batch_prompt(
 领域边界要求：
 {domain_guidance}
 
+终端边界要求：
+{_terminal_guidance(task)}
+
 本批模块轮廓：
 {json.dumps(outline_batch, ensure_ascii=False)}
 
-每个模块必须包含 key/title/description/entities/operations/data_fields/pages/rules。
-description 90-180字；operations 4-7个；data_fields 6-10个；rules 3-5条。
+每个模块必须包含 key/title/description/entities/operations/operation_specs/data_fields/pages/rules。
+description 90-180字；operations 4-7个；operation_specs 3-5个；data_fields 6-10个；rules 3-5条。
+- modules 数量、顺序、key 和 title 必须与“本批模块轮廓”逐项一致，不得改成 module_1 等泛化 key，也不得把首页、搜索、个人中心等导航入口改造成业务模块。
 - 模块边界、操作名、字段名和规则必须符合差异化产品策略，不要复用“新增、编辑、删除、导出”四件套作为主要内容。
+- operation_specs 的 label 必须是领域动作；role、trigger、input_fields、post_state、result_evidence 不得为空。查询动作必须给出真实筛选字段和结果证据，业务动作必须给出状态变化；只有删除、失效、覆盖、正式发布等高风险动作 requires_confirmation=true。
 只返回 JSON。
 """.strip()
 
@@ -1057,6 +1905,9 @@ def _build_module_repair_prompt(
 领域边界要求：
 {domain_guidance}
 
+终端边界要求：
+{_terminal_guidance(task)}
+
 本批模块轮廓：
 {json.dumps(batch, ensure_ascii=False, indent=2)}
 
@@ -1072,11 +1923,12 @@ def _build_module_repair_prompt(
 - title、description、operations、data_fields、rules 必须呼应软件名称、业务补充、业务对象、流程和指标。
 - description 至少 90 字，写清业务对象、用户动作、状态流转、校验点、输出结果。
 - operations 至少 5 个，不能只写新增、编辑、删除、查询、导出。
+- operation_specs 至少 3 个，必须覆盖查询和业务处理/结果类动作，并写清角色、触发条件、输入字段、前后状态和结果证据。
 - data_fields 至少 7 个，不能只写名称、编号、状态、备注、创建时间。
 - rules 至少 3 条，必须包含校验、权限、状态流转或审计要求。
 
 返回 JSON 示例：
-{{"modules":[{{"key":"domain_task_trace","title":"业务任务追踪","description":"...","entities":["TaskRecord","TaskTrace"],"operations":["..."],"data_fields":["..."],"pages":["..."],"rules":["..."]}}]}}
+{{"modules":[{{"key":"domain_task_trace","title":"业务任务追踪","description":"...","entities":["TaskRecord","TaskTrace"],"operations":["筛选待办任务","下发处理任务","确认处理结果"],"operation_specs":[{{"action_key":"filter_pending_tasks","label":"筛选待办任务","category":"lookup","role":"调度员","trigger":"需要定位待处理任务","input_fields":["任务编号","处理状态"],"pre_state":"任务列表未筛选","post_state":"显示匹配任务","result_evidence":"筛选条件和结果数量","requires_confirmation":false}}],"data_fields":["..."],"pages":["..."],"rules":["..."]}}]}}
 """.strip()
 
 
@@ -1258,12 +2110,11 @@ def _chat_json(
     temperature: float,
     max_tokens: int,
     label: str,
-    attempts: int = 3,
+    attempts: int = 2,
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     current_messages = messages
-    provider_retries = int(getattr(getattr(provider, "config", None), "retry_count", 0) or 0)
-    total_attempts = 1 if provider_retries > 0 else max(1, attempts)
+    total_attempts = max(1, min(2, attempts))
     for attempt in range(total_attempts):
         started_at = time.perf_counter()
         trace_event(
@@ -1277,12 +2128,14 @@ def _chat_json(
             message_count=len(current_messages),
         )
         try:
+            request_number = _consume_blueprint_request(provider, label)
             content = provider.chat(
                 current_messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"},
                 trace_label=f"blueprint:{label}",
+                retry_policy=TextRetryPolicy(max_retries=1),
             )
             data = _parse_json(content)
             trace_event(
@@ -1292,9 +2145,13 @@ def _chat_json(
                 attempt=attempt + 1,
                 elapsed_seconds=round(time.perf_counter() - started_at, 3),
                 content_chars=len(content or ""),
+                request_number=request_number,
+                request_limit=8,
             )
             return data
         except Exception as exc:
+            if isinstance(exc, TextProviderError) and exc.category.value != "format_error":
+                raise
             last_error = exc
             trace_event(
                 "chat_json_error",
@@ -1318,19 +2175,31 @@ def _chat_json(
     raise RuntimeError(f"{label}请求失败：{last_error}")
 
 
+def _consume_blueprint_request(provider: LLMProvider, label: str) -> int:
+    budget = getattr(provider, "_blueprint_request_budget", None)
+    if not isinstance(budget, dict):
+        budget = {"count": 0, "limit": 8, "lock": threading.Lock()}
+        setattr(provider, "_blueprint_request_budget", budget)
+    lock = budget.get("lock")
+    if not hasattr(lock, "__enter__"):
+        lock = threading.Lock()
+        budget["lock"] = lock
+    with lock:
+        next_count = int(budget.get("count") or 0) + 1
+        limit = int(budget.get("limit") or 8)
+        if next_count > limit:
+            raise RuntimeError(f"产品蓝图请求预算已用尽：{label} 将超过 {limit} 次请求上限")
+        budget["count"] = next_count
+        return next_count
+
+
+def _blueprint_request_count(provider: LLMProvider) -> int:
+    budget = getattr(provider, "_blueprint_request_budget", None)
+    return int(budget.get("count") or 0) if isinstance(budget, dict) else 0
+
+
 def _parse_json(content: str) -> dict[str, Any]:
-    cleaned = content.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
-        cleaned = re.sub(r"```$", "", cleaned).strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start >= 0 and end > start:
-        cleaned = cleaned[start : end + 1]
-    data = json.loads(cleaned)
-    if not isinstance(data, dict):
-        raise ValueError("LLM 蓝图不是 JSON 对象")
-    return data
+    return parse_json_object(content, label="blueprint")
 
 
 def _blueprint_from_data(task: GenerationTask, data: dict[str, Any]) -> ProductBlueprint:
@@ -1342,9 +2211,25 @@ def _blueprint_from_data(task: GenerationTask, data: dict[str, Any]) -> ProductB
     for index, item in enumerate(modules_data[:8], start=1):
         if not isinstance(item, dict):
             continue
-        key = _safe_key(str(item.get("key") or f"module_{index}"))
         title = _clean_text(str(item.get("title") or f"业务模块{index}"), 24)
         description = _clean_text(str(item.get("description") or f"{title}用于业务数据维护和流程处理。"), 220)
+        operations = _clean_list(item.get("operations"), 7, 28)
+        operation_specs = _clean_operation_specs(item.get("operation_specs") or item.get("operationSpecs"))
+        if operation_specs:
+            operations = _ensure_min_strings(
+                [str(spec.get("label") or "") for spec in operation_specs],
+                operations,
+                minimum=5,
+                limit=7,
+            )
+        data_fields = _clean_list(item.get("data_fields"), 10, 24)
+        key = semantic_module_key(
+            title,
+            index,
+            raw_key=str(item.get("key") or ""),
+            used={module.key for module in modules},
+            context_terms=[description, *operations[:4], *data_fields[:6]],
+        )
         entities = item.get("entities")
         if not isinstance(entities, list):
             entities = [f"Module{index}Record", f"Module{index}Query"]
@@ -1353,17 +2238,18 @@ def _blueprint_from_data(task: GenerationTask, data: dict[str, Any]) -> ProductB
             for entity in entities[:4]
             if _entity_name_from_item(entity)
         ]
-        safe_entities = _normalize_entities(safe_entities, key, index)
+        safe_entities = _normalize_entities(safe_entities, key, index, old_key=str(item.get("key") or ""))
         modules.append(
             FeatureModule(
                 key=key,
                 title=title,
                 description=description,
                 entities=safe_entities,
-                operations=_clean_list(item.get("operations"), 7, 28),
-                data_fields=_clean_list(item.get("data_fields"), 10, 24),
+                operations=operations,
+                data_fields=data_fields,
                 pages=_clean_list(item.get("pages"), 4, 28),
                 rules=_clean_list(item.get("rules"), 5, 80),
+                operation_specs=operation_specs,
             )
         )
 
@@ -1567,21 +2453,8 @@ def _entity_name_from_item(item: Any) -> str:
     return str(item).strip()
 
 
-def _normalize_entities(entities: list[str], key: str, index: int) -> list[str]:
-    base = _entity_base_from_key(key) or f"Module{index}"
-    cleaned: list[str] = []
-    for entity in entities:
-        if not entity or entity == "BusinessRecord" or entity in cleaned:
-            continue
-        cleaned.append(entity)
-    while len(cleaned) < 2:
-        suffix = "Record" if len(cleaned) == 0 else "Query"
-        candidate = f"{base}{suffix}"
-        if candidate not in cleaned:
-            cleaned.append(candidate)
-        else:
-            cleaned.append(f"{base}Detail")
-    return cleaned[:4]
+def _normalize_entities(entities: list[str], key: str, index: int, old_key: str = "") -> list[str]:
+    return normalize_entity_names(entities, key, index, old_key=old_key)
 
 
 def _entity_base_from_key(key: str) -> str:
@@ -1620,7 +2493,12 @@ def _clean_workflows(value: Any) -> list[dict[str, list[str] | str]]:
     for index, item in enumerate(value[:5], start=1):
         if not isinstance(item, dict):
             continue
-        steps = _clean_list(item.get("steps"), 7, 32)
+        steps = [
+            f"{step}，系统记录处理结果。"
+            if len(step) == 32 and not re.search(r"[。；：!?！？]$", step)
+            else step
+            for step in _clean_list(item.get("steps"), 7, 80)
+        ]
         if len(steps) < 3:
             steps = ["创建记录", "字段校验", "提交处理", "生成结果"]
         workflows.append(
@@ -1634,6 +2512,52 @@ def _clean_workflows(value: Any) -> list[dict[str, list[str] | str]]:
     return workflows
 
 
+def _clean_operation_specs(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, Any]] = []
+    seen_labels: set[str] = set()
+    allowed_categories = {
+        "lookup", "mutation", "import", "export", "destructive",
+        "analysis", "workflow", "result", "instant",
+    }
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        label = _clean_text(str(item.get("label") or item.get("action") or item.get("name") or ""), 28)
+        if not label or label in seen_labels:
+            continue
+        seen_labels.add(label)
+        category = _clean_text(str(item.get("category") or ""), 20).lower()
+        if category not in allowed_categories:
+            category = operation_category(label)
+        action_key = _safe_key(str(item.get("action_key") or item.get("actionKey") or ""))
+        input_fields = _clean_list(item.get("input_fields") or item.get("inputFields"), 8, 24)
+        result.append(
+            {
+                "action_key": action_key,
+                "label": label,
+                "category": category,
+                "role": _clean_text(str(item.get("role") or ""), 24),
+                "trigger": _clean_text(str(item.get("trigger") or ""), 80),
+                "input_fields": input_fields,
+                "pre_state": _clean_text(str(item.get("pre_state") or item.get("preState") or ""), 32),
+                "post_state": _clean_text(str(item.get("post_state") or item.get("postState") or ""), 32),
+                "result_evidence": _clean_text(
+                    str(item.get("result_evidence") or item.get("resultEvidence") or ""), 90
+                ),
+                "requires_confirmation": bool(
+                    item.get("requires_confirmation")
+                    if item.get("requires_confirmation") is not None
+                    else item.get("requiresConfirmation", False)
+                ),
+            }
+        )
+        if len(result) >= 7:
+            break
+    return result
+
+
 def _clean_text(value: str, limit: int) -> str:
     value = re.sub(r"\s+", " ", value).strip()
     return value[:limit]
@@ -1642,6 +2566,185 @@ def _clean_text(value: str, limit: int) -> str:
 def _fallback_summary(task: GenerationTask, industry: str, modules: list[FeatureModule]) -> str:
     titles = "、".join(module.title for module in modules[:4])
     return f"{task.software_name}是一套面向{industry}的{task.product_type}，围绕{titles}等模块提供业务管理、流程协同、统计分析和权限审计能力。"
+
+
+def blueprint_contract_issues(task: GenerationTask, blueprint: ProductBlueprint) -> list[str]:
+    from .product_experience import build_product_experience_spec, expected_renderer_for_experience
+
+    issues: list[str] = []
+    renderer = expected_renderer_for_experience(build_product_experience_spec(task, blueprint))
+    repeated_actions: dict[str, set[str]] = {}
+    generic_actions = {
+        "查询", "搜索", "筛选", "查看", "详情", "新增", "登记", "录入", "编辑", "修改",
+        "校验", "验证", "分析", "确认", "归档", "统计", "导入", "导出", "处理",
+    }
+    for module in blueprint.modules:
+        key = str(module.key or "")
+        if re.fullmatch(r"domain_(?:\d+_)?[0-9a-f]{4,}", key):
+            issues.append(f"{module.title} 使用弱语义模块 key：{key}")
+        if renderer == "game":
+            continue
+        specs = _clean_operation_specs(getattr(module, "operation_specs", None))
+        if len(specs) < 3:
+            issues.append(f"{module.title} 缺少至少 3 个结构化操作契约")
+            continue
+        categories = {str(spec.get("category") or "") for spec in specs}
+        if "lookup" not in categories or not (categories - {"lookup"}):
+            issues.append(f"{module.title} 未同时覆盖查询和业务处理/结果动作")
+        incomplete = [
+            str(spec.get("label") or "")
+            for spec in specs
+            if (
+                not str(spec.get("action_key") or "").strip()
+                or str(spec.get("action_key") or "") in {"business", "module", "action"}
+                or not str(spec.get("role") or "").strip()
+                or not str(spec.get("trigger") or "").strip()
+                or not list(spec.get("input_fields") or [])
+                or not str(spec.get("post_state") or "").strip()
+                or not str(spec.get("result_evidence") or "").strip()
+            )
+        ]
+        if incomplete:
+            issues.append(f"{module.title} 的结构化操作信息不完整：{'、'.join(incomplete[:3])}")
+        domain_action_count = 0
+        for spec in specs:
+            label = _normalized_action_label(str(spec.get("label") or ""), module.title)
+            if not label:
+                continue
+            repeated_actions.setdefault(label, set()).add(module.key)
+            if label not in generic_actions and len(label) >= 3:
+                domain_action_count += 1
+        if domain_action_count < 2:
+            issues.append(f"{module.title} 缺少至少 2 个独有领域动作")
+
+    repeated_floor = max(3, (len(blueprint.modules) + 1) // 2)
+    repeated = [
+        label
+        for label, module_keys in repeated_actions.items()
+        if label not in {"查询", "搜索", "筛选", "查看详情", "查询{对象}", "搜索{对象}", "筛选{对象}"}
+        and not re.fullmatch(r"(?:查询|搜索|筛选|查看)\{对象\}(?:记录|列表|详情)?", label)
+        and not re.fullmatch(r"(?:登记|校核|提交|追踪|采集|比对|确认|汇总|录入|复核|转交|反馈|维护|验证|启用|查看)\{对象\}", label)
+        and len(module_keys) >= repeated_floor
+    ]
+    if repeated:
+        issues.append(f"跨模块操作重复度过高：{'、'.join(sorted(repeated)[:6])}")
+
+    if len(blueprint.modules) >= 4 and renderer != "game":
+        signatures: dict[tuple, list[str]] = {}
+        description_shapes: dict[str, list[str]] = {}
+        for module in blueprint.modules:
+            specs = _clean_operation_specs(getattr(module, "operation_specs", None))
+            signature = _operation_contract_signature(module, specs)
+            signatures.setdefault(signature, []).append(module.title)
+            description_shape = _contract_text_shape(module.description, module.title)
+            description_shapes.setdefault(description_shape, []).append(module.title)
+        required_unique = max(3, (len(blueprint.modules) + 1) // 2)
+        if len(signatures) < required_unique:
+            duplicate_group = max(signatures.values(), key=len, default=[])
+            issues.append(
+                f"跨模块结构化操作缺少语义差异：仅 {len(signatures)}/{required_unique} 组独立契约"
+                + (f"，重复模块包括{'、'.join(duplicate_group[:4])}" if duplicate_group else "")
+            )
+        repeated_description_group = max(description_shapes.values(), key=len, default=[])
+        if len(repeated_description_group) >= max(3, (len(blueprint.modules) + 1) // 2):
+            issues.append(f"跨模块说明仅替换业务对象：{'、'.join(repeated_description_group[:4])}")
+
+    workflow_steps = [
+        str(step or "").strip()
+        for workflow in blueprint.workflows
+        if isinstance(workflow, dict)
+        for step in (workflow.get("steps") or [])
+    ]
+    if any(len(step) < 6 for step in workflow_steps):
+        issues.append("业务工作流包含过短或不完整步骤")
+    truncated_steps = [
+        step for step in workflow_steps if len(step) == 32 and not re.search(r"[。；：!?！？]$", step)
+    ]
+    if len(truncated_steps) >= 2:
+        issues.append("业务工作流步骤疑似被固定长度截断")
+    workflow_signatures = {
+        tuple(_contract_text_shape(str(step or ""), "", blueprint.modules) for step in (workflow.get("steps") or []))
+        for workflow in blueprint.workflows
+        if isinstance(workflow, dict)
+    }
+    if len(blueprint.workflows) >= 3 and len(workflow_signatures) < 2:
+        issues.append("业务工作流步骤跨模块重复，未形成真实协同链路")
+    workflow_names = [
+        str(workflow.get("name") or "").strip()
+        for workflow in blueprint.workflows
+        if isinstance(workflow, dict)
+    ]
+    if len(workflow_names) >= 3 and sum(name.endswith("闭环流程") for name in workflow_names) >= len(workflow_names) - 1:
+        issues.append("业务工作流名称过度使用“闭环流程”模板")
+
+    blueprint_text = json.dumps(
+        {
+            "summary": blueprint.summary,
+            "scenario": blueprint.scenario,
+            "positioning": blueprint.positioning,
+            "workflows": blueprint.workflows,
+            "uniqueness_notes": blueprint.uniqueness_notes,
+            "deployment_topology": blueprint.deployment_topology,
+        },
+        ensure_ascii=False,
+    )
+    if renderer == "admin":
+        mobile_conflicts = [
+            term for term in (
+                "移动 App", "移动端", "手机 App", "会员状态", "会员权益", "个人中心", "底部导航",
+                "收藏清单", "个人关注", "离线缓存", "离线查看", "弱网环境",
+            )
+            if term in blueprint_text
+        ]
+        if len(mobile_conflicts) >= 2:
+            issues.append(f"后台/工业软件蓝图混入移动消费端语义：{'、'.join(mobile_conflicts)}")
+    return list(dict.fromkeys(issues))
+
+
+def _normalized_action_label(label: str, module_title: str) -> str:
+    text = _contract_text_shape(label, module_title)
+    text = re.sub(r"^(?:执行|进行|发起|完成)", "", text)
+    return re.sub(r"\s+", "", text)
+
+
+def _contract_text_shape(value: str, module_title: str, modules: list[FeatureModule] | None = None) -> str:
+    text = re.sub(r"\s+", "", str(value or ""))
+    titles = [str(module_title or "")]
+    titles.extend(str(module.title or "") for module in (modules or []))
+    variants: set[str] = set()
+    for title in titles:
+        if not title:
+            continue
+        variants.add(title)
+        subject = title
+        for suffix in ("管理", "系统", "平台", "中心", "模块"):
+            subject = subject.removesuffix(suffix)
+        if subject:
+            variants.add(subject)
+    for variant in sorted(variants, key=len, reverse=True):
+        text = text.replace(variant, "{对象}")
+    text = re.sub(r"[0-9０-９]+", "#", text)
+    return text
+
+
+def _operation_contract_signature(module: FeatureModule, specs: list[dict[str, Any]]) -> tuple:
+    result: list[tuple] = []
+    for spec in specs:
+        result.append(
+            (
+                str(spec.get("category") or ""),
+                _contract_text_shape(str(spec.get("label") or ""), module.title),
+                tuple(
+                    _contract_text_shape(str(field or ""), module.title)
+                    for field in (spec.get("input_fields") or [])
+                ),
+                _contract_text_shape(str(spec.get("pre_state") or ""), module.title),
+                _contract_text_shape(str(spec.get("post_state") or ""), module.title),
+                _contract_text_shape(str(spec.get("result_evidence") or ""), module.title),
+                bool(spec.get("requires_confirmation")),
+            )
+        )
+    return tuple(result)
 
 
 def _quality_review(task: GenerationTask, blueprint: ProductBlueprint) -> tuple[int, list[str]]:
@@ -1673,6 +2776,36 @@ def _quality_review(task: GenerationTask, blueprint: ProductBlueprint) -> tuple[
         "回溯",
         "确认",
         "配置",
+        "建档",
+        "登记",
+        "维护",
+        "导入",
+        "绑定",
+        "停用",
+        "恢复",
+        "接入",
+        "编排",
+        "排程",
+        "下达",
+        "执行",
+        "点检",
+        "巡检",
+        "监测",
+        "比对",
+        "标注",
+        "告警",
+        "联动",
+        "处置",
+        "研判",
+        "生成",
+        "匹配",
+        "上报",
+        "整改",
+        "复验",
+        "追溯",
+        "计算",
+        "钻取",
+        "反馈",
     ]
     action_words.extend(_domain_action_words(task))
     domain_terms = _domain_terms(task)
@@ -1762,7 +2895,7 @@ def _quality_review(task: GenerationTask, blueprint: ProductBlueprint) -> tuple[
     feature_terms = [term for term in re.split(r"[，,、\s]+", task.feature_hint) if len(term) >= 2]
     if feature_terms:
         joined = json.dumps(blueprint.to_dict(), ensure_ascii=False)
-        hit_count = sum(1 for term in feature_terms if term in joined)
+        hit_count = sum(1 for term in feature_terms if _feature_term_matches_plan(term, joined))
         if hit_count < max(1, min(3, len(feature_terms))):
             score -= 10
             reasons.append("产品方案与业务补充关键词关联不足")
@@ -1794,4 +2927,51 @@ def _quality_review(task: GenerationTask, blueprint: ProductBlueprint) -> tuple[
         score -= 5
         reasons.append("缺少部署拓扑说明")
 
+    contract_review = blueprint_contract_review(task, blueprint)
+    if contract_review.blocking_issues:
+        score -= min(70, max(18, len(contract_review.blocking_issues) * 10))
+        reasons.extend(contract_review.blocking_issues)
+    if contract_review.quality_warnings:
+        score -= min(12, len(contract_review.quality_warnings) * 3)
+        reasons.extend(contract_review.quality_warnings)
+
     return max(score, 0), reasons
+
+
+_FEATURE_ACTION_EQUIVALENTS = (
+    ("巡检", "点检", "巡查"),
+    ("台账", "档案", "建档"),
+    ("复验", "复核", "复检"),
+    ("预警", "告警", "报警"),
+    ("派发", "派单", "下达"),
+    ("追溯", "回溯", "溯源"),
+)
+
+
+def _feature_term_matches_plan(term: str, joined_plan: str) -> bool:
+    """Match short feature phrases by business semantics, not only adjacency."""
+    term = re.sub(r"\s+", "", str(term or ""))
+    if not term:
+        return False
+    if term in joined_plan:
+        return True
+    canonical_term = term
+    canonical_plan = joined_plan
+    for equivalents in _FEATURE_ACTION_EQUIVALENTS:
+        canonical = equivalents[0]
+        for value in equivalents[1:]:
+            canonical_term = canonical_term.replace(value, canonical)
+            canonical_plan = canonical_plan.replace(value, canonical)
+    if canonical_term in canonical_plan:
+        return True
+    action_markers = (
+        "巡检", "台账", "闭环", "复验", "预警", "派发", "追溯", "监测",
+        "采集", "上报", "整改", "调度", "分析", "统计", "审核", "配置",
+    )
+    for marker in action_markers:
+        if marker not in canonical_term or marker not in canonical_plan:
+            continue
+        subject = canonical_term.replace(marker, "").strip("与及和的")
+        if len(subject) >= 2 and subject in canonical_plan:
+            return True
+    return False

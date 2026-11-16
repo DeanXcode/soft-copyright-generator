@@ -7,6 +7,7 @@ from pathlib import Path
 import threading
 from typing import Any
 
+from ..errors import sanitize_error_message
 
 _LOCK = threading.Lock()
 
@@ -38,7 +39,7 @@ def trace_event(event: str, **payload: Any) -> None:
 def _safe_value(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         if isinstance(value, str):
-            return value[:500]
+            return sanitize_error_message(value, limit=500)
         return value
     if isinstance(value, Path):
         return str(value)

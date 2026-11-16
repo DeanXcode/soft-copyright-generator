@@ -6,7 +6,9 @@ import re
 from typing import Any
 
 from .design_dna import build_design_dna
+from .domain_profile import has_transport_domain_signal as _has_transport_domain_signal
 from .models import GenerationTask
+from .module_keys import is_placeholder_module_key, semantic_module_key
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,10 @@ class IndustrySubtype:
 
 INDUSTRY_SUBTYPES: dict[str, tuple[IndustrySubtype, ...]] = {
     "APP": (
+        IndustrySubtype("design_viewer", "设计文件浏览与评审工作台", "设计文件浏览、预览与协作评审", "设计文件接入、资源导航、页面画板预览、图层组件检查、原型演示、评论评审和版本追踪", "面向设计师、产品经理和评审参与者的桌面设计资源工作区", ("UI/UX设计师", "产品经理", "设计评审参与者"), ("设计文件", "项目资源", "页面画板", "图层组件", "原型流程", "评审评论", "设计版本", "浏览收藏"), ("可访问文件数", "最近浏览数", "收藏文件数", "待处理评论数", "原型流程数", "版本更新数"), ("matrix", "command", "workflow"), ("side_menu", "top_tabs"), ("桌面设计资源工作台", "画布预览与图层检查界面", "评审协作与版本追踪台"), ("资源树+画布预览", "画板导航+图层属性", "评审评论+版本时间线"), ("设计文件详情", "画板预览", "评论定位"), ("接入", "浏览", "定位", "预览", "检查", "演示", "收藏", "追踪")),
+        IndustrySubtype("download_manager", "移动文件下载管理APP", "移动文件下载与传输任务管理", "下载链接解析、下载任务创建、队列调序、后台传输、进度跟踪、断点续传、文件交付和历史复建", "面向需要单个、批量或持续下载文件用户的移动下载工具", ("移动端用户", "批量下载用户"), ("下载链接", "下载任务", "下载队列", "后台下载", "下载进度", "断点续传", "已下载文件", "下载记录"), ("下载任务数", "当前下载速度", "今日传输量", "下载完成率", "续传成功率", "失败任务数"), ("workflow", "kanban", "matrix"), ("phone_tabs", "top_tabs"), ("紧凑移动下载界面", "任务队列与实时进度界面", "文件交付与历史记录界面"), ("下载队列+实时速度", "任务状态+剩余时间", "失败恢复+文件清单"), ("移动下载任务列表", "传输进度详情", "文件操作面板"), ("解析", "创建", "下载", "暂停", "续传", "重试", "打开", "移动")),
+        IndustrySubtype("agency_accounting", "企业代理记账工作台", "企业代理记账与财税服务", "客户建档、账套核算、票据凭证、银行对账、月末结账、税务申报、财务报表和交付归档", "面向代账会计、复核会计、税务专员和财务主管的企业财税业务工作台", ("代账会计", "复核会计", "税务专员", "财务主管", "客户对接人员"), ("企业客户", "核算账套", "票据凭证", "银行对账", "月末结账", "税务申报", "财务报表", "交付归档"), ("服务客户数", "待制凭证数", "对账差异数", "本期关账率", "申报完成率", "报表交付率"), ("workflow", "ledger_split", "matrix"), ("side_menu", "top_tabs"), ("企业财税工作台", "代理记账核算界面", "税务申报运营台"), ("客户账套+期间任务", "凭证核算+对账差异", "申报进度+报表交付"), ("客户账套详情", "凭证复核", "申报任务"), ("查询", "编制", "复核", "对账", "结账", "申报", "导出")),
+        IndustrySubtype("workforce_attendance", "移动考勤与打卡APP", "企业人力资源与移动考勤", "员工排班、上下班打卡、补卡请假和出勤统计", "面向员工、班组负责人和人事人员的移动考勤协同工具", ("员工", "班组负责人", "人事专员", "考勤管理员"), ("班次排班", "上下班打卡", "补卡申请", "请假申请", "异常考勤", "出勤统计"), ("今日出勤人数", "正常打卡率", "迟到人数", "早退人数", "请假人数", "补卡完成率"), ("workflow", "kanban", "matrix"), ("phone_tabs", "top_tabs"), ("轻量移动考勤界面", "班次打卡工作台", "出勤统计看板"), ("今日班次+打卡入口", "出勤指标+异常提醒", "请假补卡+处理进度"), ("移动打卡列表", "班次日历", "申请详情"), ("打卡", "查询", "申请", "统计", "详情")),
         IndustrySubtype("community_service", "社区生活服务APP", "移动互联网生活服务", "社区服务预约、订单履约、消息触达和用户留存运营", "面向社区用户、商户和平台运营人员的移动服务协同平台", ("平台运营", "客服专员", "商户管理员", "移动端用户"), ("服务预约", "门店核销", "会员权益", "消息推送", "售后工单", "活动入口", "订单支付"), ("日活用户", "预约转化率", "核销订单数", "推送到达率", "售后响应时长", "用户留存率"), ("workflow", "command", "kanban"), ("top_tabs", "side_menu", "rail"), ("移动运营工作台", "高密度服务调度台", "轻量化订单运营界面"), ("指标总览+服务队列", "运营漏斗+订单提醒", "活动看板+客服待办"), ("主从订单列表", "工单看板", "用户画像侧栏"), ("查询", "审核", "导出", "详情", "配置")),
         IndustrySubtype("commerce_app", "移动电商运营APP", "移动电商与会员运营", "商品推荐、购物车、订单支付、优惠券和售后处理", "面向移动端交易链路的商品、订单和会员运营平台", ("运营管理员", "商品专员", "客服人员", "会员用户"), ("商品上架", "购物车", "支付订单", "优惠券", "会员等级", "售后退款", "推荐位"), ("GMV", "订单转化率", "退款率", "优惠券核销率", "会员复购率", "客诉处理量"), ("command", "workflow", "matrix"), ("top_tabs", "side_menu"), ("电商运营指挥台", "营销活动配置台", "订单履约管理台"), ("销售漏斗+履约提醒", "营销指标+异常订单", "会员分层+活动转化"), ("订单主从详情", "营销配置表单", "售后审批流"), ("查询", "导入", "导出", "审核", "详情")),
         IndustrySubtype("field_service", "外勤服务APP", "移动外勤与任务协同", "工单派发、位置签到、现场照片、服务回访和结算统计", "面向外勤人员和调度中心的移动任务闭环系统", ("调度管理员", "外勤人员", "质检人员", "客户经理"), ("派工任务", "现场签到", "服务照片", "客户回访", "费用结算", "轨迹记录"), ("准时到达率", "工单完成率", "回访满意度", "异常退单数", "外勤在线率", "平均服务时长"), ("map", "kanban", "workflow"), ("side_menu", "top_tabs"), ("外勤调度台", "现场服务闭环界面", "地图化任务运营台"), ("地图派工+工单队列", "人员轨迹+异常提醒", "服务指标+质检任务"), ("地图详情抽屉", "工单流转看板", "回访表单"), ("定位", "审核", "查询", "详情", "统计")),
@@ -46,6 +52,8 @@ INDUSTRY_SUBTYPES: dict[str, tuple[IndustrySubtype, ...]] = {
         IndustrySubtype("payment_clearing", "支付清算风控系统", "支付清算与交易风控", "交易接入、清算批次、异常拦截、对账差错和监管报送", "面向支付机构的交易清算与风险处置平台", ("清算人员", "风控管理员", "财务复核员", "监管报送员"), ("交易流水", "清算批次", "对账差错", "风险拦截", "商户资料", "报送文件"), ("交易笔数", "清算成功率", "差错金额", "风险拦截数", "对账完成率", "报送批次数"), ("risk", "matrix", "command"), ("top_tabs", "side_menu"), ("支付清算监控台", "交易风险指挥台", "对账差错处理界面"), ("交易态势+清算队列", "风险命中+差错处理", "监管报送+批次统计"), ("交易详情", "差错复核", "导出报送"), ("查询", "复核", "导出", "预警", "统计")),
     ),
     "医疗软件": (
+        IndustrySubtype("inpatient_monitoring", "住院患者监测护理系统", "院内住院患者监测与护理协同", "在院患者总览、床位状态、生命体征记录、病情观察、异常预警、护理巡视、医嘱关注和班次交接", "面向临床护士、值班医生和护理管理人员的移动化患者监测平台", ("临床护士", "值班医生", "护理管理人员", "病区管理员"), ("在院患者", "床位状态", "生命体征", "病情观察", "异常预警", "护理巡视", "医嘱关注", "班次交接"), ("在院患者数", "异常预警数", "巡视完成率", "体征异常率", "重点医嘱跟进率", "交接确认率"), ("workflow", "kanban", "matrix"), ("phone_tabs", "top_tabs", "side_menu"), ("移动护理监测工作台", "病区患者状态看板", "床旁巡视记录界面"), ("患者状态+预警队列", "床位看板+巡视任务", "体征趋势+交接摘要"), ("患者详情", "床位详情", "预警处理"), ("查询", "录入", "预警", "确认", "交接", "统计")),
+        IndustrySubtype("surgery_schedule", "手术排班协同系统", "医疗手术排班与科室协同", "手术申请、术前确认、手术间分配、麻醉协同、排班冲突提醒和术后归档", "面向手术室、麻醉科、临床科室和医务管理人员的手术安排协调平台", ("手术室护士", "麻醉医生", "临床医生", "医务管理员"), ("手术申请单", "患者手术信息", "术式需求", "术前确认清单", "手术间分配", "麻醉需求", "排班冲突提示"), ("今日待受理手术申请数", "今日已排程手术台次", "手术间空闲窗口数量", "排班冲突提示数量", "术前确认完成率", "术后归档完成率"), ("workflow", "kanban", "command"), ("top_tabs", "side_menu"), ("手术排班协调台", "手术室资源分配界面", "术前确认工作台"), ("手术申请+排班提醒", "手术间资源+冲突提示", "术前确认+术后归档"), ("手术申请详情", "排班分配面板", "术前确认清单"), ("查询", "追加", "修改", "查看", "失效", "导出")),
         IndustrySubtype("clinic_emr", "门诊电子病历系统", "医疗门诊诊疗服务", "挂号分诊、病历书写、处方审核、检查申请和随访质控", "面向医院门诊流程的诊疗记录和质控平台", ("医生", "护士", "药师", "质控人员"), ("患者档案", "门诊病历", "处方审核", "检查申请", "药品库存", "随访任务", "质控记录"), ("今日就诊量", "处方通过率", "平均候诊时长", "随访完成率", "库存预警数", "质控问题数"), ("workflow", "command", "matrix"), ("side_menu", "top_tabs"), ("诊疗工作台", "门诊质控看板", "处方审核管理界面"), ("就诊队列+处方待审", "患者轨迹+质控提醒", "药品预警+随访任务"), ("患者详情", "处方审核", "随访记录"), ("查询", "审核", "预警", "详情", "统计")),
         IndustrySubtype("hospital_inventory", "医院耗材库存系统", "医疗耗材与药品供应", "耗材入库、科室领用、效期预警、批次追踪和成本统计", "面向医院物资科和临床科室的耗材库存管理平台", ("库房管理员", "科室护士", "采购人员", "审计人员"), ("耗材批次", "入库单", "领用申请", "效期预警", "供应商", "盘点记录"), ("库存周转率", "近效期数量", "领用完成率", "采购到货率", "盘点差异数", "科室消耗额"), ("matrix", "workflow", "command"), ("side_menu", "rail"), ("医疗库存控制台", "耗材批次追踪界面", "科室领用审批台"), ("库存指标+预警队列", "批次追踪+领用审批", "采购入库+盘点差异"), ("批次详情", "领用审核", "导入盘点"), ("导入", "审核", "预警", "查询", "导出")),
     ),
@@ -66,12 +74,14 @@ INDUSTRY_SUBTYPES: dict[str, tuple[IndustrySubtype, ...]] = {
         IndustrySubtype("realtime_warehouse", "实时数仓调度系统", "实时数据仓库与调度", "流式采集、任务编排、作业监控、数据入仓、指标计算和异常重跑", "面向实时数据开发和运维的数据链路调度平台", ("数据开发员", "调度管理员", "运维监控员", "数据分析师"), ("流式任务", "调度队列", "作业实例", "指标宽表", "重跑记录", "延迟告警"), ("任务成功率", "平均延迟", "入仓数据量", "重跑次数", "指标产出数", "链路健康度"), ("pipeline", "kanban", "command"), ("top_tabs", "rail"), ("实时链路调度台", "任务编排看板", "数仓运行监控界面"), ("链路阶段+延迟趋势", "任务队列+异常重跑", "指标产出+质量告警"), ("任务详情", "重跑确认", "链路统计"), ("调度", "预警", "查询", "统计", "详情")),
     ),
     "人工智能软件": (
+        IndustrySubtype("smart_manufacturing", "智能制造生产运营平台", "智能制造与生产运营优化", "生产计划协同、生产工单管控、产线智能排程、换线调度、工序节拍监控、在制品流转、设备停机响应和产能预测", "面向制造企业计划、调度、车间执行、设备保障和交付管理人员的智能生产运营平台", ("生产主管", "计划员", "调度员", "车间主管", "设备工程师", "质量管理员"), ("主生产计划", "生产工单", "产线排程", "换线任务", "工序节拍", "在制品", "设备停机", "产能瓶颈"), ("计划达成率", "工单按期完工率", "产线负荷率", "节拍达标率", "在制品周转率", "设备开动率", "产能利用率", "交付达成率"), ("command", "pipeline", "matrix"), ("side_menu", "rail", "top_tabs"), ("智能制造生产指挥台", "产线排程协同界面", "生产运营监控工作台"), ("计划达成+工单队列", "产线负荷+排程冲突", "设备状态+交付风险"), ("排程甘特图", "工单主从详情", "异常处置工作台"), ("查询", "排程", "下达", "调整", "预警", "统计", "导出")),
         IndustrySubtype("mlops_platform", "MLOps模型管理平台", "人工智能模型工程", "数据集、标注任务、训练作业、模型评估、推理服务和漂移监控", "面向算法团队的模型全生命周期管理平台", ("算法管理员", "标注人员", "模型训练员", "业务审核员"), ("数据集", "标注任务", "训练作业", "模型版本", "评估指标", "推理服务", "漂移信号"), ("模型准确率", "训练成功率", "推理延迟", "样本通过率", "漂移告警数", "发布版本数"), ("pipeline", "kanban", "command"), ("side_menu", "top_tabs"), ("模型生命周期控制台", "训练任务看板", "推理服务监控界面"), ("训练链路+评估指标", "模型版本+发布审批", "推理调用+漂移监控"), ("训练详情", "发布审核", "漂移预警"), ("训练", "审核", "发布", "预警", "统计")),
         IndustrySubtype("intelligent_review", "智能审核平台", "智能识别与人工复核", "模型识别、风险标注、人工复核、纠错反馈和审核统计", "面向内容安全或业务审核场景的人机协同审核系统", ("审核管理员", "复核人员", "算法运营", "质检人员"), ("识别任务", "风险标签", "复核队列", "纠错样本", "审核结论", "质检记录"), ("自动通过率", "人工复核量", "误判率", "召回率", "平均审核时长", "纠错样本数"), ("risk", "kanban", "matrix"), ("top_tabs", "side_menu"), ("智能审核工作台", "人机复核队列界面", "模型质检看板"), ("风险标签+复核队列", "识别结果+质检样本", "模型指标+纠错反馈"), ("复核详情", "质检审核", "样本导入"), ("审核", "复核", "导入", "统计", "详情")),
     ),
     "VR软件": (
         IndustrySubtype("vr_training", "VR安全培训系统", "虚拟现实培训", "三维场景、设备校准、训练任务、成绩评分、体验记录和复盘分析", "面向培训机构或企业安全培训的沉浸式训练平台", ("内容管理员", "设备管理员", "培训教师", "体验学员"), ("虚拟场景", "训练任务", "VR设备", "交互脚本", "体验记录", "成绩评分", "复盘报告"), ("场景完成率", "设备在线率", "平均训练时长", "成绩达标率", "异常退出数", "复盘报告数"), ("pipeline", "command", "matrix"), ("side_menu", "top_tabs"), ("VR培训运营台", "沉浸训练任务界面", "设备与体验监控台"), ("场景任务+设备状态", "训练链路+成绩评分", "体验记录+复盘分析"), ("设备详情", "训练发布", "成绩统计"), ("发布", "审核", "统计", "详情", "预警")),
         IndustrySubtype("vr_showroom", "VR展厅内容管理系统", "虚拟展厅与数字内容", "展厅场景、素材资源、路线配置、讲解脚本、设备状态和访问统计", "面向数字展厅运营的VR内容发布与设备管理平台", ("展厅运营", "内容管理员", "设备管理员", "讲解人员"), ("展厅场景", "三维素材", "游览路线", "讲解脚本", "头显设备", "访问记录"), ("场景访问量", "素材审核数", "设备在线率", "平均停留时长", "路线完成率", "讲解触发量"), ("matrix", "pipeline", "command"), ("top_tabs", "side_menu"), ("VR展厅运营界面", "虚拟内容发布台", "设备巡检管理界面"), ("场景访问+素材审核", "路线配置+设备在线", "讲解脚本+访问统计"), ("素材审核", "路线配置", "设备详情"), ("审核", "发布", "查询", "统计", "导出")),
+        IndustrySubtype("vr_spatial_modeling", "三维空间建模与测绘平台", "三维空间建模与地理测绘", "空间模型导入、坐标配准、点云与倾斜摄影处理、模型分块编辑、质量检查和成果交付", "面向测绘、GIS和三维建模团队的空间数据生产与成果管理平台", ("测绘工程师", "三维建模人员", "质量检查人员", "成果审核人员"), ("测绘项目", "空间模型", "坐标控制点", "点云数据", "倾斜摄影", "模型分块", "纹理材质", "测绘成果"), ("模型接入成功率", "坐标配准误差", "点云处理进度", "分块接边通过率", "质量问题闭环率", "成果交付数量"), ("map", "pipeline", "matrix"), ("side_menu", "rail", "top_tabs"), ("三维空间生产工作台", "测绘模型编辑界面", "空间成果质量控制台"), ("三维场景+作业队列", "坐标配准+质量结果", "模型分块+成果交付"), ("模型编辑器", "坐标配准", "质量检查"), ("导入", "定位", "校验", "编辑", "审核", "导出")),
     ),
     "5G软件": (
         IndustrySubtype("private_network", "5G专网运维平台", "5G专网与边缘运维", "基站站点、网络切片、边缘节点、终端接入、QoS监控和告警派单", "面向行业专网运营团队的5G网络保障平台", ("网络管理员", "边缘节点管理员", "业务运营员", "监控人员"), ("基站站点", "网络切片", "边缘节点", "终端接入", "QoS指标", "告警派单", "流量趋势"), ("平均时延", "切片达标率", "边缘负载", "终端在线数", "告警闭环率", "流量峰值"), ("map", "pipeline", "command"), ("side_menu", "top_tabs"), ("5G专网监控台", "边缘节点运维界面", "切片保障工作台"), ("站点地图+切片指标", "边缘节点+告警派单", "QoS趋势+终端接入"), ("站点详情", "切片开通", "告警处置"), ("定位", "发布", "预警", "统计", "详情")),
@@ -86,6 +96,8 @@ INDUSTRY_SUBTYPES: dict[str, tuple[IndustrySubtype, ...]] = {
         IndustrySubtype("cold_chain_iot", "冷链物联网监管系统", "冷链物流与环境监测", "温湿度采集、车辆定位、箱体告警、运输轨迹、合规报表和远程处置", "面向冷链物流企业的环境监测和合规追踪平台", ("冷链管理员", "运输调度员", "告警处置员", "监管人员"), ("温湿度记录", "车辆轨迹", "冷箱设备", "超温告警", "运输批次", "合规报表"), ("温控达标率", "超温告警数", "车辆在线率", "批次追踪率", "处置响应时长", "合规报告数"), ("map", "risk", "command"), ("top_tabs", "side_menu"), ("冷链态势监管台", "运输轨迹监控界面", "温控告警处置台"), ("车辆地图+温控告警", "批次追踪+合规报表", "处置队列+设备状态"), ("轨迹详情", "告警确认", "报表导出"), ("定位", "预警", "查询", "导出", "详情")),
     ),
     "智慧城市软件": (
+        IndustrySubtype("rail_construction_quality", "轨道交通施工质量分析系统", "轨道交通工程施工质量管理", "标段与单位工程维护、施工工序检验、质量计划与检验点、检验批评定、材料进场复检、质量问题整改、验收归档和质量趋势分析", "面向轨道交通建设单位、施工单位、监理单位和质量管理人员的工程施工质量分析检验平台", ("建设单位质量负责人", "施工质量员", "监理工程师", "试验检测人员", "项目管理员"), ("工程结构树", "施工工序", "质量计划", "检验点", "检验批", "材料复检", "质量问题", "整改验收"), ("质量计划执行率", "检验点完成率", "检验批合格率", "主控项目合格率", "材料复检通过率", "质量问题闭环率", "整改平均时长", "验收通过率"), ("pipeline", "command", "matrix"), ("top_tabs", "side_menu", "rail"), ("轨道交通施工质量监控台", "工程质量检验工作台", "标段质量分析界面"), ("工程结构+质量态势", "工序检验+异常整改", "检验批+材料复检"), ("检验批详情", "质量问题整改", "材料复检记录"), ("查询", "检验", "评定", "整改", "验收", "统计", "导出")),
+        IndustrySubtype("transport_route", "交通干支线路径适配系统", "智慧交通与运输线路调度", "干线支线维护、路径适配、站点接驳、班次衔接、换乘规则和线路运行统计", "面向交通运输管理单位的干支线路径适配与协同调度平台", ("线路管理员", "调度员", "站点运营员", "统计分析员"), ("干线线路", "支线线路", "站点接驳", "路径适配", "班次计划", "换乘规则", "运行统计"), ("线路覆盖率", "班次准点率", "接驳成功率", "路径匹配率", "换乘耗时", "异常班次数"), ("map", "workflow", "command"), ("side_menu", "top_tabs"), ("交通线路调度台", "干支线路径适配界面", "站点接驳运行看板"), ("线路地图+班次指标", "路径适配+接驳规则", "换乘分析+运行统计"), ("线路详情", "路径适配", "班次调整"), ("定位", "查询", "追加", "调度", "统计", "导出")),
         IndustrySubtype("scenic_ticketing", "景区票务门禁系统", "智慧景区与票务通行", "票务订单、团队预约、闸机核验、年卡会员、客流预警和经营统计", "面向景区运营管理的票务、门禁和客流协同平台", ("景区运营员", "票务管理员", "门禁管理员", "统计分析员"), ("票种配置", "票务订单", "团队预约", "闸机核验", "年卡会员", "客流预警", "经营报表"), ("核验成功率", "票务收入", "客流峰值", "退改审核数", "年卡续费率", "团队预约量"), ("map", "command", "workflow"), ("top_tabs", "side_menu"), ("景区运营态势台", "票务门禁管理界面", "客流预警指挥台"), ("客流地图+票务指标", "闸机核验+退改审核", "团队预约+经营统计"), ("订单详情", "退改审核", "闸机预警"), ("定位", "审核", "预警", "统计", "导出")),
         IndustrySubtype("urban_event", "城市事件协同处置平台", "城市治理与事件协同", "事件上报、网格派单、部门协同、现场核验、结案归档和态势统计", "面向城市治理部门的事件闭环处置平台", ("指挥中心", "网格员", "处置部门", "督办人员"), ("事件上报", "网格派单", "部门协同", "现场核验", "督办任务", "结案归档"), ("事件办结率", "平均响应时长", "超期事件数", "网格覆盖率", "督办完成率", "群众满意度"), ("map", "kanban", "command"), ("side_menu", "top_tabs"), ("城市事件指挥台", "网格派单看板", "部门协同处置界面"), ("事件地图+派单队列", "处置流程+超期预警", "督办任务+办结统计"), ("事件详情", "派单审核", "结案归档"), ("定位", "审核", "预警", "详情", "统计")),
     ),
@@ -98,24 +110,169 @@ DEFAULT_SUBTYPES = (
 
 
 def select_industry_subtype(task: GenerationTask) -> IndustrySubtype:
-    choices = INDUSTRY_SUBTYPES.get(task.product_type, DEFAULT_SUBTYPES)
-    seed = _seed_value(task, "industry-subtype")
-    return choices[seed % len(choices)]
+    return select_industry_subtype_for_context(task)
+
+
+def select_industry_subtype_for_context(task: GenerationTask, context_text: str = "") -> IndustrySubtype:
+    product_type = _context_product_type(task, context_text)
+    choices = INDUSTRY_SUBTYPES.get(product_type, DEFAULT_SUBTYPES)
+    matched = _keyword_matched_subtype(task, choices, "")
+    if not matched and context_text:
+        matched = _keyword_matched_subtype(task, choices, context_text)
+    if matched:
+        return matched
+    if product_type in {"APP", "智慧城市软件"}:
+        return DEFAULT_SUBTYPES[0]
+    return choices[0] if choices else DEFAULT_SUBTYPES[0]
+
+
+def _context_product_type(task: GenerationTask, context_text: str = "") -> str:
+    input_text = _task_input_text(task)
+    primary_text = f"{input_text} {task.product_type}"
+    domain_text = f"{input_text} {context_text}"
+    full_text = f"{primary_text} {context_text}"
+    if re.search(r"(?:APP|App|app)(?:\b|二期|平台|系统|服务)?", input_text) and not re.search(
+        r"后台|管理后台|运营后台|控制台|管理端|商家端|门店端|平台端|PC端|Web端",
+        input_text,
+    ):
+        return "APP"
+    if _has_rail_construction_quality_signal(domain_text):
+        return "智慧城市软件"
+    if re.search(r"医疗|医院|诊疗|处方|病历|药品|随访|护理|患者|手术|麻醉|科室|医生|住院|病区|床位|生命体征|医嘱", full_text):
+        return "医疗软件"
+    if re.search(r"云计算|云资源|云主机|云平台|容器|集群|Kubernetes|K8S|k8s|资源编排|弹性伸缩|租户|SaaS", full_text):
+        return "云计算软件"
+    if task.product_type in INDUSTRY_SUBTYPES and _strong_product_type_signal(task.product_type, primary_text):
+        return task.product_type
+    if _has_transport_domain_signal(domain_text):
+        return "智慧城市软件" if task.product_type not in {"地理信息软件", "物联网软件"} else task.product_type
+    if _has_transport_domain_signal(primary_text):
+        return "智慧城市软件" if task.product_type == "智慧城市软件" else task.product_type
+    return task.product_type
+
+
+def _strong_product_type_signal(product_type: str, text: str) -> bool:
+    if product_type in {"APP", "小程序"}:
+        return False
+    if product_type == "智慧城市软件":
+        return bool(re.search(r"智慧城市|交通|运输|城市|网格|事件|线路|路径|站点|接驳", text))
+    if product_type == "医疗软件":
+        return bool(re.search(r"医疗|医院|诊疗|处方|病历|药品|随访|护理|患者|检验|手术|麻醉|科室|医生", text))
+    if product_type == "云计算软件":
+        return bool(re.search(r"云计算|云资源|云主机|容器|集群|Kubernetes|K8S|k8s|租户", text))
+    return bool(product_type and product_type in text)
+
+
+def _has_rail_construction_quality_signal(text: str) -> bool:
+    value = str(text or "")
+    rail_signal = bool(re.search(r"轨道交通|地铁|铁路|轨道工程|隧道工程|车站工程", value))
+    quality_signal = bool(re.search(r"施工质量|工程质量|检验批|检验点|质量计划|材料复检|整改验收|工程部位|单位工程|标段", value))
+    return rail_signal and quality_signal
+
+
+def _keyword_matched_subtype(task: GenerationTask, choices: tuple[IndustrySubtype, ...], context_text: str = "") -> IndustrySubtype | None:
+    query_text = f"{task.software_name} {task.feature_hint} {task.product_type} {context_text}".lower()
+    best: tuple[int, IndustrySubtype] | None = None
+    for subtype in choices:
+        if subtype.key == "rail_construction_quality" and not _has_rail_construction_quality_signal(query_text):
+            continue
+        score = 0
+        for keyword in _explicit_subtype_keywords(subtype):
+            if keyword.lower() in query_text:
+                score += 3
+        subtype_text = " ".join(
+            [
+                subtype.title,
+                subtype.industry,
+                subtype.scenario,
+                subtype.positioning,
+                " ".join(subtype.domain_terms),
+                " ".join(subtype.metrics),
+            ]
+        ).lower()
+        for keyword in _task_match_keywords(task, context_text):
+            if keyword in subtype_text:
+                score += 1
+        if score and (best is None or score > best[0]):
+            best = (score, subtype)
+    return best[1] if best else None
+
+
+def _task_match_keywords(task: GenerationTask, context_text: str = "") -> list[str]:
+    text = f"{_task_input_text(task)} {task.product_type} {context_text}"
+    return [item.lower() for item in re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]{2,}", text) if len(item.strip()) >= 2]
+
+
+def _task_input_text(task: GenerationTask) -> str:
+    feature_hint = getattr(task, "input_feature_hint", None)
+    if feature_hint is None:
+        feature_hint = task.feature_hint
+    return f"{task.software_name} {feature_hint or ''}".strip()
+
+
+def _explicit_subtype_keywords(subtype: IndustrySubtype) -> tuple[str, ...]:
+    if subtype.key == "design_viewer":
+        return ("Figma", "设计文件", "设计资源", "页面画板", "画布预览", "图层组件", "原型演示", "设计评审", "设计版本")
+    if subtype.key == "download_manager":
+        return ("下载链接", "下载任务", "下载队列", "后台下载", "下载进度", "断点续传", "已下载文件", "下载记录")
+    if subtype.key == "agency_accounting":
+        return ("代理记账", "代账", "财税代办", "核算账套", "记账凭证", "银行对账", "月末结账", "税务申报")
+    if subtype.key == "workforce_attendance":
+        return ("考勤", "打卡", "签到", "签退", "补卡", "请假", "出勤", "迟到", "早退", "班次排班")
+    if subtype.key == "community_service":
+        return ("社区预约", "社区服务", "预约服务", "场地预约", "活动预约", "上门预约", "门店预约", "社区生活")
+    if subtype.key == "rail_construction_quality":
+        return ("轨道交通", "地铁", "铁路", "施工质量", "工程质量", "检验批", "检验点", "质量计划", "材料复检", "整改", "验收", "标段", "单位工程", "工程部位")
+    if subtype.key == "smart_manufacturing":
+        return ("智能制造", "生产", "制造", "产线", "工单", "工序", "排程", "换线", "节拍", "在制品", "停机", "产能", "良率", "交付")
+    if subtype.key == "inpatient_monitoring":
+        return ("在院", "住院", "病区", "床位", "生命体征", "体征", "护理", "患者", "医嘱", "巡视", "交接", "预警")
+    if subtype.key == "surgery_schedule":
+        return ("手术", "手术室", "术前", "术后", "术式", "麻醉", "科室", "医生", "护士")
+    if subtype.key == "transport_route":
+        return ("交通", "运输", "干线", "支线", "线路", "路径", "班次", "接驳", "换乘", "站点", "公交", "客运")
+    if subtype.key == "vr_spatial_modeling":
+        return ("测绘", "GIS", "地理信息", "空间模型", "三维模型", "实景三维", "点云", "倾斜摄影", "坐标配准", "控制点", "模型分块", "纹理贴合")
+    return ()
 
 
 def subtype_module_specs(subtype: IndustrySubtype, fallback_specs: list[tuple[str, str, str, list[str]]]) -> list[tuple[str, str, str, list[str]]]:
     specs: list[tuple[str, str, str, list[str]]] = []
+    used_keys: set[str] = set()
     for index, term in enumerate(subtype.domain_terms[:7], start=1):
         title = _module_title(term)
-        key = f"{subtype.key}_{index:02d}"
+        raw_key = _subtype_module_raw_key(subtype.key, term)
+        key = semantic_module_key(
+            title,
+            index,
+            raw_key=raw_key,
+            used=used_keys,
+            context_terms=[term, subtype.title, subtype.scenario, subtype.positioning],
+        )
+        if is_placeholder_module_key(key):
+            key = f"{subtype.key}_feature_{index:02d}"
+        used_keys.add(key)
         desc = f"围绕{subtype.title}中的{term}提供业务录入、状态跟踪、异常处理和统计分析。"
         entities = [f"{_ascii_prefix(subtype.key)}Record{index}", f"{_ascii_prefix(subtype.key)}Flow{index}"]
         specs.append((key, title, desc, entities))
     return specs or fallback_specs
 
 
+def _subtype_module_raw_key(subtype_key: str, term: str) -> str:
+    if subtype_key == "workforce_attendance":
+        return {
+            "班次排班": "shift_schedule",
+            "上下班打卡": "clock_in_out",
+            "补卡申请": "missed_punch_request",
+            "请假申请": "leave_request",
+            "异常考勤": "attendance_exception",
+            "出勤统计": "attendance_statistics",
+        }.get(str(term or ""), "")
+    return ""
+
+
 def build_ui_design_brief(task: GenerationTask, blueprint: Any | None = None) -> dict[str, Any]:
-    subtype = select_industry_subtype(task)
+    subtype = select_industry_subtype_for_context(task, _blueprint_context_text(blueprint))
     design_dna = build_design_dna(task, subtype)
     structure_seed = _seed_value(task, f"ui-combo|{subtype.key}")
     visual_seed = _seed_value(task, f"ui-visual|{subtype.key}")
@@ -174,6 +331,30 @@ def build_ui_design_brief(task: GenerationTask, blueprint: Any | None = None) ->
         "accent_soft": palette["accent_soft"],
         "sidebar": palette["sidebar"],
     }
+
+
+def _blueprint_context_text(blueprint: Any | None) -> str:
+    if blueprint is None:
+        return ""
+    parts: list[str] = []
+    for attr in ["software_name", "product_type", "industry", "purpose", "summary", "scenario", "positioning", "industry_subtype"]:
+        value = getattr(blueprint, attr, "")
+        if value:
+            parts.append(str(value))
+    for attr in ["target_users", "roles", "business_objects", "report_metrics", "quality_rules", "technical_features"]:
+        values = getattr(blueprint, attr, []) or []
+        if isinstance(values, (list, tuple)):
+            parts.extend(str(item) for item in values[:12] if str(item).strip())
+    for module in getattr(blueprint, "modules", []) or []:
+        parts.extend(
+            [
+                str(getattr(module, "title", "") or ""),
+                str(getattr(module, "description", "") or ""),
+                " ".join(str(item) for item in (getattr(module, "operations", []) or [])[:5]),
+                " ".join(str(item) for item in (getattr(module, "data_fields", []) or [])[:5]),
+            ]
+        )
+    return " ".join(part for part in parts if part)
 
 
 def _seed_value(task: GenerationTask, salt: str) -> int:

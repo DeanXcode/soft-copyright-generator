@@ -1,0 +1,355 @@
+{
+  "started_at": "2026-11-12T10:57:51.684226+08:00",
+  "finished_at": "2026-11-12T12:03:18.841306+08:00",
+  "model": "gpt-6-sol",
+  "scope": "fresh outputs, same confirmed outlines/feature hints/seeds as baseline; current source; no manual content edits; no resumed results counted as first-pass",
+  "definition": "Process exit 0, existing ready_for_delivery gate true and ZIP exists. Initial task includes bounded internal retries; no post-failure resume or manual edits. This is not final client content acceptance.",
+  "baseline": {
+    "sample_count": 3,
+    "first_pass_full_success": 0,
+    "after_one_resume_full_success": 0,
+    "source": "docs/deliverables/2026-11-10/真实API生成成功率实测数据.json"
+  },
+  "rates": {
+    "sample_count": 3,
+    "first_pass_full_success": 2
+  },
+  "samples": [
+    {
+      "id": 3,
+      "name": "社区患者随访管理软件",
+      "status": "complete",
+      "passed": true,
+      "elapsed_seconds": 1271.2,
+      "exit_code": 0,
+      "timed_out": false,
+      "ready_for_delivery": true,
+      "zip_path": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\api-regression-20261112-105751\\sample-3\\output\\社区患者随访管理软件-real-run-192936-3--材料包.zip",
+      "message": "",
+      "warnings": [
+        "说明书截图后的操作步骤密度偏低，建议复核截图页是否紧跟入口、字段、保存结果和后续处理说明。",
+        "说明书部分正文页的 PDF 可提取文本少于 30 行，已按字符量和业务操作内容综合判定通过；提交前建议人工复核版面。"
+      ],
+      "checks": {
+        "ui_screenshot_count": 35,
+        "page_spec_count": 35,
+        "ui_ai_frontend_ready": true,
+        "ui_visual_reference_ready": true,
+        "ui_operation_result_evidence_ready": true,
+        "manual_pdf_page_count": 31,
+        "source_pdf_page_count": 60,
+        "pdf_conversion_method": "libreoffice",
+        "manual_template_risk_level": "low",
+        "manual_pdf_line_requirement_risk_pages": [
+          {
+            "page": 3,
+            "line_count": 29,
+            "character_count": 830
+          },
+          {
+            "page": 30,
+            "line_count": 29,
+            "character_count": 1042
+          }
+        ],
+        "material_consistency_ready": false,
+        "material_business_object_hits": 1,
+        "material_metric_hits": 0,
+        "authenticity_score": 87,
+        "normative_score": 100,
+        "frontend_page_request_timing": {
+          "count": 35,
+          "min_seconds": 7.447,
+          "max_seconds": 146.124,
+          "avg_seconds": 38.541,
+          "p95_seconds": 110.986
+        },
+        "provider_retry_summary": {
+          "logical_requests": 35,
+          "request_attempts": 36,
+          "provider_retries": 1,
+          "error_categories": {
+            "timeout": 1
+          },
+          "stop_reasons": {}
+        },
+        "validation_ready_for_delivery": true
+      },
+      "trace": {
+        "event_counts": {
+          "blueprint_attempt_begin": 1,
+          "chat_json_begin": 15,
+          "provider_request_begin": 52,
+          "provider_request_success": 51,
+          "chat_json_success": 15,
+          "blueprint_contract_modules_reused": 1,
+          "blueprint_attempt_success": 1,
+          "architecture_selection_success": 1,
+          "ai_visual_prompt_begin": 1,
+          "ai_visual_prompt_success": 1,
+          "provider_image_request_begin": 1,
+          "provider_image_request_success": 1,
+          "ai_frontend_provider_config": 1,
+          "ai_frontend_reference_contract_ready": 1,
+          "provider_request_error": 1
+        },
+        "finish_reasons": {
+          "stop": 51
+        },
+        "reported_usage": {
+          "prompt_tokens": 1051596,
+          "completion_tokens": 58553,
+          "total_tokens": 1110149
+        },
+        "requests_reporting_usage": 51,
+        "errors": [
+          {
+            "event": "provider_request_error",
+            "label": "page_spec:followup_outcome_reports_operation_2_2",
+            "attempt": 1,
+            "error_category": "timeout",
+            "error": "模型网关连接: Read timed out. (read timeout=120)"
+          }
+        ],
+        "syntax_repairs": []
+      },
+      "quality_repairs": [],
+      "final_content_accepted": false,
+      "artifact_counts_on_disk": {
+        "screenshots": 35,
+        "page_specs": 35,
+        "zip_exists": true
+      }
+    },
+    {
+      "id": 1,
+      "name": "聚合剪辑软件",
+      "status": "complete",
+      "passed": true,
+      "elapsed_seconds": 1321.2,
+      "exit_code": 0,
+      "timed_out": false,
+      "ready_for_delivery": true,
+      "zip_path": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\api-regression-20261112-105751\\sample-1\\output\\聚合剪辑软件-real-run-192936-1--材料包.zip",
+      "message": "",
+      "warnings": [
+        "说明书截图后的操作步骤密度偏低，建议复核截图页是否紧跟入口、字段、保存结果和后续处理说明。",
+        "说明书部分正文页的 PDF 可提取文本少于 30 行，已按字符量和业务操作内容综合判定通过；提交前建议人工复核版面。"
+      ],
+      "checks": {
+        "ui_screenshot_count": 27,
+        "page_spec_count": 27,
+        "ui_ai_frontend_ready": true,
+        "ui_visual_reference_ready": true,
+        "ui_operation_result_evidence_ready": true,
+        "manual_pdf_page_count": 32,
+        "source_pdf_page_count": 60,
+        "pdf_conversion_method": "libreoffice",
+        "manual_template_risk_level": "low",
+        "manual_pdf_line_requirement_risk_pages": [
+          {
+            "page": 3,
+            "line_count": 27,
+            "character_count": 759
+          },
+          {
+            "page": 31,
+            "line_count": 27,
+            "character_count": 975
+          }
+        ],
+        "material_consistency_ready": false,
+        "material_business_object_hits": 0,
+        "material_metric_hits": 0,
+        "authenticity_score": 85,
+        "normative_score": 100,
+        "frontend_page_request_timing": {
+          "count": 27,
+          "min_seconds": 10.569,
+          "max_seconds": 110.114,
+          "avg_seconds": 34.996,
+          "p95_seconds": 107.662
+        },
+        "provider_retry_summary": {
+          "logical_requests": 28,
+          "request_attempts": 28,
+          "provider_retries": 0,
+          "error_categories": {},
+          "stop_reasons": {}
+        },
+        "validation_ready_for_delivery": true
+      },
+      "trace": {
+        "event_counts": {
+          "blueprint_attempt_begin": 1,
+          "chat_json_begin": 19,
+          "provider_request_begin": 48,
+          "provider_request_success": 48,
+          "chat_json_success": 19,
+          "blueprint_contract_modules_reused": 1,
+          "blueprint_attempt_success": 1,
+          "architecture_selection_success": 1,
+          "ai_visual_prompt_begin": 1,
+          "ai_visual_prompt_success": 1,
+          "provider_image_request_begin": 1,
+          "provider_image_request_success": 1,
+          "ai_frontend_provider_config": 1,
+          "ai_frontend_reference_contract_ready": 1,
+          "ai_frontend_quality_repair": 1
+        },
+        "finish_reasons": {
+          "stop": 48
+        },
+        "reported_usage": {
+          "prompt_tokens": 762034,
+          "completion_tokens": 47727,
+          "total_tokens": 809761
+        },
+        "requests_reporting_usage": 48,
+        "errors": [
+          {
+            "event": "ai_frontend_quality_repair",
+            "page_key": "login",
+            "error_category": "quality_error",
+            "reason": "登录页缺少密码字段"
+          }
+        ],
+        "syntax_repairs": []
+      },
+      "quality_repairs": [
+        {
+          "event": "ai_frontend_quality_repair",
+          "page_key": "login",
+          "reason": "登录页缺少密码字段",
+          "error_category": "quality_error"
+        }
+      ],
+      "final_content_accepted": false,
+      "artifact_counts_on_disk": {
+        "screenshots": 27,
+        "page_specs": 27,
+        "zip_exists": true
+      }
+    },
+    {
+      "id": 2,
+      "name": "校园作业批改与学情分析软件",
+      "status": "complete",
+      "passed": false,
+      "elapsed_seconds": 1334.5,
+      "exit_code": 1,
+      "timed_out": false,
+      "ready_for_delivery": false,
+      "zip_path": "",
+      "message": "statistics 页面存在文字溢出、越界或重叠：div.chart-grid-lines: 4",
+      "warnings": [
+        "statistics 页面存在文字溢出、越界或重叠：div.chart-grid-lines: 4"
+      ],
+      "checks": {
+        "ui_visual_reference_ready": true
+      },
+      "trace": {
+        "event_counts": {
+          "blueprint_attempt_begin": 1,
+          "chat_json_begin": 19,
+          "provider_request_begin": 55,
+          "provider_request_success": 55,
+          "chat_json_success": 19,
+          "blueprint_contract_modules_reused": 1,
+          "blueprint_attempt_success": 1,
+          "architecture_selection_success": 1,
+          "ai_visual_prompt_begin": 1,
+          "ai_visual_prompt_success": 1,
+          "provider_image_request_begin": 1,
+          "provider_image_request_success": 1,
+          "ai_frontend_provider_config": 1,
+          "ai_frontend_reference_contract_ready": 1
+        },
+        "finish_reasons": {
+          "stop": 55
+        },
+        "reported_usage": {
+          "prompt_tokens": 843049,
+          "completion_tokens": 59742,
+          "total_tokens": 902791
+        },
+        "requests_reporting_usage": 55,
+        "errors": [],
+        "syntax_repairs": []
+      },
+      "quality_repairs": [],
+      "final_content_accepted": false,
+      "artifact_counts_on_disk": {
+        "screenshots": 34,
+        "page_specs": 35,
+        "zip_exists": false
+      }
+    }
+  ],
+  "aggregate": {
+    "events": {
+      "blueprint_attempt_begin": 3,
+      "chat_json_begin": 53,
+      "provider_request_begin": 155,
+      "provider_request_success": 154,
+      "chat_json_success": 53,
+      "blueprint_contract_modules_reused": 3,
+      "blueprint_attempt_success": 3,
+      "architecture_selection_success": 3,
+      "ai_visual_prompt_begin": 3,
+      "ai_visual_prompt_success": 3,
+      "provider_image_request_begin": 3,
+      "provider_image_request_success": 3,
+      "ai_frontend_provider_config": 3,
+      "ai_frontend_reference_contract_ready": 3,
+      "provider_request_error": 1,
+      "ai_frontend_quality_repair": 1
+    },
+    "finish_reasons": {
+      "stop": 154
+    },
+    "reported_usage_on_successful_text_requests": {
+      "prompt_tokens": 2656679,
+      "completion_tokens": 166022,
+      "total_tokens": 2822701
+    }
+  },
+  "source_sha256": {
+    "backend/softcopyright/llm/provider.py": "9e5ad9f44de661972da721670f2e3d09c46c7ba4302f83e68e762b6b2da4ee5f",
+    "backend/softcopyright/llm/json_response.py": "d0bbc182b42d9cbcfc550365f7f2aa482c2a4b1ad43548cdd178ceb1c38c3142",
+    "backend/softcopyright/llm_blueprint.py": "6641c0723c8eb1e8a015ed8e602ef5fe381ca753b1ef21637a524b334116a9f2",
+    "backend/softcopyright/frontend_codegen/page_spec_request.py": "98debc0eff7b9d28656d89bf8f39388f02f581423bd22784fc5ce4306e931cb4",
+    "backend/softcopyright/ai_frontend_codegen.py": "fd12e40ccd10853062d371ddd29939b400d9d67e65ef070814db42b44762d8d2",
+    "backend/softcopyright/llm_architecture.py": "3d986c0b7b36b57c92d5ddd3234b647694f2148c2dfeefc6ec4a41cff801520e",
+    "backend/softcopyright/ui_blueprint.py": "080b1c666bd7e65bbb11cbd6a4d91dd0a580f0ff6a0470b2ff2b535882d63726",
+    "backend/softcopyright/llm_manual.py": "48893c1a38b98c7463e156aa59b794e58cb8fef2c9b401f75e93191bda82bb80",
+    "backend/softcopyright/feature_inference.py": "6be7415ac195057bec19342ef02b0284798f492d137a4c1a5c886a5513289ca1"
+  },
+  "source_hashes_match_at_export": true,
+  "exploratory_run": "tmp/api-regression-20261112-104738/summary.json",
+  "automated_tests": {
+    "count": 353,
+    "passed": true,
+    "seconds": 37.734
+  },
+  "template_smoke": {
+    "passed": true,
+    "screenshots": 27,
+    "included_in_api_rate": false
+  },
+  "api_config_modified": false,
+  "new_installer_built": false,
+  "failed_sample_local_reproduction": {
+    "sample_id": 2,
+    "paid_api_calls": 0,
+    "source_modified": false,
+    "evidence": "tmp/education-layout-review/evidence.json",
+    "screenshot": "tmp/education-layout-review/statistics-after-existing-repair.png",
+    "finding": "Statistics grid occludes a metric card; original PageSpec values are also overwritten or replaced by generic renderer/runtime fallbacks. Original failure remains counted."
+  },
+  "limitations": [
+    "Three-sample regression cannot establish long-term reliability.",
+    "Gateway-reported usage excludes unknown failed-request usage and image billing.",
+    "Read-only spot checks found material consistency and visual quality gaps; final client acceptance remains pending."
+  ]
+}

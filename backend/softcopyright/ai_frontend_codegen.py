@@ -1,0 +1,4245 @@
+from __future__ import annotations
+
+import base64
+import copy
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from hashlib import sha256
+from html import escape
+import io
+import json
+import os
+import re
+import shutil
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+from .blueprint import FeatureModule, ProductBlueprint
+from .errors import sanitize_error_message
+from .frontend_codegen.legacy_fallback import LEGACY_FALLBACK_VERSION, legacy_cache_key, requires_legacy_fallback
+from .frontend_codegen.page_spec import (
+    COMPONENT_LIBRARY_VERSION,
+    FRONTEND_ENGINE_VERSION,
+    PAGE_SPEC_SCHEMA_VERSION,
+    PageSpecValidationError,
+    page_spec_cache_key,
+    page_spec_manifest,
+    repair_cached_page_spec_columns,
+)
+from .frontend_codegen.page_spec_renderer import render_page_spec
+from .frontend_codegen.page_spec_request import request_page_spec
+from .frontend_codegen.reference_style import REFERENCE_STYLE_VERSION, component_style_css, resolve_reference_style
+from .frontend_codegen.vite_build import (
+    build_react_vite_bundle as _build_react_vite_bundle,
+    frontend_node_module_root as _frontend_node_module_root,
+    react_build_error_detail as _react_build_error_detail,
+)
+from .llm.provider import (
+    LLMProvider,
+    LocalTemplateProvider,
+    TextErrorCategory,
+    TextProviderError,
+    TextRetryPolicy,
+    classify_text_error,
+    image_model_name,
+    _inspect_generated_image,
+)
+from .llm.trace import trace_event
+from .llm.json_response import parse_json_object
+from .models import GenerationTask
+from .navigation_contract import (
+    NAVIGATION_CONTRACT_VERSION,
+    build_navigation_contracts,
+    navigation_page_catalog,
+    navigation_contract_summary,
+)
+from .packager import write_json
+from .ui_blueprint import UiBlueprint
+
+
+MODEL_GENERATED_REACT_VERSION = "model-generated-react-v1"
+
+
+def _model_generated_react_cache_key(creative_key: str) -> str:
+    return sha256(f"{creative_key}|{MODEL_GENERATED_REACT_VERSION}".encode("utf-8")).hexdigest()
+
+
+def generate_ai_frontend_pages(
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    screenshots: list[Any],
+    provider: LLMProvider | None,
+    emit=None,
+    require_llm: bool = False,
+    visual_reference_report: dict[str, Any] | None = None,
+    codegen_progress_start: int = 44,
+) -> dict[str, Any]:
+    if provider is None or isinstance(provider, LocalTemplateProvider):
+        if require_llm:
+            raise RuntimeError("正式 GPT 流程要求由 GPT 生成界面页面代码，请配置 GPT/OpenAI-compatible。")
+        return {"enabled": False, "ready": False, "source": "local-template", "pages": []}
+    if not screenshots:
+        raise RuntimeError("AI 前端代码生成缺少截图页面清单。")
+
+    pages: list[dict[str, Any]] = []
+    module_by_key = {module.key: module for module in blueprint.modules}
+    design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
+    context = _codegen_context(task, blueprint, ui_blueprint)
+    if not isinstance(visual_reference_report, dict) or not visual_reference_report:
+        visual_reference_report = generate_style_reference_assets(
+            task=task,
+            blueprint=blueprint,
+            ui_blueprint=ui_blueprint,
+            screenshots=screenshots,
+            provider=provider,
+            emit=emit,
+            require_llm=require_llm,
+        )
+    style_reference = visual_reference_report.get("style_reference")
+    if not isinstance(style_reference, dict):
+        style_reference = next(
+            (item for item in visual_reference_report.get("pages", []) if isinstance(item, dict) and item.get("ready")),
+            {},
+        )
+    if require_llm and not visual_reference_report.get("ready"):
+        raise RuntimeError("正式 GPT 流程要求先生成 gpt-image-2 全局视觉风格参考图，当前参考图未生成。")
+    provider = _frontend_provider(provider)
+    renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
+    if _use_react_framework(renderer):
+        return _generate_react_frontend_pages(
+            task=task,
+            blueprint=blueprint,
+            ui_blueprint=ui_blueprint,
+            screenshots=screenshots,
+            module_by_key=module_by_key,
+            provider=provider,
+            visual_reference_report=visual_reference_report,
+            style_reference=style_reference,
+            emit=emit,
+            codegen_progress_start=codegen_progress_start,
+        )
+    if _use_stable_component_shell(renderer):
+        return _generate_stable_component_shell_pages(
+            task=task,
+            blueprint=blueprint,
+            ui_blueprint=ui_blueprint,
+            screenshots=screenshots,
+            module_by_key=module_by_key,
+            visual_reference_report=visual_reference_report,
+            style_reference=style_reference,
+            emit=emit,
+            codegen_progress_start=codegen_progress_start,
+        )
+    total = len(screenshots)
+    for index, item in enumerate(screenshots, start=1):
+        progress = codegen_progress_start + min(4, int(index / max(total, 1) * 4))
+        _emit(emit, progress, f"根据全局视觉风格参考图生成界面代码 {index}/{total}")
+        module = module_by_key.get(str(getattr(item, "module_key", "") or ""))
+        reference = style_reference
+        if require_llm and not _visual_reference_ready(reference):
+            raise RuntimeError("缺少 gpt-image-2 全局视觉风格参考图。")
+        creative_key = _page_creative_key(task, design_brief, item)
+        cached_page = _load_reusable_page(item, creative_key=creative_key)
+        if cached_page:
+            pages.append(
+                {
+                    "key": str(getattr(item, "key", "")),
+                    "file": cached_page.name,
+                    "page_kind": str(getattr(item, "page_kind", "") or "general"),
+                    "module_key": str(getattr(item, "module_key", "") or ""),
+                    "source": "llm-html-cache",
+                    "visual_reference": _report_reference_summary(reference),
+                    "reused": True,
+                }
+            )
+            trace_event(
+                "ai_frontend_page_reused",
+                page_key=str(getattr(item, "key", "") or cached_page.stem),
+                file=cached_page.name,
+                index=index,
+                total=total,
+            )
+            continue
+        try:
+            html = _generate_page_html(
+                task=task,
+                blueprint=blueprint,
+                ui_blueprint=ui_blueprint,
+                provider=provider,
+                screenshot=item,
+                module=module,
+                visual_reference=reference,
+                context=context,
+                design_brief=design_brief,
+                index=index,
+                total=total,
+            )
+            html = _stamp_creative_key(html, creative_key)
+            html_path = Path(str(getattr(item, "html_path", "")))
+            if not str(html_path).strip() or html_path.name == "":
+                raise RuntimeError(f"{getattr(item, 'key', 'page')} 缺少界面 HTML 输出路径。")
+            html_path.parent.mkdir(parents=True, exist_ok=True)
+            html_path.write_text(html, encoding="utf-8")
+            pages.append(
+                {
+                    "key": str(getattr(item, "key", "")),
+                    "file": html_path.name,
+                    "page_kind": str(getattr(item, "page_kind", "") or "general"),
+                    "module_key": str(getattr(item, "module_key", "") or ""),
+                    "source": "llm-html",
+                    "visual_reference": _report_reference_summary(reference),
+                }
+            )
+        except Exception as exc:
+            if require_llm:
+                raise RuntimeError(f"{getattr(item, 'key', 'page')} AI 界面代码生成失败：{exc}") from exc
+            return {
+                "enabled": True,
+                "ready": False,
+                "source": "gpt-style-reference-image2-to-html",
+                "error": str(exc)[:240],
+                "visual_references": visual_reference_report,
+                "pages": pages,
+            }
+    return {
+        "enabled": True,
+        "ready": len(pages) == total,
+        "source": "gpt-style-reference-image2-to-html",
+        "page_count": len(pages),
+        "visual_references": visual_reference_report,
+        "pages": pages,
+    }
+
+
+def _use_stable_component_shell(renderer: str) -> bool:
+    mode = os.getenv("SOFT_AI_FRONTEND_MODE", "react-vite").strip().lower()
+    return renderer == "admin" and mode in {"stable-component-shell", "stable-shell", "component-shell"}
+
+
+def _use_react_framework(renderer: str) -> bool:
+    mode = os.getenv("SOFT_AI_FRONTEND_MODE", "react-vite").strip().lower()
+    return mode not in {"llm-html", "freeform-html", "legacy", "stable-component-shell", "stable-shell", "component-shell"}
+
+
+def _uses_model_generated_react(design_brief: dict[str, Any] | None) -> bool:
+    brief = design_brief if isinstance(design_brief, dict) else {}
+    return str(brief.get("industry_subtype_key") or "").strip() == "design_viewer"
+
+
+def _requires_direct_react(renderer: str, screenshot: Any, design_brief: dict[str, Any] | None) -> bool:
+    return _uses_model_generated_react(design_brief) or requires_legacy_fallback(renderer, screenshot)
+
+
+def _generate_react_frontend_pages(
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    screenshots: list[Any],
+    module_by_key: dict[str, FeatureModule],
+    provider: LLMProvider,
+    visual_reference_report: dict[str, Any],
+    style_reference: dict[str, Any],
+    emit=None,
+    codegen_progress_start: int = 50,
+) -> dict[str, Any]:
+    prototype_dir = Path(str(getattr(screenshots[0], "html_path", ""))).parent
+    react_dir = prototype_dir / "react-app"
+    screens_dir = react_dir / "src" / "screens"
+    screens_dir.mkdir(parents=True, exist_ok=True)
+    design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
+    model_generated_react = _uses_model_generated_react(design_brief)
+    write_json(
+        react_dir / ".frontend-engine.json",
+        {
+            "frontend_engine_version": FRONTEND_ENGINE_VERSION,
+            "frontend_generation_mode": "model-generated-react",
+            "react_engine_version": MODEL_GENERATED_REACT_VERSION,
+            "page_spec_schema_version": "",
+            "component_library_version": "",
+        }
+        if model_generated_react
+        else page_spec_manifest(),
+    )
+    context = _codegen_context(task, blueprint, ui_blueprint)
+    total = len(screenshots)
+    visual_style_contract = _visual_reference_style_contract(style_reference)
+    if not model_generated_react:
+        _emit(emit, codegen_progress_start, "提取参考图共享组件样式（可复用，失败时沿用现有样式）")
+        visual_style_contract = resolve_reference_style(
+            provider=provider, reference=style_reference, base_contract=visual_style_contract,
+            cache_path=react_dir / "reference-component-style.json", image_data_url=_image_data_url,
+        )
+    trace_event(
+        "ai_frontend_reference_contract_ready",
+        image_width=int(visual_style_contract.get("image_width") or 0),
+        image_height=int(visual_style_contract.get("image_height") or 0),
+        palette_count=len(visual_style_contract.get("dominant_colors") or []),
+    )
+    stop_event = threading.Event()
+    worker_mode, initial_workers = _react_codegen_worker_setting(total)
+    if model_generated_react:
+        worker_mode, initial_workers = "direct-react-serial", 1
+    runtime_lock = threading.Lock()
+    runtime_state: dict[str, Any] = {
+        "configured_workers": initial_workers,
+        "active_limit": initial_workers,
+        "max_inflight": 0,
+        "degraded": False,
+        "degrade_reason": "",
+        "clean_successes": 0,
+        "concurrency_recoveries": 0,
+        "logical_requests": 0,
+        "request_attempts": 0,
+        "provider_retries": 0,
+        "error_categories": {},
+        "stop_reasons": {},
+    }
+
+    def record_attempt(attempt: int, retry_budget: int) -> None:
+        with runtime_lock:
+            runtime_state["request_attempts"] += 1
+            if int(attempt) == 1:
+                runtime_state["logical_requests"] += 1
+
+    def record_error(
+        category: TextErrorCategory,
+        attempt: int,
+        retry_budget: int,
+        will_retry: bool,
+        stop_reason: str,
+    ) -> None:
+        category_value = category.value if isinstance(category, TextErrorCategory) else str(category)
+        with runtime_lock:
+            runtime_state["clean_successes"] = 0
+            categories = runtime_state["error_categories"]
+            categories[category_value] = int(categories.get(category_value, 0)) + 1
+            if will_retry:
+                runtime_state["provider_retries"] += 1
+            else:
+                stops = runtime_state["stop_reasons"]
+                stops[str(stop_reason)] = int(stops.get(str(stop_reason), 0)) + 1
+            should_degrade = (
+                worker_mode == "auto"
+                and category in {TextErrorCategory.RATE_LIMIT, TextErrorCategory.GATEWAY, TextErrorCategory.CONNECTION, TextErrorCategory.TIMEOUT}
+                and runtime_state["active_limit"] > 1
+            )
+            if should_degrade:
+                runtime_state["active_limit"] = 1
+                runtime_state["degraded"] = True
+                runtime_state["degrade_reason"] = category_value
+        if should_degrade:
+            trace_event(
+                "ai_frontend_concurrency_degraded",
+                from_workers=initial_workers,
+                to_workers=1,
+                reason=category_value,
+                attempt=attempt,
+                retry_budget=retry_budget,
+            )
+            _emit(emit, codegen_progress_start, f"检测到 {category_value}，当前任务界面并发已降为 1")
+
+    def record_success(attempt: int, retry_budget: int) -> None:
+        with runtime_lock:
+            runtime_state["clean_successes"] = runtime_state["clean_successes"] + 1 if attempt == 1 else 0
+            recover = (
+                worker_mode == "auto"
+                and runtime_state["active_limit"] < initial_workers
+                and runtime_state["clean_successes"] >= 4
+            )
+            if recover:
+                runtime_state["active_limit"] = initial_workers
+                runtime_state["clean_successes"] = 0
+                runtime_state["concurrency_recoveries"] += 1
+        if recover:
+            trace_event("ai_frontend_concurrency_recovered", to_workers=initial_workers, clean_requests=4)
+            _emit(emit, codegen_progress_start, f"连续请求稳定，界面并发恢复为 {initial_workers}")
+
+    def page_retry_policy() -> TextRetryPolicy:
+        return TextRetryPolicy(
+            max_retries=2,
+            on_attempt=record_attempt,
+            on_error=record_error,
+            on_success=record_success,
+        )
+
+    renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
+    identity = design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {}
+    if not isinstance(identity, dict):
+        identity = {}
+    nav_model = str(identity.get("nav_model") or design_brief.get("nav_model") or "top_tabs")
+    if renderer in {"mobile_app", "game"}:
+        nav_model = "phone_tabs"
+    navigation_pages = {
+        str(page.get("key") or ""): page
+        for page in navigation_page_catalog(blueprint, renderer=renderer)
+        if str(page.get("key") or "")
+    }
+    navigation_pages.update(
+        {
+            str(page.get("key") or ""): page
+            for page in [_page_spec_screen_payload(item, task=task, design_brief=design_brief) for item in screenshots]
+            if str(page.get("key") or "")
+        }
+    )
+    all_navigation_contracts = build_navigation_contracts(
+        task,
+        blueprint,
+        list(navigation_pages.values()),
+        renderer=renderer,
+        nav_model=nav_model,
+    )
+    navigation_contracts = {
+        str(getattr(item, "key", "") or ""): all_navigation_contracts.get(str(getattr(item, "key", "") or ""), {})
+        for item in screenshots
+    }
+    late_resume = bool(
+        getattr(task, "resume_existing_output", False)
+        and str(getattr(task, "resume_stage", "") or "") in {
+            "manual",
+            "manual_docx",
+            "source_doc",
+            "source_docx",
+            "pdf",
+            "info",
+            "package",
+            "validate",
+            "done",
+        }
+    )
+    pending_indexes: list[int] = []
+    renderer_migration_count = 0
+    for pending_index, pending_item in enumerate(screenshots, start=1):
+        pending_key = str(getattr(pending_item, "key", "") or f"page_{pending_index}")
+        pending_token = _react_component_token(pending_key, pending_index)
+        pending_creative_key = _page_creative_key(task, design_brief, pending_item)
+        react_engine = MODEL_GENERATED_REACT_VERSION if model_generated_react else LEGACY_FALLBACK_VERSION
+        cache_ready = _frontend_page_cache_ready(
+            component_path=screens_dir / f"{pending_token}.jsx",
+            css_path=screens_dir / f"{pending_token}.css",
+            spec_path=screens_dir / f"{pending_token}.page-spec.json",
+            meta_path=screens_dir / f"{pending_token}.meta.json",
+            creative_key=pending_creative_key,
+            legacy=_requires_direct_react(renderer, pending_item, design_brief),
+            react_engine=react_engine,
+        )
+        renderer_migration_ready = (
+            not cache_ready
+            and not _requires_direct_react(renderer, pending_item, design_brief)
+            and _page_spec_renderer_migration_ready(
+                spec_path=screens_dir / f"{pending_token}.page-spec.json",
+                meta_path=screens_dir / f"{pending_token}.meta.json",
+                creative_key=pending_creative_key,
+            )
+        )
+        if renderer_migration_ready:
+            renderer_migration_count += 1
+        if not cache_ready and not renderer_migration_ready and not (late_resume and _late_resume_page_cache_ready(
+            component_path=screens_dir / f"{pending_token}.jsx",
+            css_path=screens_dir / f"{pending_token}.css",
+            spec_path=screens_dir / f"{pending_token}.page-spec.json",
+            meta_path=screens_dir / f"{pending_token}.meta.json",
+            legacy=_requires_direct_react(renderer, pending_item, design_brief),
+            react_engine=react_engine,
+        )):
+            pending_indexes.append(pending_index)
+    if pending_indexes and pending_indexes[0] > 1:
+        _emit(emit, codegen_progress_start, f"从未完成页面继续 {pending_indexes[0]}/{total}")
+    elif not pending_indexes:
+        if renderer_migration_count:
+            _emit(emit, codegen_progress_start, f"本地升级 PageSpec 页面渲染缓存 {renderer_migration_count}/{total}，无需模型请求")
+        else:
+            _emit(emit, codegen_progress_start, f"复用全部 PageSpec/React 页面缓存 {total}/{total}")
+
+    def build_page(index: int, item: Any) -> dict[str, Any]:
+        page_started_at = time.perf_counter()
+        if stop_event.is_set():
+            raise RuntimeError("React 页面生成已因模型网关错误停止")
+        page_key = str(getattr(item, "key", "") or f"page_{index}")
+        token = _react_component_token(page_key, index)
+        component_name = f"Screen{token}"
+        component_path = screens_dir / f"{token}.jsx"
+        css_path = screens_dir / f"{token}.css"
+        spec_path = screens_dir / f"{token}.page-spec.json"
+        meta_path = screens_dir / f"{token}.meta.json"
+        css_scope = _react_css_scope(page_key, index)
+        creative_key = _page_creative_key(task, design_brief, item)
+        progress = codegen_progress_start + min(4, int(index / max(total, 1) * 4))
+        legacy = _requires_direct_react(renderer, item, design_brief)
+        react_engine = MODEL_GENERATED_REACT_VERSION if model_generated_react else LEGACY_FALLBACK_VERSION
+        reused = _frontend_page_cache_ready(
+            component_path=component_path,
+            css_path=css_path,
+            spec_path=spec_path,
+            meta_path=meta_path,
+            creative_key=creative_key,
+            legacy=legacy,
+            react_engine=react_engine,
+        )
+        renderer_migrated = (
+            not reused
+            and not legacy
+            and _page_spec_renderer_migration_ready(
+                spec_path=spec_path,
+                meta_path=meta_path,
+                creative_key=creative_key,
+            )
+        )
+        if late_resume and not reused and not renderer_migrated:
+            reused = _late_resume_page_cache_ready(
+                component_path=component_path,
+                css_path=css_path,
+                spec_path=spec_path,
+                meta_path=meta_path,
+                legacy=legacy,
+                react_engine=react_engine,
+            )
+        module = module_by_key.get(str(getattr(item, "module_key", "") or ""))
+        screen_payload = _page_spec_screen_payload(item, task=task, design_brief=design_brief)
+        engine = react_engine if legacy else PAGE_SPEC_SCHEMA_VERSION
+        data: dict[str, Any] | None = None
+        composition_contract = {}
+        if reused:
+            cached_meta = _read_json_dict(meta_path)
+            if isinstance(cached_meta.get("composition_contract"), dict):
+                composition_contract = dict(cached_meta["composition_contract"])
+        if (reused or renderer_migrated) and not legacy:
+            cached_spec = _read_json_dict(spec_path)
+            if repair_cached_page_spec_columns(cached_spec):
+                write_json(spec_path, cached_spec)
+            data = render_page_spec(
+                cached_spec,
+                css_scope=css_scope,
+                creative_key=creative_key,
+                renderer=renderer,
+                module=_module_payload(module),
+                screen=screen_payload,
+                visual_identity=design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {},
+                color_contract=visual_style_contract,
+            )
+        if not reused and not renderer_migrated:
+            generation_label = "模型 React" if model_generated_react else "legacy React" if legacy else "PageSpec"
+            _emit(emit, progress, f"生成 {generation_label} 页面 {index}/{total}")
+            last_error: Exception | None = None
+            try:
+                for quality_attempt in range(2):
+                    if stop_event.is_set():
+                        raise RuntimeError("React 页面生成已因模型网关错误停止")
+                    try:
+                        if legacy:
+                            data = _generate_react_component(
+                                task=task,
+                                blueprint=blueprint,
+                                ui_blueprint=ui_blueprint,
+                                provider=provider,
+                                screenshot=item,
+                                module=module,
+                                visual_reference=style_reference,
+                                visual_style_contract=visual_style_contract,
+                                context=context,
+                                design_brief=design_brief,
+                                index=index,
+                                total=total,
+                                component_name=component_name,
+                                css_scope=css_scope,
+                                creative_key=creative_key,
+                                navigation_contract=navigation_contracts.get(page_key, {}),
+                                validation_feedback=sanitize_error_message(last_error, limit=240) if last_error else "",
+                                retry_policy=page_retry_policy(),
+                                cancel_event=stop_event,
+                            )
+                        else:
+                            page_spec = request_page_spec(
+                                provider=provider,
+                                software_context=context,
+                                screen=screen_payload,
+                                module=_module_payload(module),
+                                visual_identity=design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {},
+                                color_contract=visual_style_contract,
+                                validation_feedback=sanitize_error_message(last_error, limit=360) if last_error else "",
+                                retry_policy=page_retry_policy(),
+                                cancel_event=stop_event,
+                            )
+                            data = render_page_spec(
+                                page_spec,
+                                css_scope=css_scope,
+                                creative_key=creative_key,
+                                renderer=renderer,
+                                module=_module_payload(module),
+                                screen=screen_payload,
+                                visual_identity=design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {},
+                                color_contract=visual_style_contract,
+                            )
+                            write_json(spec_path, page_spec)
+                        break
+                    except (PageSpecValidationError, ValueError, TextProviderError) as exc:
+                        if isinstance(exc, TextProviderError) and exc.category != TextErrorCategory.FORMAT:
+                            raise
+                        last_error = exc
+                        category = classify_text_error(exc)
+                        if category in {
+                            TextErrorCategory.RATE_LIMIT,
+                            TextErrorCategory.GATEWAY,
+                            TextErrorCategory.CONNECTION,
+                            TextErrorCategory.TIMEOUT,
+                            TextErrorCategory.EMPTY_RESPONSE,
+                        }:
+                            raise
+                        if quality_attempt == 0:
+                            trace_event(
+                                "ai_frontend_quality_repair",
+                                page_key=page_key,
+                                index=index,
+                                total=total,
+                                error_category=category.value,
+                                repair_number=1,
+                                repair_budget=1,
+                                reason=sanitize_error_message(exc, limit=300),
+                            )
+                            _emit(emit, progress, f"{'React 组件' if legacy else 'PageSpec'} 格式或质量不合格，定向修复 {page_key} 1/1")
+                            continue
+                        raise
+                if data is None:
+                    raise RuntimeError(f"{page_key} 页面生成失败：{last_error}") from last_error
+            except Exception as exc:
+                stop_event.set()
+                trace_event(
+                    "ai_frontend_circuit_open",
+                    page_key=page_key,
+                    index=index,
+                    total=total,
+                    error=sanitize_error_message(exc, limit=500),
+                )
+                raise RuntimeError(
+                    f"{page_key} 前端模型请求失败，已停止剩余页面，避免长时间重复等待：{sanitize_error_message(exc)}"
+                ) from exc
+        if data is not None:
+            composition_contract = dict(data.get("composition_contract") or {})
+            component_path.write_text(
+                f'import React from "react";\nimport "./{token}.css";\n\n'
+                f"export default function {component_name}() {{\n  return (\n{data['jsx']}\n  );\n}}\n",
+                encoding="utf-8",
+            )
+            css_path.write_text(data["css"], encoding="utf-8")
+        if not reused or renderer_migrated:
+            write_json(
+                meta_path,
+                {
+                    "creative_key": creative_key,
+                    "cache_key": (
+                        _model_generated_react_cache_key(creative_key)
+                        if model_generated_react
+                        else legacy_cache_key(creative_key) if legacy else page_spec_cache_key(creative_key)
+                    ),
+                    "page_key": page_key,
+                    "framework": "react-vite",
+                    "engine": engine,
+                    "composition_contract": composition_contract,
+                    **({} if legacy else page_spec_manifest()),
+                },
+            )
+        _sanitize_cached_react_component(component_path)
+        _sanitize_cached_react_css(css_path, css_scope)
+        return {
+            "index": index,
+            "import": f'import {component_name} from "./screens/{token}.jsx";',
+            "registration": f'  {json.dumps(page_key, ensure_ascii=False)}: {component_name},',
+            "page": {
+                "key": page_key,
+                "title": str(getattr(item, "title", "") or page_key),
+                "caption": str(getattr(item, "caption", "") or ""),
+                "file": Path(str(getattr(item, "html_path", ""))).name,
+                "page_kind": str(getattr(item, "page_kind", "") or "general"),
+                "module_key": str(getattr(item, "module_key", "") or ""),
+                "interaction_action": str(getattr(item, "interaction_action", "") or ""),
+                "interaction_mode": str(getattr(item, "interaction_mode", "") or ""),
+                "interaction_surface": str(getattr(item, "interaction_surface", "") or ""),
+                "requires_confirmation": bool(getattr(item, "requires_confirmation", False)),
+                "interaction_action_key": str(getattr(item, "interaction_action_key", "") or ""),
+                "interaction_role": str(getattr(item, "interaction_role", "") or ""),
+                "interaction_trigger": str(getattr(item, "interaction_trigger", "") or ""),
+                "interaction_input_fields": list(getattr(item, "interaction_input_fields", None) or []),
+                "interaction_pre_state": str(getattr(item, "interaction_pre_state", "") or ""),
+                "interaction_post_state": str(getattr(item, "interaction_post_state", "") or ""),
+                "interaction_result_evidence": str(getattr(item, "interaction_result_evidence", "") or ""),
+                "source": (
+                    "model-generated-react"
+                    if model_generated_react
+                    else "legacy-react-fallback" if legacy else "page-spec-v1"
+                ),
+                "engine": engine,
+                "page_spec": str(spec_path) if not legacy else "",
+                "page_spec_schema_version": "" if legacy else PAGE_SPEC_SCHEMA_VERSION,
+                "component_library_version": "" if legacy else COMPONENT_LIBRARY_VERSION,
+                "composition_contract": composition_contract,
+                "component": str(component_path),
+                "creative_key": creative_key,
+                "visual_reference": _report_reference_summary(style_reference),
+            },
+            "elapsed_seconds": round(time.perf_counter() - page_started_at, 3),
+            "reused": reused or renderer_migrated,
+            "renderer_migrated": renderer_migrated,
+        }
+
+    results: list[dict[str, Any]] = []
+    first_error: Exception | None = None
+    futures: dict[Any, int] = {}
+    next_position = 0
+    executor = ThreadPoolExecutor(max_workers=initial_workers, thread_name_prefix="react-codegen")
+    try:
+        while next_position < total or futures:
+            with runtime_lock:
+                active_limit = int(runtime_state["active_limit"])
+            while not stop_event.is_set() and next_position < total and len(futures) < active_limit:
+                index = next_position + 1
+                future = executor.submit(build_page, index, screenshots[next_position])
+                futures[future] = index
+                next_position += 1
+                with runtime_lock:
+                    runtime_state["max_inflight"] = max(int(runtime_state["max_inflight"]), len(futures))
+            if not futures:
+                break
+            completed, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            failures: list[Exception] = []
+            for future in completed:
+                futures.pop(future, None)
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    failures.append(exc)
+            if failures:
+                stop_event.set()
+                first_error = next(
+                    (
+                        exc
+                        for exc in failures
+                        if "前端模型请求失败" in str(exc)
+                    ),
+                    next(
+                        (
+                            exc
+                            for exc in failures
+                            if not isinstance(exc, TextProviderError)
+                            or exc.category is not TextErrorCategory.CANCELLED
+                        ),
+                        failures[0],
+                    ),
+                )
+                for pending in futures:
+                    pending.cancel()
+                break
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    if first_error is not None:
+        cancelled_page_count = max(0, total - len(results) - 1)
+        with runtime_lock:
+            failure_stats = _frontend_runtime_summary(runtime_state, cancelled_page_count=cancelled_page_count)
+        trace_event("ai_frontend_bounded_queue_stopped", **failure_stats)
+        if isinstance(first_error, RuntimeError):
+            setattr(first_error, "frontend_stats", failure_stats)
+        raise first_error
+    results.sort(key=lambda item: int(item["index"]))
+    imports = [str(item["import"]) for item in results]
+    registrations = [str(item["registration"]) for item in results]
+    pages = [dict(item["page"]) for item in results]
+    for page in pages:
+        page["navigation_contract"] = navigation_contracts.get(str(page.get("key") or ""), {})
+    navigation_summary = navigation_contract_summary(navigation_contracts)
+    page_spec_count = sum(1 for page in pages if page.get("source") == "page-spec-v1")
+    legacy_react_page_count = sum(1 for page in pages if page.get("source") == "legacy-react-fallback")
+    model_generated_react_page_count = sum(1 for page in pages if page.get("source") == "model-generated-react")
+    shared_confirmation_page_count = sum(1 for page in pages if bool(page.get("requires_confirmation")))
+    request_timings = [
+        float(item.get("elapsed_seconds") or 0.0)
+        for item in results
+        if not item.get("reused") and float(item.get("elapsed_seconds") or 0.0) > 0
+    ]
+    with runtime_lock:
+        runtime_summary = _frontend_runtime_summary(runtime_state, cancelled_page_count=0)
+    write_json(
+        prototype_dir / "page-spec-manifest.json",
+        {
+            **page_spec_manifest(),
+            **navigation_summary,
+            "page_spec_count": page_spec_count,
+            "legacy_react_page_count": legacy_react_page_count,
+            "model_generated_react_page_count": model_generated_react_page_count,
+            "page_count": len(pages),
+            "pages": [
+                {
+                    "page_key": str(page.get("key") or ""),
+                    "engine": str(page.get("engine") or ""),
+                    "source": str(page.get("source") or ""),
+                    "navigation_level": str((page.get("navigation_contract") or {}).get("level") or ""),
+                    "navigation_signature": str((page.get("navigation_contract") or {}).get("hierarchy_signature") or ""),
+                }
+                for page in pages
+            ],
+        },
+    )
+    _write_react_app_files(
+        task=task,
+        blueprint=blueprint,
+        ui_blueprint=ui_blueprint,
+        react_dir=react_dir,
+        imports=imports,
+        registrations=registrations,
+        pages=pages,
+        default_key=str(getattr(screenshots[0], "key", "") or "page_1"),
+        visual_style_contract=visual_style_contract,
+    )
+    _emit(emit, codegen_progress_start + 5, "构建 React + Vite 运行工程")
+    _build_react_vite_bundle(react_dir)
+    _publish_react_page_entries(
+        prototype_dir,
+        react_dir / "dist",
+        screenshots,
+        renderer=str(getattr(ui_blueprint, "renderer", "") or "admin"),
+    )
+    return {
+        "enabled": True,
+        "ready": len(pages) == total,
+        "source": (
+            "gpt-image2-to-model-generated-react-vite"
+            if model_generated_react
+            else "gpt-style-reference-image2-to-pagespec-react-vite"
+        ),
+        "framework": "react",
+        "build_tool": "vite",
+        "frontend_engine_version": FRONTEND_ENGINE_VERSION,
+        "page_spec_schema_version": PAGE_SPEC_SCHEMA_VERSION,
+        "component_library_version": COMPONENT_LIBRARY_VERSION,
+        "renderer": str(getattr(ui_blueprint, "renderer", "") or "admin"),
+        "page_count": len(pages),
+        "page_spec_count": page_spec_count,
+        "legacy_react_page_count": legacy_react_page_count,
+        "model_generated_react_page_count": model_generated_react_page_count,
+        "frontend_generation_mode": "model-generated-react" if model_generated_react else "pagespec-hybrid",
+        "shared_confirmation_contract": "shared-confirm-dialog-v1",
+        "shared_confirmation_page_count": shared_confirmation_page_count,
+        "shared_confirmation_ready": (react_dir / "src" / "SharedConfirmDialog.jsx").is_file(),
+        "navigation_contract_version": NAVIGATION_CONTRACT_VERSION,
+        **navigation_summary,
+        "source_dir": str(react_dir),
+        "visual_references": visual_reference_report,
+        "reference_component_style": {
+            "schema_version": REFERENCE_STYLE_VERSION,
+            "status": visual_style_contract.get("component_style_status", "direct-react"),
+            "reused": bool(visual_style_contract.get("component_style_reused")),
+            "image_sha256": visual_style_contract.get("component_style_image_sha256", ""),
+            "applied": bool(visual_style_contract.get("component_style")),
+            "request_seconds": float(visual_style_contract.get("component_style_request_seconds") or 0),
+        },
+        **runtime_summary,
+        "frontend_page_request_timing": _frontend_timing_summary(request_timings),
+        "pages": pages,
+    }
+
+
+def _react_codegen_workers(total: int) -> int:
+    return _react_codegen_worker_setting(total)[1]
+
+
+def _react_codegen_worker_setting(total: int) -> tuple[str, int]:
+    raw = os.getenv("SOFT_LLM_AI_FRONTEND_WORKERS", "auto").strip().lower()
+    if raw == "auto" or not raw:
+        return "auto", max(1, min(2, int(total or 1)))
+    try:
+        configured = int(raw)
+    except ValueError:
+        return "auto", max(1, min(2, int(total or 1)))
+    return "fixed", max(1, min(3, int(total or 1), configured))
+
+
+def _frontend_runtime_summary(state: dict[str, Any], *, cancelled_page_count: int) -> dict[str, Any]:
+    return {
+        "frontend_configured_workers": int(state.get("configured_workers") or 1),
+        "frontend_effective_workers": int(state.get("max_inflight") or 1),
+        "frontend_concurrency_degraded": bool(state.get("degraded")),
+        "frontend_concurrency_degrade_reason": str(state.get("degrade_reason") or ""),
+        "frontend_final_worker_limit": int(state.get("active_limit") or 1),
+        "frontend_concurrency_recoveries": int(state.get("concurrency_recoveries") or 0),
+        "frontend_cancelled_page_count": int(cancelled_page_count),
+        "provider_retry_summary": {
+            "logical_requests": int(state.get("logical_requests") or 0),
+            "request_attempts": int(state.get("request_attempts") or 0),
+            "provider_retries": int(state.get("provider_retries") or 0),
+            "error_categories": dict(state.get("error_categories") or {}),
+            "stop_reasons": dict(state.get("stop_reasons") or {}),
+        },
+    }
+
+
+def _frontend_timing_summary(values: list[float]) -> dict[str, Any]:
+    clean = sorted(round(float(value), 3) for value in values if float(value) >= 0)
+    if not clean:
+        return {"count": 0, "min_seconds": 0, "max_seconds": 0, "avg_seconds": 0, "p95_seconds": 0}
+    p95_index = min(len(clean) - 1, max(0, int(round((len(clean) - 1) * 0.95))))
+    return {
+        "count": len(clean),
+        "min_seconds": clean[0],
+        "max_seconds": clean[-1],
+        "avg_seconds": round(sum(clean) / len(clean), 3),
+        "p95_seconds": clean[p95_index],
+    }
+
+
+def _frontend_provider(provider: LLMProvider) -> LLMProvider:
+    config = getattr(provider, "config", None)
+    if config is None:
+        return provider
+    cloned_provider = copy.copy(provider)
+    cloned_config = copy.copy(config)
+    frontend_model = os.getenv("SOFT_MODEL_GPT_FRONTEND_NAME", "").strip()
+    if frontend_model:
+        cloned_config.model = frontend_model
+    # Text retries are owned by the per-request TextRetryPolicy. Keeping the
+    # cloned provider retry count at zero prevents page-level repair loops from
+    # multiplying a second hidden provider retry budget.
+    cloned_config.retry_count = 0
+    cloned_config.timeout = _ai_frontend_timeout_seconds(provider)
+    cloned_provider.config = cloned_config
+    trace_event(
+        "ai_frontend_provider_config",
+        model=str(getattr(cloned_config, "model", "") or ""),
+        retry_count=int(getattr(cloned_config, "retry_count", 0) or 0),
+        timeout=int(getattr(cloned_config, "timeout", 0) or 0),
+    )
+    return cloned_provider
+
+
+def _ai_frontend_retry_count() -> int:
+    return 0
+
+
+def _react_component_max_tokens() -> int:
+    raw = os.getenv("SOFT_REACT_COMPONENT_MAX_TOKENS", "3000").strip()
+    try:
+        configured = int(raw)
+    except ValueError:
+        configured = 3000
+    return max(2400, min(4000, configured))
+
+
+def _operation_prompt_rule(screenshot: Any) -> str:
+    if str(getattr(screenshot, "page_kind", "") or "") != "operation":
+        return ""
+    action = str(getattr(screenshot, "interaction_action", "") or "当前操作")
+    surface = str(getattr(screenshot, "interaction_surface", "") or "detail")
+    mode = str(getattr(screenshot, "interaction_mode", "") or "instant")
+    role = str(getattr(screenshot, "interaction_role", "") or "当前岗位")
+    trigger = str(getattr(screenshot, "interaction_trigger", "") or "进入当前业务场景")
+    fields = [str(item) for item in (getattr(screenshot, "interaction_input_fields", None) or []) if str(item).strip()]
+    pre_state = str(getattr(screenshot, "interaction_pre_state", "") or "当前状态")
+    post_state = str(getattr(screenshot, "interaction_post_state", "") or "处理后状态")
+    evidence = str(getattr(screenshot, "interaction_result_evidence", "") or "可见状态和结果记录")
+    contract = (
+        f"执行角色：{role}；触发条件：{trigger}；输入字段：{'、'.join(fields) or '按模块业务字段'}；"
+        f"状态变化：{pre_state} -> {post_state}；结果证据：{evidence}。"
+    )
+    if bool(getattr(screenshot, "requires_confirmation", False)):
+        return (
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}该动作确需确认。"
+            "系统将通过 SharedConfirmDialog 统一渲染可见弹窗，本组件禁止自行设计可见遮罩、弹窗卡片或按钮栏。"
+            "必须在页面根节点内提供 <section hidden data-shared-confirm-source=\"true\"> 语义源，其中包含 "
+            "data-confirm-title 标题、data-confirm-description 说明、2-4 个带 data-confirm-item/data-label/data-value 的影响项、"
+            "data-confirm-note 状态影响和 data-confirm-action 确认按钮文字；禁止使用‘登记’替代真实动作名称。"
+        )
+    if mode == "query":
+        return (
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}页面应展示真实查询条件、已选范围、"
+            "查询结果列表和结果数量；查询后直接刷新结果，不要生成确认弹窗。"
+        )
+    if mode == "form":
+        return (
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}页面应展示与当前模块对应的字段表单、"
+            "必填标识、校验提示、保存/取消入口和保存后的状态反馈；普通保存不需要二次确认。"
+        )
+    if mode == "import":
+        return (
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}页面应展示文件选择、文件信息、字段映射、"
+            "格式校验、错误明细和导入结果；不得只放一个上传按钮。"
+        )
+    if mode == "export":
+        return (
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}页面应展示导出范围、文件格式、字段选择、"
+            "生成进度和下载结果；普通导出不需要确认弹窗。"
+        )
+    if mode == "analysis":
+        return (
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}页面应展示统计范围、关键指标、趋势或分组结果、"
+            "异常提示和导出入口，所有图表必须有名称、日期或单位。"
+        )
+    if mode in {"workflow", "detail"}:
+        return (
+            f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}页面应展示当前记录、处理条件、流程轨迹、"
+            "责任人和执行后的状态结果；只有确实高风险的动作才允许确认弹窗。"
+        )
+    return (
+        f"当前动作是“{action}”，目标界面类型为 {surface}。{contract}该动作属于即时或可随时撤销的低风险操作。"
+        "必须直接展示详情、播放器、歌词、搜索结果、下载选项、队列编辑或状态反馈；"
+        "禁止确认弹窗、确认登记、登记表单、取消/确认按钮对，也不要把浏览和播放写成提交办理流程。"
+    )
+
+
+def _generate_react_component(
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    provider: LLMProvider,
+    screenshot: Any,
+    module: FeatureModule | None,
+    visual_reference: dict[str, Any] | None,
+    visual_style_contract: dict[str, Any],
+    context: dict[str, Any],
+    design_brief: dict[str, Any],
+    index: int,
+    total: int,
+    component_name: str,
+    css_scope: str,
+    creative_key: str,
+    navigation_contract: dict[str, Any] | None = None,
+    validation_feedback: str = "",
+    retry_policy: TextRetryPolicy | None = None,
+    cancel_event: Any | None = None,
+) -> dict[str, Any]:
+    renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
+    terminal_rule = (
+        "这是 720x1280 竖屏手机 App 页面：根节点及主要手机内容壳必须使用完整 720px 逻辑宽度并铺满画布，"
+        "禁止使用 max-width:375px、390px、430px 等窄手机模拟框，禁止在 720px 画布中居中放置缩小版手机页面；"
+        "使用触控友好的尺寸、移动导航和单手操作动线，禁止出现压缩后的桌面侧栏后台。"
+        if renderer in {"mobile_app", "game"}
+        else "这是 1280x720 横屏桌面软件页面：利用横向空间形成真实业务工作区，禁止模拟手机卡片流。"
+    )
+    design_viewer = _uses_model_generated_react(design_brief)
+    if design_viewer:
+        terminal_rule = (
+            "这是 1280x720 横屏桌面设计文件浏览器。你必须直接在本组件内生成完整可见应用结构，包括紧凑标签/文档栏、"
+            "导航与资源路径/搜索工具、左侧团队项目和文件树、中间文件缩略图或设计画布、右侧设计/原型/检查属性面板及底部缩放状态。"
+            "禁止手机底部导航、通用后台卡片墙、编号区域和大段功能说明。"
+        )
+    payload = {
+        "creative_seed": str(getattr(task, "seed", "") or ""),
+        "page_structure_seed": creative_key,
+        "software_context": context,
+        "screen": {
+            "key": str(getattr(screenshot, "key", "") or ""),
+            "title": str(getattr(screenshot, "title", "") or ""),
+            "caption": str(getattr(screenshot, "caption", "") or ""),
+            "page_kind": str(getattr(screenshot, "page_kind", "") or ""),
+            "module_key": str(getattr(screenshot, "module_key", "") or ""),
+            "interaction_action": str(getattr(screenshot, "interaction_action", "") or ""),
+            "interaction_mode": str(getattr(screenshot, "interaction_mode", "") or ""),
+            "interaction_surface": str(getattr(screenshot, "interaction_surface", "") or ""),
+            "requires_confirmation": bool(getattr(screenshot, "requires_confirmation", False)),
+            "interaction_action_key": str(getattr(screenshot, "interaction_action_key", "") or ""),
+            "interaction_role": str(getattr(screenshot, "interaction_role", "") or ""),
+            "interaction_trigger": str(getattr(screenshot, "interaction_trigger", "") or ""),
+            "interaction_input_fields": list(getattr(screenshot, "interaction_input_fields", None) or []),
+            "interaction_pre_state": str(getattr(screenshot, "interaction_pre_state", "") or ""),
+            "interaction_post_state": str(getattr(screenshot, "interaction_post_state", "") or ""),
+            "interaction_result_evidence": str(getattr(screenshot, "interaction_result_evidence", "") or ""),
+        },
+        "module": _module_payload(module),
+        "visual_identity": design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {},
+        "product_experience": design_brief.get("product_experience_spec") if isinstance(design_brief, dict) else {},
+        "reference": _prompt_reference_payload(visual_reference),
+        "reference_style_contract": visual_style_contract,
+        "navigation_contract": navigation_contract or {},
+    }
+    operation_rule = _operation_prompt_rule(screenshot)
+    retry_rule = (
+        f"\n上一次返回未通过本地构建门禁，原因：{validation_feedback}。本次必须针对该原因修正，禁止重复同类内容。"
+        if validation_feedback
+        else ""
+    )
+    prompt = f"""
+为第 {index}/{total} 个页面生成 React 组件的 JSX 主体和独立 CSS。组件名由系统包装为 {component_name}。
+
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+
+要求：
+- {terminal_rule}
+- {operation_rule or "按当前 page_kind 构建对应层级的真实软件页面。"}
+ - 只返回 JSON：{{"jsx":"单个根节点的 JSX","css":"完整 CSS","composition_family":"实际构图族英文短标识","composition_variant":"实际构图变体英文短标识"}}；不要返回 import、export、函数声明、Markdown 或外部依赖。
+ - JSX 与 CSS 合计控制在 4500-7500 个字符，其中 CSS 控制在 1800-3200 个字符；用 CSS 类复用样式，不要为每个数据行重复冗长结构，也不要输出解释性注释。
+- JSX 必须完全自包含：不要引用未声明变量、数组 map、自定义组件或图标组件；业务样例直接写成 JSX 节点，保证无需额外上下文即可渲染。
+- JSX 根节点必须包含 className="screen-root {css_scope}" 和 data-page-structure="{creative_key}"。
+ - {"本组件必须直接生成完整可见软件界面，外层只负责 React 挂载与公共确认交互，不会替你生成浏览器或页面结构。" if design_viewer else "系统会按 visual_identity_spec 在组件外层渲染本软件专属的共享外壳；外壳可能是侧栏、顶部页签或紧凑导航轨道，并使用真实模块名。本组件只生成页面内容区，禁止再次生成全局 header、品牌名称、主导航或重复的系统标题。"}
+- {"navigation_contract 只规定当前路由的导航语义，不规定布局。请把其中 primary_items、secondary_items、breadcrumb 和 back_target 设计成页面中自然可见的标签、文件树入口或路径控件，并分别逐项添加 data-navigation-primary-item、data-navigation-secondary-item、data-navigation-breadcrumb-item、data-navigation-back-target；可跳转项同时添加 data-navigation-page-key。禁止为满足属性而输出隐藏导航。" if design_viewer else "共享外壳会根据 navigation_contract 渲染导航，不要在内容区重复生成这些导航节点。"}
+- 按随消息附带的 image2 全局参考图继承真实布局关系、色彩、控件质感、信息密度和视觉节奏；不要只提取颜色。当前业务信息和路由状态仍以 payload 为准。
+- 页面保持简洁，围绕当前功能设置一个主要工作区和不超过两个辅助区域；指标卡不超过 4 个、主要操作按钮不超过 6 个、示例表格不超过 5 行；禁止用 kicker、eyebrow、subtitle、caption、helper text、说明段落或装饰性副标题填充页面，标题只保留一个主标题，区域标题只保留必要业务语义。
+- 操作按钮必须是短动作词（优先 2-6 个字，如“筛选”“保存”“创建任务”“确认”），不得把完整业务描述或流程解释写进按钮；所有按钮使用统一的图标化视觉结构，图标可用纯 CSS 或单字符图标，不得混用图片按钮和长文字按钮。
+- 页面必须按真实流程组织：入口/筛选 -> 核心字段或结果 -> 下一步操作；不要为了“丰富”堆叠重复指标、无关卡片、装饰说明或虚构流程。
+- 同一软件的相邻页面保持共享外壳一致，但不得假设外壳是通用深蓝顶部导航；内容区必须继续服从当前软件的视觉身份和页面结构种子。
+- 登录、仪表盘、模块工作区、操作页和统计页要像同一产品中的不同真实路由，而不是同一模板换文字。
+- 操作页必须严格服从 interaction_action、interaction_surface 和 requires_confirmation；即时操作不得擅自增加确认弹窗、登记表单或“确认登记”按钮。
+- requires_confirmation=true 时只提供 data-shared-confirm-source 隐藏语义源，不得输出另一套可见弹窗；可见确认框统一由系统公共组件渲染。
+- 使用真实中文业务数据、按钮、状态、表单、表格、图表、流程、时间线、任务板或地图工作区；按当前业务选择，不要求每类控件都出现。JSX 可见文字中的小于号必须写成 &lt;，例如“P 值 &lt; 0.05”，不能直接写裸字符“<”。
+- CSS 必须以 .{css_scope} 为作用域，不引用 CDN、图片、字体、SVG 或网络资源；首屏铺满且文字不能溢出。长标题、字段值、状态和按钮标签必须换行或允许区域滚动，禁止对主要业务文本大面积使用 `white-space: nowrap`、`overflow: hidden` 或省略号裁切；不得让文字被容器边界截断。
+- CSS 中严禁出现 @import、url(...)、@font-face、http://、https:// 或 data:image；图标和装饰只能使用文字、纯 CSS、渐变、边框与伪元素。
+- 所有样式都写入 css 字段，JSX 中严禁出现 style=、style={{...}} 或 style 字符串；进度条宽度、颜色和定位也必须改用 CSS 类。
+- 保留可供运行数据覆盖的 .table-frame、.runtime-record-panel、.map-pin、.operation-result 中至少一个适合本页的区域。
+- 可见内容禁止出现 AI、GPT、image2、提示词、视觉参考、接口返回、Base URL、API Key、内部文件名。
+- 禁止使用“待填写、待补充、待完善、示例内容、业务记录、记录01”等未完成占位文案；缺省值也要写成自然业务状态，例如“无异常”“未发现冲突”或“正常流转”。
+{retry_rule}
+""".strip()
+    image_path = Path(str((visual_reference or {}).get("image_path") or ""))
+    if design_viewer and not image_path.is_file():
+        raise RuntimeError("设计文件浏览器的直接 React 生成缺少可读取的 image2 参考图")
+    if design_viewer and image_path.is_file():
+        user_message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": _image_data_url(image_path)}},
+            ],
+        }
+    else:
+        # Non-design pages use the extracted contract to keep streaming and reduce timeout risk.
+        user_message = {"role": "user", "content": prompt}
+    content = provider.chat(
+        [
+            {
+                "role": "system",
+                "content": "你是资深 React 产品工程师。根据真实业务和随消息提供的视觉参考直接编写可编译 JSX 与 CSS，只返回 JSON，不使用 PageSpec、固定模板或通用后台骨架。",
+            },
+            user_message,
+        ],
+        temperature=0.68,
+        max_tokens=_react_component_max_tokens(),
+        response_format={"type": "json_object"},
+        trace_label=f"react_frontend:{getattr(screenshot, 'key', index)}",
+        timeout=_ai_frontend_timeout_seconds(provider),
+        retry_policy=retry_policy or TextRetryPolicy(max_retries=2),
+        cancel_event=cancel_event,
+    )
+    data = _parse_json(content)
+    jsx = str(data.get("jsx") or data.get("component_jsx") or "").strip()
+    jsx, sanitized_text_operator_count = _sanitize_react_text_operators(jsx)
+    if sanitized_text_operator_count:
+        trace_event(
+            "ai_frontend_text_operators_escaped",
+            page_key=str(getattr(screenshot, "key", "") or index),
+            escaped_count=sanitized_text_operator_count,
+        )
+    jsx, sanitized_inline_style_count = _sanitize_inline_react_styles(jsx)
+    if sanitized_inline_style_count:
+        trace_event(
+            "ai_frontend_inline_styles_removed",
+            page_key=str(getattr(screenshot, "key", "") or index),
+            removed_count=sanitized_inline_style_count,
+        )
+    css, sanitized_resource_count = _sanitize_external_css_resources(str(data.get("css") or ""))
+    css = _trim_incomplete_css_tail(css)
+    css = _scope_react_css(css, css_scope)
+    if sanitized_resource_count:
+        trace_event(
+            "ai_frontend_css_external_resources_removed",
+            page_key=str(getattr(screenshot, "key", "") or index),
+            removed_count=sanitized_resource_count,
+        )
+    if len(jsx) < 700 or len(css) < 500:
+        raise ValueError("模型返回的 React JSX/CSS 过短")
+    if re.search(r"(?m)^\s*(?:import|export)\s+", jsx) or re.search(r"dangerouslySetInnerHTML|<script\b", jsx, flags=re.I):
+        raise ValueError("React 页面包含不允许的导入、脚本或 HTML 注入")
+    if re.search(r"<\/?[A-Z][A-Za-z0-9_.]*\b", jsx):
+        raise ValueError("React 页面引用了未声明的自定义组件")
+    if re.search(r"\sstyle\s*=", jsx, flags=re.I):
+        raise ValueError("React 页面包含内联 style，无法保证样式隔离")
+    jsx = re.sub(r"\sclass=", " className=", jsx)
+    jsx = _sanitize_react_visible_terms(jsx)
+    _reject_internal_visible_terms(jsx)
+    if f"screen-root {css_scope}" not in jsx or creative_key not in jsx:
+        raise ValueError("React 页面缺少页面作用域或独立构图标识")
+    if f".{css_scope}" not in css:
+        raise ValueError("React 页面 CSS 未按页面作用域隔离")
+    if re.search(r"@import|@font-face|url\s*\(|https?://|data:image", css, flags=re.I):
+        raise ValueError("React 页面 CSS 引用了外部资源")
+    if bool(getattr(screenshot, "requires_confirmation", False)):
+        required_markers = ("data-shared-confirm-source", "data-confirm-title", "data-confirm-action")
+        if not all(marker in jsx for marker in required_markers):
+            raise ValueError("确认操作页缺少 SharedConfirmDialog 语义源")
+    composition_contract = _model_react_composition_contract(
+        data,
+        screenshot=screenshot,
+        creative_key=creative_key,
+    )
+    jsx = _inject_model_react_composition_attributes(jsx, composition_contract)
+    if design_viewer:
+        _validate_model_navigation_markup(jsx, navigation_contract or {})
+    return {"jsx": jsx, "css": css, "composition_contract": composition_contract}
+
+
+def _model_react_composition_contract(
+    data: dict[str, Any],
+    *,
+    screenshot: Any,
+    creative_key: str,
+) -> dict[str, str]:
+    page_kind = _composition_token(getattr(screenshot, "page_kind", "")) or "general"
+    surface = _composition_token(getattr(screenshot, "interaction_surface", ""))
+    mode = _composition_token(getattr(screenshot, "interaction_mode", ""))
+    family = _composition_token(data.get("composition_family")) or page_kind
+    variant = _composition_token(data.get("composition_variant"))
+    if not variant:
+        variant = "-".join(token for token in (page_kind, surface, mode) if token) or "workspace"
+    signature = sha256(f"{creative_key}|{family}|{variant}".encode("utf-8")).hexdigest()[:20]
+    return {
+        "version": "model-react-composition-v1",
+        "family": family,
+        "variant": variant,
+        "workspace_mode": "model-generated",
+        "signature": signature,
+    }
+
+
+def _composition_token(value: Any) -> str:
+    token = re.sub(r"[^a-z0-9_-]+", "-", str(value or "").strip().lower()).strip("-_")
+    return token[:48]
+
+
+def _inject_model_react_composition_attributes(jsx: str, contract: dict[str, str]) -> str:
+    if "data-composition-signature=" in jsx:
+        return jsx
+    marker = re.search(r'data-page-structure="[^"]+"', jsx)
+    if not marker:
+        return jsx
+    attributes = (
+        f' data-page-composition-version="{contract["version"]}"'
+        f' data-page-composition="{contract["variant"]}"'
+        f' data-composition-family="{contract["family"]}"'
+        f' data-composition-signature="{contract["signature"]}"'
+    )
+    return jsx[: marker.end()] + attributes + jsx[marker.end() :]
+
+
+def _validate_model_navigation_markup(jsx: str, contract: dict[str, Any]) -> None:
+    requirements = (
+        ("primary_items", "data-navigation-primary-item="),
+        ("secondary_items", "data-navigation-secondary-item="),
+        ("breadcrumb", "data-navigation-breadcrumb-item="),
+    )
+    missing: list[str] = []
+    for key, marker in requirements:
+        expected = len(contract.get(key) or [])
+        if expected and jsx.count(marker) < expected:
+            missing.append(f"{key} {jsx.count(marker)}/{expected}")
+    back_target = contract.get("back_target") if isinstance(contract.get("back_target"), dict) else {}
+    if back_target.get("page_key") and "data-navigation-back-target=" not in jsx:
+        missing.append("back_target 0/1")
+    if missing:
+        raise ValueError("模型直出页面缺少可见导航契约节点：" + "，".join(missing))
+
+
+def _sanitize_react_visible_terms(value: str) -> str:
+    developer_type = re.compile(
+        r"\b[A-Z][A-Za-z0-9]*(Record|Service|Controller|Router|Route|Entity|Model|Query|Trace|DTO|ViewModel)\b"
+    )
+
+    replacements = {
+        "Record": "业务对象",
+        "Entity": "业务对象",
+        "Model": "业务对象",
+        "Query": "查询条件",
+        "Trace": "追踪信息",
+        "DTO": "业务对象",
+        "ViewModel": "业务视图",
+        "Service": "业务处理",
+        "Controller": "业务处理",
+        "Router": "业务处理",
+        "Route": "业务处理",
+    }
+
+    def replace_developer_type(match: re.Match[str]) -> str:
+        return replacements.get(match.group(1), "业务对象")
+
+    def replace_text(match: re.Match[str]) -> str:
+        visible = developer_type.sub(replace_developer_type, match.group(1))
+        # These phrases are useful while drafting but must not leak into a
+        # delivery screenshot as template-like or unfinished content.
+        visible = visible.replace("业务记录", "业务对象").replace("待填写", "请选择")
+        visible = re.sub(r"记录(\d{2,})", r"对象\1", visible)
+        visible = re.sub(
+            r"(?:备注)?(?:内容|说明|文案|描述|信息|资料)待(?:补充|完善)(?:：[^，。；<]*)?",
+            "相关信息已核验",
+            visible,
+        )
+        visible = re.sub(r"待补充内容|内容待补充|说明待补充", "相关信息已核验", visible)
+        return f">{visible}<"
+
+    return re.sub(r">([^<>{]+)<", replace_text, str(value or ""))
+
+
+def _sanitize_cached_react_component(path: Path) -> None:
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    sanitized, _escaped_count = _sanitize_react_text_operators(source)
+    sanitized, _removed_count = _sanitize_inline_react_styles(sanitized)
+    sanitized = _sanitize_react_visible_terms(sanitized)
+    if sanitized != source:
+        path.write_text(sanitized, encoding="utf-8")
+
+
+def _sanitize_cached_react_css(path: Path, css_scope: str = "") -> None:
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    sanitized, _removed_count = _sanitize_external_css_resources(source)
+    sanitized = _trim_incomplete_css_tail(sanitized)
+    if css_scope:
+        sanitized = _scope_react_css(sanitized, css_scope)
+    if sanitized != source:
+        path.write_text(sanitized, encoding="utf-8")
+
+
+def _sanitize_external_css_resources(value: str) -> tuple[str, int]:
+    source = str(value or "")
+    removed_count = 0
+    source, count = re.subn(r"@font-face\s*\{[^{}]*\}", "", source, flags=re.I | re.S)
+    removed_count += count
+    source, count = re.subn(
+        r"@import\s+(?:url\s*\([^;]*\)|['\"][^'\"]+['\"])[^;]*;?",
+        "",
+        source,
+        flags=re.I | re.S,
+    )
+    removed_count += count
+
+    def replace_external_declaration(match: re.Match[str]) -> str:
+        nonlocal removed_count
+        removed_count += 1
+        property_name = str(match.group("property") or "").strip().lower()
+        if property_name == "src":
+            return 'src:local("Arial");'
+        if property_name in {"background", "background-image"}:
+            return "background-image:none;"
+        return f"{property_name}:none;"
+
+    source = re.sub(
+        r"(?P<property>[-\w]+)\s*:[^;{}]*url\s*\([^)]*\)[^;{}]*(?:;|(?=\}))",
+        replace_external_declaration,
+        source,
+        flags=re.I | re.S,
+    )
+    return source.strip(), removed_count
+
+
+def _scope_react_css(value: str, css_scope: str) -> str:
+    source = str(value or "").strip()
+    scope = str(css_scope or "").strip().lstrip(".")
+    if not source or not scope:
+        return source
+    source, keyframes = _extract_css_keyframe_blocks(source)
+    scope_pattern = re.compile(rf"(?<![\w-])\.{re.escape(scope)}(?![\w-])")
+
+    def prefix_rule(match: re.Match[str]) -> str:
+        boundary, spacing, selector_text = match.group(1), match.group(2), match.group(3)
+        stripped = selector_text.strip()
+        if not stripped or stripped.startswith("@") or ":" in stripped and ";" in stripped:
+            return match.group(0)
+        scoped_selectors: list[str] = []
+        for selector in _split_css_selectors(stripped):
+            normalized = selector.strip()
+            if not normalized:
+                continue
+            if scope_pattern.search(normalized):
+                scoped_selectors.append(normalized)
+                continue
+            if normalized in {"html", "body", "#root", ":root"}:
+                scoped_selectors.append(f".{scope}")
+                continue
+            normalized = re.sub(r"^(?:html|body|#root|:root)(?=[\s.#:\[])", f".{scope}", normalized)
+            if not scope_pattern.search(normalized):
+                normalized = f".{scope} {normalized}"
+            scoped_selectors.append(normalized)
+        if not scoped_selectors:
+            return match.group(0)
+        return f"{boundary}{spacing}{','.join(scoped_selectors)}{{"
+
+    source = re.sub(r"(^|[{}])(\s*)([^@{}][^@{}]*?)\{", prefix_rule, source, flags=re.S)
+    for placeholder, block in keyframes:
+        source = source.replace(placeholder, block)
+    return source.strip()
+
+
+def _split_css_selectors(value: str) -> list[str]:
+    selectors: list[str] = []
+    start = 0
+    depth = 0
+    quote = ""
+    escaped = False
+    for index, char in enumerate(str(value or "")):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in {"(", "["}:
+            depth += 1
+        elif char in {")", "]"}:
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            selectors.append(value[start:index])
+            start = index + 1
+    selectors.append(value[start:])
+    return selectors
+
+
+def _extract_css_keyframe_blocks(value: str) -> tuple[str, list[tuple[str, str]]]:
+    source = str(value or "")
+    blocks: list[tuple[str, str]] = []
+    pattern = re.compile(r"@(?:-webkit-)?keyframes\s+[-\w]+\s*\{", flags=re.I)
+    search_from = 0
+    while True:
+        match = pattern.search(source, search_from)
+        if not match:
+            break
+        opening = source.find("{", match.start())
+        closing = _matching_css_brace(source, opening)
+        if closing < 0:
+            break
+        block = source[match.start() : closing + 1]
+        placeholder = f"/*__SOFT_KEYFRAME_{len(blocks)}__*/"
+        blocks.append((placeholder, block))
+        source = source[: match.start()] + placeholder + source[closing + 1 :]
+        search_from = match.start() + len(placeholder)
+    return source, blocks
+
+
+def _matching_css_brace(value: str, opening: int) -> int:
+    depth = 0
+    quote = ""
+    escaped = False
+    in_comment = False
+    index = max(0, opening)
+    while index < len(value):
+        char = value[index]
+        next_char = value[index + 1] if index + 1 < len(value) else ""
+        if in_comment:
+            if char == "*" and next_char == "/":
+                in_comment = False
+                index += 2
+                continue
+        elif quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char == "/" and next_char == "*":
+            in_comment = True
+            index += 2
+            continue
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return -1
+
+
+def _sanitize_inline_react_styles(value: str) -> tuple[str, int]:
+    source = str(value or "")
+    removed_count = 0
+    patterns = (
+        r"\sstyle\s*=\s*\{\{.*?\}\}",
+        r"\sstyle\s*=\s*\{[^{}]*\}",
+        r"\sstyle\s*=\s*(?:\"[^\"]*\"|'[^']*')",
+    )
+    for pattern in patterns:
+        source, count = re.subn(pattern, "", source, flags=re.I | re.S)
+        removed_count += count
+    return source, removed_count
+
+
+def _sanitize_react_text_operators(value: str) -> tuple[str, int]:
+    source = str(value or "")
+    return re.subn(
+        r"<(?=\s*(?:=\s*)?(?:[-+]?(?:\d|\.\d)|LOD\b|LOQ\b))",
+        "&lt;",
+        source,
+        flags=re.I,
+    )
+
+
+def _trim_incomplete_css_tail(value: str) -> str:
+    source = str(value or "").strip()
+    depth = 0
+    last_balanced = 0
+    quote = ""
+    escaped = False
+    in_comment = False
+    index = 0
+    while index < len(source):
+        char = source[index]
+        next_char = source[index + 1] if index + 1 < len(source) else ""
+        if in_comment:
+            if char == "*" and next_char == "/":
+                in_comment = False
+                index += 2
+                continue
+            index += 1
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char == "/" and next_char == "*":
+            in_comment = True
+            index += 2
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                raise ValueError("React 页面 CSS 存在多余的闭合花括号")
+            depth -= 1
+            if depth == 0:
+                last_balanced = index + 1
+        index += 1
+    if quote or in_comment:
+        raise ValueError("React 页面 CSS 字符串或注释未闭合")
+    if depth == 0 and not source[last_balanced:].strip():
+        return source
+    if last_balanced <= 0:
+        raise ValueError("React 页面 CSS 没有完整闭合的样式规则")
+    return source[:last_balanced].rstrip()
+
+
+def _react_component_token(page_key: str, index: int) -> str:
+    parts = [part for part in re.split(r"[^a-zA-Z0-9]+", page_key) if part]
+    token = "".join(part[:1].upper() + part[1:] for part in parts)
+    base = token or f"Page{index}"
+    return f"{base}{sha256(page_key.encode('utf-8')).hexdigest()[:6]}"
+
+
+def _react_css_scope(page_key: str, index: int) -> str:
+    token = re.sub(r"[^a-zA-Z0-9_-]+", "-", page_key).strip("-_").lower()
+    return f"screen-{token or f'page-{index}'}"
+
+
+def _frontend_page_cache_ready(
+    *,
+    component_path: Path,
+    css_path: Path,
+    spec_path: Path,
+    meta_path: Path,
+    creative_key: str,
+    legacy: bool,
+    react_engine: str = LEGACY_FALLBACK_VERSION,
+) -> bool:
+    meta = _read_json_dict(meta_path)
+    if not meta or str(meta.get("creative_key") or "") != creative_key:
+        return False
+    if legacy:
+        expected_cache_key = (
+            _model_generated_react_cache_key(creative_key)
+            if react_engine == MODEL_GENERATED_REACT_VERSION
+            else legacy_cache_key(creative_key)
+        )
+        return bool(
+            str(meta.get("engine") or "") == react_engine
+            and str(meta.get("cache_key") or "") == expected_cache_key
+            and component_path.is_file()
+            and css_path.is_file()
+            and component_path.stat().st_size > 900
+            and css_path.stat().st_size > 500
+        )
+    spec = _read_json_dict(spec_path)
+    return bool(
+        str(meta.get("engine") or "") == PAGE_SPEC_SCHEMA_VERSION
+        and str(meta.get("cache_key") or "") == page_spec_cache_key(creative_key)
+        and str(meta.get("page_spec_schema_version") or "") == PAGE_SPEC_SCHEMA_VERSION
+        and str(meta.get("component_library_version") or "") == COMPONENT_LIBRARY_VERSION
+        and str(spec.get("schema_version") or "") == PAGE_SPEC_SCHEMA_VERSION
+        and str(spec.get("page_key") or "") == str(meta.get("page_key") or "")
+    )
+
+
+def _page_spec_renderer_migration_ready(
+    *,
+    spec_path: Path,
+    meta_path: Path,
+    creative_key: str,
+) -> bool:
+    """Allow a renderer-only upgrade without issuing another model request."""
+    meta = _read_json_dict(meta_path)
+    spec = _read_json_dict(spec_path)
+    return bool(
+        str(meta.get("creative_key") or "") == creative_key
+        and str(meta.get("engine") or "") == PAGE_SPEC_SCHEMA_VERSION
+        and str(spec.get("schema_version") or "") == PAGE_SPEC_SCHEMA_VERSION
+        and str(spec.get("page_key") or "")
+        and str(spec.get("page_key") or "") == str(meta.get("page_key") or "")
+    )
+
+
+def _late_resume_page_cache_ready(
+    *,
+    component_path: Path,
+    css_path: Path,
+    spec_path: Path,
+    meta_path: Path,
+    legacy: bool,
+    react_engine: str = LEGACY_FALLBACK_VERSION,
+) -> bool:
+    """Keep completed UI source immutable when resuming after screenshots.
+
+    A late-stage retry must not reinterpret a previously accepted UI blueprint
+    just because a newer product-type rule would choose a different renderer.
+    The screenshot checkpoint and published frontend are the source of truth.
+    """
+    if not all(path.is_file() for path in (component_path, css_path, meta_path)):
+        return False
+    if component_path.stat().st_size <= 900 or css_path.stat().st_size <= 500:
+        return False
+    if legacy:
+        meta = _read_json_dict(meta_path)
+        return str(meta.get("engine") or "") == react_engine
+    spec = _read_json_dict(spec_path)
+    return str(spec.get("schema_version") or "") == PAGE_SPEC_SCHEMA_VERSION
+
+
+def _read_json_dict(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _page_spec_screen_payload(
+    item: Any,
+    *,
+    task: GenerationTask | None = None,
+    design_brief: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    brief = design_brief if isinstance(design_brief, dict) else {}
+    return {
+        "key": str(getattr(item, "key", "") or ""),
+        "title": str(getattr(item, "title", "") or ""),
+        "caption": str(getattr(item, "caption", "") or ""),
+        "page_kind": str(getattr(item, "page_kind", "") or "general"),
+        "module_key": str(getattr(item, "module_key", "") or ""),
+        "interaction_action": str(getattr(item, "interaction_action", "") or ""),
+        "interaction_mode": str(getattr(item, "interaction_mode", "") or "browse"),
+        "interaction_surface": str(getattr(item, "interaction_surface", "") or "workspace"),
+        "requires_confirmation": bool(getattr(item, "requires_confirmation", False)),
+        "software_name": str(getattr(task, "software_name", "") or "") if task is not None else "",
+        "industry_subtype_key": str(brief.get("industry_subtype_key") or ""),
+        "interaction_action_key": str(getattr(item, "interaction_action_key", "") or ""),
+        "interaction_role": str(getattr(item, "interaction_role", "") or ""),
+        "interaction_trigger": str(getattr(item, "interaction_trigger", "") or ""),
+        "interaction_input_fields": list(getattr(item, "interaction_input_fields", None) or []),
+        "interaction_pre_state": str(getattr(item, "interaction_pre_state", "") or ""),
+        "interaction_post_state": str(getattr(item, "interaction_post_state", "") or ""),
+        "interaction_result_evidence": str(getattr(item, "interaction_result_evidence", "") or ""),
+    }
+
+
+def _write_react_app_files(
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    react_dir: Path,
+    imports: list[str],
+    registrations: list[str],
+    pages: list[dict[str, Any]],
+    default_key: str,
+    visual_style_contract: dict[str, Any] | None = None,
+) -> None:
+    src_dir = react_dir / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
+    (react_dir / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "generated-react-ui",
+                "private": True,
+                "version": "1.0.0",
+                "type": "module",
+                "scripts": {"build": "vite build"},
+                "dependencies": {"react": "^19.2.3", "react-dom": "^19.2.3"},
+                "devDependencies": {"vite": "^7.2.7"},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    build_config = (
+        "export default { base: './', esbuild: { jsx: 'automatic' }, build: { outDir: 'dist', emptyOutDir: true, "
+        "rollupOptions: { output: { entryFileNames: 'assets/app.js', assetFileNames: 'assets/[name][extname]' } } } };\n"
+    )
+    (react_dir / "vite.config.js").write_text(build_config, encoding="utf-8")
+    module_root = _frontend_node_module_root()
+    alias_entries = [
+        ("react/jsx-runtime", module_root / "react" / "jsx-runtime.js"),
+        ("react/jsx-dev-runtime", module_root / "react" / "jsx-dev-runtime.js"),
+        ("react-dom/client", module_root / "react-dom" / "client.js"),
+        ("react-dom", module_root / "react-dom" / "index.js"),
+        ("react", module_root / "react" / "index.js"),
+    ]
+    alias_source = ",".join(
+        "{find:" + json.dumps(name) + ",replacement:" + json.dumps(str(path).replace("\\", "/")) + "}"
+        for name, path in alias_entries
+    )
+    (react_dir / "vite.runtime.config.js").write_text(
+        build_config.replace("export default {", f"export default {{ resolve: {{ alias: [{alias_source}] }},"),
+        encoding="utf-8",
+    )
+    (react_dir / "index.html").write_text('<!doctype html><html><head><meta charset="UTF-8"></head><body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>', encoding="utf-8")
+    (src_dir / "main.jsx").write_text('import React from "react";\nimport { createRoot } from "react-dom/client";\nimport App from "./App.jsx";\nimport "./theme.css";\ncreateRoot(document.getElementById("root")).render(<App />);\n', encoding="utf-8")
+    screen_meta = {
+        str(page.get("key") or ""): {
+            "title": str(page.get("title") or "功能界面"),
+            "page_kind": str(page.get("page_kind") or "general"),
+            "module_key": str(page.get("module_key") or ""),
+            "section": _shared_shell_section(page),
+            "interaction_action": str(page.get("interaction_action") or ""),
+            "interaction_mode": str(page.get("interaction_mode") or ""),
+            "interaction_surface": str(page.get("interaction_surface") or ""),
+            "requires_confirmation": bool(page.get("requires_confirmation")),
+            "interaction_action_key": str(page.get("interaction_action_key") or ""),
+            "interaction_role": str(page.get("interaction_role") or ""),
+            "interaction_trigger": str(page.get("interaction_trigger") or ""),
+            "interaction_input_fields": list(page.get("interaction_input_fields") or []),
+            "interaction_pre_state": str(page.get("interaction_pre_state") or ""),
+            "interaction_post_state": str(page.get("interaction_post_state") or ""),
+            "interaction_result_evidence": str(page.get("interaction_result_evidence") or ""),
+            "navigation_contract": dict(page.get("navigation_contract") or {}),
+        }
+        for page in pages
+        if str(page.get("key") or "")
+    }
+    design_brief = dict(getattr(ui_blueprint, "design_brief", {}) or {})
+    identity = design_brief.get("visual_identity_spec") if isinstance(design_brief.get("visual_identity_spec"), dict) else {}
+    nav_model = str(identity.get("nav_model") or design_brief.get("nav_model") or "top_tabs")
+    if renderer in {"mobile_app", "game"}:
+        nav_model = "top_tabs"
+    navigation_limit = 5 if nav_model == "side_menu" else 3
+    dashboard_page = next((page for page in pages if str(page.get("page_kind") or "") == "dashboard"), {})
+    statistics_page = next((page for page in pages if str(page.get("page_kind") or "") == "statistics"), {})
+    navigation = [
+        {"key": "dashboard", "label": _shared_shell_nav_label(str(dashboard_page.get("title") or "业务总览"))}
+    ]
+    navigation.extend(
+        {
+            "key": str(getattr(module, "key", "") or f"module_{index}"),
+            "label": _shared_shell_nav_label(str(getattr(module, "title", "") or f"功能{index}")),
+        }
+        for index, module in enumerate((blueprint.modules or [])[:navigation_limit], start=1)
+    )
+    if statistics_page:
+        navigation.append(
+            {"key": "statistics", "label": _shared_shell_nav_label(str(statistics_page.get("title") or "统计分析"))}
+        )
+    palette = identity.get("palette") if isinstance(identity.get("palette"), dict) else {}
+    shell_config = {
+        "software_name": task.software_name,
+        "version": task.version,
+        "industry": blueprint.industry or task.product_type,
+        "role": str((blueprint.roles or blueprint.target_users or ["当前用户"])[0]),
+        "navigation": navigation,
+        "nav_model": nav_model,
+        "layout_variant": str(identity.get("layout_variant") or design_brief.get("layout_variant") or "classic"),
+        "workspace_shape": str(identity.get("workspace_shape") or design_brief.get("workspace_shape") or "ledger_split"),
+        "identity_signature": str(identity.get("identity_signature") or design_brief.get("identity_signature") or ""),
+        "palette": {
+            "accent": str(palette.get("accent") or design_brief.get("accent") or "#0f766e"),
+            "accent_soft": str(palette.get("accent_soft") or design_brief.get("accent_soft") or "#ecfdf5"),
+            "sidebar": str(palette.get("sidebar") or design_brief.get("sidebar") or "#123c40"),
+            "canvas": str(palette.get("canvas") or design_brief.get("canvas") or "#f4fbf8"),
+        },
+        "industry_subtype_key": str(design_brief.get("industry_subtype_key") or ""),
+        "page_files": {
+            str(page.get("key") or ""): str(page.get("file") or "")
+            for page in pages
+            if str(page.get("key") or "") and str(page.get("file") or "")
+        },
+    }
+    if visual_style_contract and visual_style_contract.get("component_style"):
+        colors = visual_style_contract["component_style"]["colors"]
+        shell_config["palette"].update(accent=colors["accent"], sidebar=colors["text"], canvas=colors["canvas"])
+        shell_config["palette"]["accent_soft"] = f"color-mix(in srgb,{colors['accent']} 10%,#fff)"
+    (src_dir / "SharedAppShell.jsx").write_text(_shared_app_shell_source(), encoding="utf-8")
+    (src_dir / "SharedConfirmDialog.jsx").write_text(_shared_confirm_dialog_source(), encoding="utf-8")
+    app_source = "\n".join(imports) + '\nimport SharedAppShell from "./SharedAppShell.jsx";\nimport SharedConfirmDialog from "./SharedConfirmDialog.jsx";\n\nconst screens = {\n' + "\n".join(registrations) + "\n};\n" + f'''\nconst screenMeta = {json.dumps(screen_meta, ensure_ascii=False, indent=2)};
+const shellConfig = {json.dumps(shell_config, ensure_ascii=False, indent=2)};
+
+export default function App() {{
+  const key = window.__SOFT_SCREEN_KEY__ || new URLSearchParams(window.location.search).get("screen") || {json.dumps(default_key, ensure_ascii=False)};
+  const Screen = screens[key] || screens[{json.dumps(default_key, ensure_ascii=False)}];
+  const meta = screenMeta[key] || {{}};
+  return <div className="generated-product" data-renderer={json.dumps(renderer)} data-software={json.dumps(task.software_name, ensure_ascii=False)} data-shared-confirmation-contract="v1" data-shared-confirmation={{meta.requires_confirmation ? "true" : "false"}}>
+    <SharedAppShell renderer={json.dumps(renderer)} screenKey={{key}} screenMeta={{meta}} config={{shellConfig}}>
+      <Screen />
+      <SharedConfirmDialog screenKey={{key}} screenMeta={{meta}} />
+    </SharedAppShell>
+  </div>;
+}}
+'''
+    (src_dir / "App.jsx").write_text(app_source, encoding="utf-8")
+    mobile_css = "max-width:720px;margin:0 auto;" if renderer in {"mobile_app", "game"} else "width:100%;"
+    (src_dir / "theme.css").write_text(
+        _shared_app_shell_css(mobile_css) + _shared_confirm_dialog_css()
+        + component_style_css(visual_style_contract or {}, scope=".generated-product", shell=True), encoding="utf-8",
+    )
+
+
+def _shared_shell_section(page: dict[str, Any]) -> str:
+    page_kind = str(page.get("page_kind") or "").lower()
+    title = str(page.get("title") or "")
+    if page_kind == "dashboard":
+        return "dashboard"
+    if page_kind == "statistics":
+        return "statistics"
+    if page_kind == "login":
+        return "login"
+    if any(token in title for token in ("任务", "待办", "跟踪", "整改", "复验", "审核")):
+        return "tracking"
+    return "business"
+
+
+def _shared_shell_nav_label(value: str, limit: int = 8) -> str:
+    label = re.sub(r"(?:管理|平台|系统|界面|页面)$", "", re.sub(r"\s+", "", str(value or ""))).strip()
+    label = label or "功能"
+    return label[: max(2, int(limit or 0))]
+
+
+def _shared_app_shell_source() -> str:
+    return '''import React from "react";
+
+export default function SharedAppShell({ renderer, screenKey, screenMeta, config, children }) {
+  if (screenMeta?.section === "login" || screenKey === "login") return children;
+  const contract = screenMeta?.navigation_contract || {};
+  const navModel = contract?.nav_model || config?.nav_model || "top_tabs";
+  const primaryItems = contract?.primary_items || config?.navigation || [];
+  const secondaryItems = contract?.secondary_items || [];
+  const breadcrumb = contract?.breadcrumb || [];
+  const activePrimary = contract?.active_primary_key || screenMeta?.module_key || screenMeta?.section || "dashboard";
+  const activeSecondary = contract?.active_secondary_key || "";
+  const backTarget = contract?.back_target || {};
+  const mobile = renderer === "mobile_app" || renderer === "game";
+  const mark = String(config?.software_name || "软").trim().slice(0, 1) || "软";
+  const navigateToPage = (pageKey) => {
+    const target = config?.page_files?.[pageKey];
+    if (!target || pageKey === screenKey) return;
+    window.location.assign(target);
+  };
+  const shellStyle = {
+    "--shell-accent": config?.palette?.accent || "#0f766e",
+    "--shell-accent-soft": config?.palette?.accent_soft || "#ecfdf5",
+    "--shell-sidebar": config?.palette?.sidebar || "#123c40",
+    "--shell-canvas": config?.palette?.canvas || "#f4fbf8",
+  };
+  if (config?.industry_subtype_key === "design_viewer") return <div className="model-react-contract" data-navigation-contract={contract?.schema_version || ""} data-navigation-ready={contract?.ready ? "true" : "false"} data-navigation-level={contract?.level || ""} data-navigation-signature={contract?.hierarchy_signature || ""} data-navigation-active-primary={activePrimary} data-navigation-active-secondary={activeSecondary} data-navigation-back-target={backTarget?.page_key || ""} onClick={(event) => {
+    const target = event.target.closest("[data-navigation-page-key],[data-navigation-back-target]");
+    if (!target) return;
+    navigateToPage(target.getAttribute("data-navigation-page-key") || target.getAttribute("data-navigation-back-target") || "");
+  }}>{children}</div>;
+  const brand = <div className="shared-app-brand"><span className="shared-app-mark">{mark}</span><div><strong>{config?.software_name}</strong></div></div>;
+  const navigation = <nav className="shared-app-nav" aria-label="一级导航">
+    {primaryItems.map((item) => <span key={item.key} data-navigation-primary-item={item.key || ""} data-navigation-page-key={item.page_key || ""} onClick={() => navigateToPage(item.page_key)} className={item.key === activePrimary ? "active" : ""}>{item.label}</span>)}
+  </nav>;
+  const context = <div className="shared-app-context">{config?.role && <strong title={config.role}>{config.role}</strong>}</div>;
+  const hierarchy = <div className="shared-app-hierarchy">
+    <div className="shared-app-hierarchy-main">
+      {backTarget?.page_key && <span className="shared-app-back" data-navigation-back-target={backTarget.page_key} onClick={() => navigateToPage(backTarget.page_key)}>← {backTarget.label || "返回上级"}</span>}
+      <div className="shared-app-breadcrumb" aria-label="面包屑">{breadcrumb.map((item, index) => <React.Fragment key={`${item.key}-${index}`}><span data-navigation-breadcrumb-item={item.key || ""} data-navigation-page-key={item.page_key || ""} onClick={() => navigateToPage(item.page_key)}>{item.label}</span>{index < breadcrumb.length - 1 && <i>/</i>}</React.Fragment>)}</div>
+    </div>
+    {secondaryItems.length > 0 && <nav className={`shared-app-secondary shared-app-secondary-${contract?.secondary_style || "tabs"}`} aria-label="二级导航">{secondaryItems.map((item) => <span key={item.key} data-navigation-secondary-item={item.key || ""} data-navigation-page-key={item.page_key || ""} onClick={() => navigateToPage(item.page_key)} className={item.key === activeSecondary ? "active" : ""}>{item.label}</span>)}</nav>}
+  </div>;
+  return <div className={`shared-app-shell shared-app-shell-${renderer || "admin"}`} data-nav-model={navModel} data-layout-variant={config?.layout_variant || "classic"} data-identity-signature={config?.identity_signature || ""} data-navigation-contract={contract?.schema_version || ""} data-navigation-ready={contract?.ready ? "true" : "false"} data-navigation-level={contract?.level || ""} data-navigation-signature={contract?.hierarchy_signature || ""} data-navigation-active-primary={activePrimary} data-navigation-active-secondary={activeSecondary} data-navigation-back-target={backTarget?.page_key || ""} style={shellStyle}>
+    {mobile ? <header className="shared-app-header shared-app-mobile-header">{brand}{context}</header> : navModel === "side_menu" ? <aside className="shared-app-sidebar">{brand}{navigation}{context}</aside> : <header className="shared-app-header">{brand}{navigation}{context}</header>}
+    <div className="shared-app-workspace">{hierarchy}<main className="shared-app-main">{children}</main></div>
+    {mobile && <div className="shared-app-mobile-nav">{navigation}</div>}
+  </div>;
+}
+'''
+
+
+def _shared_confirm_dialog_source() -> str:
+    return '''import React, { useEffect, useMemo, useState } from "react";
+
+const clean = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+const clip = (value, limit) => {
+  const text = clean(value);
+  return text.length > limit ? `${text.slice(0, Math.max(1, limit - 1))}…` : text;
+};
+const splitList = (value) => {
+  const values = Array.isArray(value) ? value : String(value || "").replace(/[\\[\\]'\"]/g, "").split(/[,，、;；|]/);
+  return Array.from(new Set(values.map((item) => clean(item)).filter(Boolean)));
+};
+const fallbackData = (meta) => {
+  const action = clip(meta?.interaction_action || meta?.title || "当前操作", 32);
+  const roles = splitList(meta?.interaction_role).slice(0, 3).join("、") || "当前授权用户";
+  const pairs = [
+    { label: "当前操作", value: action },
+    { label: "执行角色", value: roles },
+    { label: "执行前状态", value: clip(meta?.interaction_pre_state || "当前业务状态已核验", 42) },
+    { label: "执行后状态", value: clip(meta?.interaction_post_state || "系统将记录处理结果", 42) },
+  ];
+  return {
+    title: action.startsWith("确认") ? action : `确认${action}`,
+    description: clip(meta?.interaction_trigger || "该操作将更新业务状态，请核对影响范围。", 92),
+    pairs,
+    evidence: splitList(meta?.interaction_result_evidence).slice(0, 4),
+    note: clip(meta?.interaction_post_state || "确认后系统将保存处理结果并记录操作轨迹。", 116),
+    actionLabel: action.startsWith("确认") ? action : `确认${action}`,
+  };
+};
+const itemPairs = (root) => Array.from(root?.querySelectorAll?.("[data-confirm-item],.impact-grid>div,.impact-summary>div,.confirm-summary>div,.confirm-order") || []).map((node) => {
+  const children = Array.from(node.children || []);
+  const labelNode = children.find((child) => child.matches?.("span,dt,label,small"));
+  const valueNode = children.find((child) => child.matches?.("strong,b,dd"));
+  const label = clip(node.getAttribute("data-label") || labelNode?.textContent, 20);
+  const value = clip(node.getAttribute("data-value") || valueNode?.textContent, 46);
+  return label && value ? { label, value } : null;
+}).filter(Boolean);
+const semanticData = (root) => {
+  const source = root?.querySelector?.('[data-shared-confirm-source="true"]');
+  if (!source) return null;
+  return {
+    title: clip(source.querySelector("[data-confirm-title]")?.textContent, 38),
+    description: clip(source.querySelector("[data-confirm-description]")?.textContent, 92),
+    pairs: itemPairs(source),
+    evidence: Array.from(source.querySelectorAll("[data-confirm-evidence]")).map((node) => clip(node.textContent, 20)).filter(Boolean),
+    note: clip(source.querySelector("[data-confirm-note]")?.textContent, 116),
+    actionLabel: clip(source.querySelector("[data-confirm-action]")?.textContent, 32),
+  };
+};
+const legacyData = (root) => {
+  const dialog = root?.querySelector?.('[role="dialog"],.confirm-dialog,.confirm-modal,.modal-dialog,.modal-card,.dialog-panel,.confirm-panel,.danger-confirm');
+  if (!dialog) return null;
+  const buttons = Array.from(dialog.querySelectorAll("button")).map((button) => clean(button.textContent)).filter(Boolean);
+  const actionLabel = [...buttons].reverse().find((label) => !/取消|返回|关闭/.test(label)) || "";
+  return {
+    title: clip(dialog.querySelector("[data-confirm-title],h1,h2,h3")?.textContent, 38),
+    description: clip(dialog.querySelector("[data-confirm-description],p")?.textContent, 92),
+    pairs: itemPairs(dialog),
+    evidence: [],
+    note: clip(dialog.querySelector("[data-confirm-note],.confirm-warning,.impact-note,.notice,.confirm-note")?.textContent, 116),
+    actionLabel: clip(actionLabel, 32),
+  };
+};
+const mergeData = (extracted, fallback) => {
+  const pairs = [];
+  for (const pair of [...(extracted?.pairs || []), ...fallback.pairs]) {
+    if (!pair?.label || !pair?.value || pairs.some((item) => item.label === pair.label && item.value === pair.value)) continue;
+    pairs.push(pair);
+    if (pairs.length >= 4) break;
+  }
+  return {
+    title: extracted?.title || fallback.title,
+    description: extracted?.description || fallback.description,
+    pairs,
+    evidence: extracted?.evidence?.length ? extracted.evidence.slice(0, 4) : fallback.evidence,
+    note: extracted?.note || fallback.note,
+    actionLabel: extracted?.actionLabel || fallback.actionLabel,
+  };
+};
+
+export default function SharedConfirmDialog({ screenKey, screenMeta }) {
+  const fallback = useMemo(() => fallbackData(screenMeta), [screenMeta]);
+  const [dialog, setDialog] = useState(fallback);
+  useEffect(() => {
+    if (!screenMeta?.requires_confirmation) return undefined;
+    const frame = requestAnimationFrame(() => {
+      const root = document.querySelector(".shared-app-main .screen-root,.screen-root");
+      setDialog(mergeData(semanticData(root) || legacyData(root), fallback));
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [screenKey, screenMeta, fallback]);
+  if (!screenMeta?.requires_confirmation) return null;
+  const titleId = `shared-confirm-title-${String(screenKey || "page").replace(/[^A-Za-z0-9_-]/g, "-")}`;
+  return <div className="shared-confirm-layer" data-shared-confirm-layer="true">
+    <section className="shared-confirm-dialog" data-shared-confirm-dialog="true" data-shared-confirm-ready="true" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+      <header className="shared-confirm-header">
+        <span className="shared-confirm-mark" aria-hidden="true">!</span>
+        <div><span className="shared-confirm-kicker">关键业务操作确认</span><h2 id={titleId}>{dialog.title}</h2><p>{dialog.description}</p></div>
+      </header>
+      <div className="shared-confirm-body">
+        <div className="shared-confirm-summary">{dialog.pairs.slice(0, 4).map((item, index) => <div key={`${item.label}-${index}`}><span>{item.label}</span><strong>{item.value}</strong></div>)}</div>
+        {dialog.evidence.length > 0 && <div className="shared-confirm-evidence"><span>结果依据</span>{dialog.evidence.slice(0, 4).map((item) => <b key={item}>{item}</b>)}</div>}
+        <div className="shared-confirm-note"><strong>状态影响</strong><span>{dialog.note}</span></div>
+      </div>
+      <footer className="shared-confirm-actions"><button className="shared-confirm-cancel" type="button">取消</button><button className="shared-confirm-primary" type="button">{dialog.actionLabel}</button></footer>
+    </section>
+  </div>;
+}
+'''
+
+
+def _shared_app_shell_css(mobile_css: str) -> str:
+    base = f'''*{{box-sizing:border-box}}html,body,#root{{margin:0;width:100%;height:100%;overflow:hidden}}body{{font-family:'Microsoft YaHei','PingFang SC',Arial,sans-serif;background:#eef2f7;color:#172033}}button,input,select,textarea{{font:inherit}}.generated-product{{height:100%;{mobile_css}}}.model-react-contract{{width:100%;height:100%;min-width:0;min-height:0;overflow:hidden}}.model-react-contract>.screen-root{{width:100%;height:100%;min-width:0;min-height:0}}.shared-app-shell{{height:100%;display:grid;grid-template-rows:66px minmax(0,1fr);background:#081a31;overflow:hidden}}.shared-app-header{{display:grid;grid-template-columns:minmax(280px,360px) minmax(420px,1fr) minmax(210px,280px);align-items:center;gap:18px;padding:0 18px;background:linear-gradient(90deg,#0a1c35,#102b4d 58%,#0a203c);border-bottom:1px solid rgba(96,165,250,.28);color:#e8f3ff;box-shadow:0 8px 22px rgba(2,12,27,.24);z-index:20}}.shared-app-brand{{display:flex;align-items:center;gap:11px;min-width:0}}.shared-app-mark{{width:38px;height:38px;flex:0 0 38px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(135deg,#f59e0b,#2563eb);color:white;font-weight:900;box-shadow:0 4px 14px rgba(37,99,235,.35)}}.shared-app-brand div,.shared-app-context{{min-width:0}}.shared-app-brand strong,.shared-app-brand small{{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-brand strong{{font-size:15px}}.shared-app-brand small{{margin-top:4px;color:#93c5fd;font-size:11px}}.shared-app-nav{{display:flex;align-items:center;justify-content:center;gap:6px;min-width:0;overflow:hidden}}.shared-app-nav span{{height:34px;display:inline-flex;align-items:center;padding:0 13px;border:1px solid rgba(147,197,253,.2);border-radius:6px;background:rgba(9,30,57,.62);color:#bfd7f5;font-size:12px;white-space:nowrap}}.shared-app-nav span.active{{background:#2563eb;border-color:#60a5fa;color:white;box-shadow:inset 0 -3px 0 #f59e0b}}.shared-app-context{{display:grid;grid-template-columns:1fr auto;align-items:center;column-gap:9px;text-align:right}}.shared-app-context span{{grid-column:1/3;color:#93c5fd;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-context strong{{margin-top:3px;color:#fef3c7;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-context em{{margin-top:3px;color:#7dd3fc;font-size:10px;font-style:normal;white-space:nowrap}}.shared-app-main{{min-height:0;overflow:hidden;position:relative}}.shared-app-main .screen-root{{width:100%!important;height:100%!important;min-height:0!important;max-height:100%!important;overflow:hidden!important}}.shared-app-main .screen-root>header:first-child,.shared-app-main .screen-root>.topbar:first-child,.shared-app-main .screen-root>.mobile-header:first-child,.shared-app-main .screen-root>.app-header:first-child{{display:none!important}}.shared-app-main .screen-root:has(>.mobile-header:first-child){{grid-template-rows:minmax(0,1fr) 78px!important}}@media(max-width:980px){{.shared-app-header{{grid-template-columns:minmax(220px,1fr) auto;padding:0 14px}}.shared-app-nav{{justify-content:flex-end}}.shared-app-nav span{{padding:0 9px}}.shared-app-context{{display:none}}}}.shared-app-shell-mobile_app{{grid-template-rows:72px minmax(0,1fr)}}.shared-app-shell-mobile_app .shared-app-header{{grid-template-columns:minmax(210px,1fr) minmax(300px,1.4fr);gap:10px;padding:0 16px}}.shared-app-shell-mobile_app .shared-app-context{{display:none}}.shared-app-shell-mobile_app .shared-app-nav{{justify-content:flex-end;overflow:hidden}}.shared-app-shell-mobile_app .shared-app-nav span{{padding:0 9px;font-size:11px}}.screen-root{{width:100%;height:100%;overflow:hidden}}
+'''
+    return base + '''
+.shared-app-shell{background:var(--shell-canvas,#f4fbf8);}
+.shared-app-header{grid-template-columns:minmax(260px,340px) minmax(0,1fr) minmax(160px,220px);gap:14px;}
+.shared-app-context{width:100%;min-width:0;display:flex;align-items:center;justify-content:flex-end;overflow:visible;}
+.shared-app-context strong,.shared-app-context em{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-app-nav span[data-navigation-page-key]:not([data-navigation-page-key=""]),.shared-app-back,.shared-app-breadcrumb span[data-navigation-page-key]:not([data-navigation-page-key=""]),.shared-app-secondary span[data-navigation-page-key]:not([data-navigation-page-key=""]){cursor:pointer;}
+@media(max-width:1180px){.shared-app-header{grid-template-columns:minmax(230px,300px) minmax(0,1fr) minmax(130px,180px);gap:10px}.shared-app-context em{display:none}.shared-app-context span{grid-column:1/3}}
+.shared-app-header{background:var(--shell-sidebar,#123c40);border-bottom-color:color-mix(in srgb,var(--shell-accent,#0f766e) 58%,#fff);box-shadow:0 5px 16px rgba(15,23,42,.18);}
+.shared-app-mark{border-radius:6px;background:var(--shell-accent,#0f766e);box-shadow:none;}
+.shared-app-brand small,.shared-app-context span,.shared-app-context em{color:color-mix(in srgb,var(--shell-accent-soft,#ecfdf5) 78%,#fff);}
+.shared-app-context strong{color:#fff;}
+.shared-app-nav span{border-color:rgba(255,255,255,.22);background:rgba(255,255,255,.06);color:rgba(255,255,255,.78);}
+.shared-app-nav span.active{background:var(--shell-accent,#0f766e);border-color:rgba(255,255,255,.56);box-shadow:inset 0 -3px 0 #fff;color:#fff;}
+.shared-app-shell[data-nav-model="rail"]{grid-template-rows:54px minmax(0,1fr);}
+.shared-app-shell[data-nav-model="rail"] .shared-app-header{grid-template-columns:minmax(260px,330px) minmax(420px,1fr) minmax(180px,240px);padding:0 14px;box-shadow:none;}
+.shared-app-shell[data-nav-model="rail"] .shared-app-mark{width:30px;height:30px;flex-basis:30px;border-radius:4px;}
+.shared-app-shell[data-nav-model="rail"] .shared-app-nav{height:100%;gap:0;justify-content:flex-start;}
+.shared-app-shell[data-nav-model="rail"] .shared-app-nav span{height:100%;padding:0 18px;border:0;border-radius:0;background:transparent;}
+.shared-app-shell[data-nav-model="rail"] .shared-app-nav span.active{background:rgba(255,255,255,.1);box-shadow:inset 0 -4px 0 var(--shell-accent,#0f766e);}
+.shared-app-shell[data-nav-model="side_menu"]{grid-template-columns:188px minmax(0,1fr);grid-template-rows:minmax(0,1fr);}
+.shared-app-sidebar{min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:18px;padding:18px 12px 14px;background:var(--shell-sidebar,#123c40);color:#fff;border-right:1px solid rgba(255,255,255,.12);}
+.shared-app-sidebar .shared-app-brand{align-items:flex-start;}
+.shared-app-sidebar .shared-app-brand strong{font-size:14px;white-space:normal;line-height:1.35;}
+.shared-app-sidebar .shared-app-brand small{font-size:10px;white-space:normal;line-height:1.45;}
+.shared-app-sidebar .shared-app-nav{display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:5px;overflow:hidden;}
+.shared-app-sidebar .shared-app-nav span{height:36px;justify-content:flex-start;padding:0 11px;border:0;border-radius:4px;background:transparent;color:rgba(255,255,255,.76);}
+.shared-app-sidebar .shared-app-nav span.active{background:var(--shell-accent,#0f766e);box-shadow:inset 3px 0 0 #fff;color:#fff;}
+.shared-app-sidebar .shared-app-context{display:block;padding-top:12px;border-top:1px solid rgba(255,255,255,.16);text-align:left;}
+.shared-app-sidebar .shared-app-context span,.shared-app-sidebar .shared-app-context strong,.shared-app-sidebar .shared-app-context em{display:block;margin:0 0 5px;white-space:normal;line-height:1.35;}
+.shared-app-sidebar .shared-app-context em{display:none;}
+.shared-app-workspace{min-width:0;min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr);overflow:hidden;background:var(--shell-canvas,#f4fbf8);}
+.shared-app-shell[data-nav-model="side_menu"]>.shared-app-workspace{grid-column:2;grid-row:1;}
+.shared-app-hierarchy{min-height:72px;display:grid;grid-template-columns:minmax(240px,.9fr) minmax(360px,1.35fr);align-items:center;gap:18px;padding:9px 18px;border-bottom:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 14%,#fff);background:color-mix(in srgb,var(--shell-canvas,#f4fbf8) 46%,#fff);box-shadow:0 3px 10px rgba(15,23,42,.07);z-index:12;}
+.shared-app-hierarchy-main{min-width:0;display:grid;gap:7px;align-content:center;}
+.shared-app-back{width:max-content;max-width:100%;display:inline-flex;align-items:center;padding:3px 8px;border:1px solid color-mix(in srgb,var(--shell-accent,#0f766e) 28%,#fff);border-radius:4px;background:var(--shell-accent-soft,#ecfdf5);color:var(--shell-accent,#0f766e);font-size:10px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-app-breadcrumb{min-width:0;display:flex;align-items:center;gap:7px;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 72%,#64748b);font-size:11px;overflow:hidden;white-space:nowrap;}
+.shared-app-breadcrumb span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-app-breadcrumb span:last-of-type{color:color-mix(in srgb,var(--shell-sidebar,#123c40) 92%,#111827);font-weight:700;}
+.shared-app-breadcrumb i{color:color-mix(in srgb,var(--shell-sidebar,#123c40) 32%,#cbd5e1);font-style:normal;}
+.shared-app-secondary{min-width:0;display:flex;align-items:center;justify-content:flex-end;gap:5px;overflow:hidden;}
+.shared-app-secondary span{height:31px;min-width:0;display:inline-flex;align-items:center;padding:0 11px;border:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 16%,#fff);border-radius:5px;background:#fff;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 66%,#475569);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-app-secondary span.active{border-color:var(--shell-accent,#0f766e);background:var(--shell-accent-soft,#ecfdf5);color:var(--shell-accent,#0f766e);font-weight:800;}
+.shared-app-secondary-rail{padding-left:10px;border-left:3px solid var(--shell-accent,#0f766e);}
+.shared-app-secondary-rail span{border-radius:2px;}
+.shared-app-secondary-segmented{gap:0;padding:3px;border-radius:7px;background:color-mix(in srgb,var(--shell-sidebar,#123c40) 8%,#fff);}
+.shared-app-secondary-segmented span{border:0;background:transparent;}
+.shared-app-secondary-segmented span.active{background:#fff;box-shadow:0 2px 7px rgba(15,23,42,.12);}
+.shared-app-mobile-nav{display:none;}
+.shared-app-shell-mobile_app,.shared-app-shell-game{grid-template-columns:minmax(0,1fr);grid-template-rows:72px minmax(0,1fr) 70px;}
+.shared-app-shell-mobile_app>.shared-app-workspace,.shared-app-shell-game>.shared-app-workspace{grid-column:1;grid-row:2;}
+.shared-app-mobile-header{grid-column:1;grid-row:1;grid-template-columns:minmax(0,1fr) minmax(150px,.7fr)!important;}
+.shared-app-mobile-header .shared-app-context{display:grid!important;}
+.shared-app-mobile-header .shared-app-context em{display:none;}
+.shared-app-mobile-nav{grid-column:1;grid-row:3;display:block;min-height:0;padding:8px 14px;background:#fff;border-top:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 14%,#fff);box-shadow:0 -5px 16px rgba(15,23,42,.08);z-index:18;}
+.shared-app-mobile-nav .shared-app-nav{height:100%;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;overflow:visible;}
+.shared-app-mobile-nav .shared-app-nav span{height:46px;justify-content:center;padding:0 5px;border:0;border-radius:8px;background:transparent;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 62%,#64748b);font-size:11px;}
+.shared-app-mobile-nav .shared-app-nav span.active{background:var(--shell-accent-soft,#ecfdf5);color:var(--shell-accent,#0f766e);box-shadow:inset 0 -3px 0 var(--shell-accent,#0f766e);font-weight:800;}
+.shared-app-shell-mobile_app .shared-app-hierarchy,.shared-app-shell-game .shared-app-hierarchy{min-height:86px;grid-template-columns:1fr;gap:6px;padding:8px 14px;}
+.shared-app-shell-mobile_app .shared-app-hierarchy-main,.shared-app-shell-game .shared-app-hierarchy-main{grid-template-columns:auto minmax(0,1fr);align-items:center;gap:9px;}
+.shared-app-shell-mobile_app .shared-app-secondary,.shared-app-shell-game .shared-app-secondary{justify-content:flex-start;}
+.shared-app-shell-mobile_app .shared-app-secondary span,.shared-app-shell-game .shared-app-secondary span{flex:1;justify-content:center;padding:0 6px;}
+@media(max-width:980px){.shared-app-hierarchy{grid-template-columns:minmax(200px,.8fr) minmax(300px,1.2fr);padding-left:12px;padding-right:12px}.shared-app-secondary span{padding:0 7px}}
+'''
+
+
+def _shared_confirm_dialog_css() -> str:
+    return '''
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[class*="confirm"][class*="mask"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[class*="confirm"][class*="layer"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[class*="confirm"][class*="overlay"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[class*="modal"][class*="mask"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[class*="modal"][class*="layer"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[class*="modal"][class*="overlay"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>[role="dialog"],
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>.confirm-dialog,
+.generated-product[data-shared-confirmation="true"] .shared-app-main .screen-root>.confirm-modal{display:none!important;}
+.shared-confirm-layer{position:absolute;inset:0;z-index:120;display:grid;place-items:center;padding:24px;background:color-mix(in srgb,var(--shell-sidebar,#123c40) 68%,transparent);backdrop-filter:blur(2px);}
+.shared-confirm-dialog{width:min(720px,calc(100vw - 48px));height:390px;max-height:calc(100vh - 48px);display:grid;grid-template-rows:104px minmax(0,1fr) 58px;overflow:hidden;background:color-mix(in srgb,var(--shell-canvas,#f4fbf8) 14%,#fff);border:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 24%,#fff);border-top:4px solid var(--shell-accent,#0f766e);border-radius:8px;box-shadow:0 22px 54px color-mix(in srgb,var(--shell-sidebar,#123c40) 42%,transparent);color:color-mix(in srgb,var(--shell-sidebar,#123c40) 84%,#111827);letter-spacing:0;}
+.shared-confirm-header{display:grid;grid-template-columns:38px minmax(0,1fr);gap:14px;align-items:start;padding:17px 22px 14px;border-bottom:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 16%,#fff);background:color-mix(in srgb,var(--shell-canvas,#f4fbf8) 10%,#fff);}
+.shared-confirm-mark{width:34px;height:34px;display:grid;place-items:center;border:1px solid color-mix(in srgb,var(--shell-accent,#0f766e) 55%,#fff);border-radius:50%;background:var(--shell-accent-soft,#ecfdf5);color:var(--shell-accent,#0f766e);font-size:20px;font-weight:800;line-height:1;}
+.shared-confirm-kicker{display:block;color:var(--shell-accent,#0f766e);font-size:10px;font-weight:700;}
+.shared-confirm-header h2{margin:2px 0 3px;font-size:19px;line-height:1.35;letter-spacing:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-confirm-header p{display:-webkit-box;overflow:hidden;margin:0;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 62%,#fff);font-size:11px;line-height:1.5;-webkit-box-orient:vertical;-webkit-line-clamp:2;}
+.shared-confirm-body{min-height:0;display:grid;grid-template-rows:auto auto minmax(48px,1fr);gap:10px;padding:14px 22px;background:color-mix(in srgb,var(--shell-canvas,#f4fbf8) 8%,#fff);overflow:hidden;}
+.shared-confirm-summary{display:grid;grid-template-columns:1fr 1fr;border:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 16%,#fff);background:color-mix(in srgb,var(--shell-sidebar,#123c40) 16%,#fff);gap:1px;min-height:112px;}
+.shared-confirm-summary>div{min-width:0;padding:10px 13px;background:color-mix(in srgb,var(--shell-canvas,#f4fbf8) 36%,#fff);}
+.shared-confirm-summary span,.shared-confirm-summary strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-confirm-summary span{color:color-mix(in srgb,var(--shell-sidebar,#123c40) 58%,#fff);font-size:10px;}
+.shared-confirm-summary strong{margin-top:4px;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 88%,#111827);font-size:12px;}
+.shared-confirm-evidence{min-height:28px;display:flex;align-items:center;gap:6px;overflow:hidden;white-space:nowrap;}
+.shared-confirm-evidence>span{flex:0 0 auto;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 62%,#fff);font-size:10px;font-weight:700;}
+.shared-confirm-evidence b{min-width:0;padding:4px 7px;border:1px solid color-mix(in srgb,var(--shell-accent,#0f766e) 38%,#fff);background:var(--shell-accent-soft,#ecfdf5);color:color-mix(in srgb,var(--shell-accent,#0f766e) 82%,var(--shell-sidebar,#123c40));font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-confirm-note{min-height:48px;display:grid;grid-template-columns:64px minmax(0,1fr);gap:10px;align-items:start;padding:9px 11px;border-left:3px solid var(--shell-accent,#0f766e);background:color-mix(in srgb,var(--shell-accent-soft,#ecfdf5) 72%,#fff);color:color-mix(in srgb,var(--shell-sidebar,#123c40) 76%,#374151);overflow:hidden;}
+.shared-confirm-note strong{color:var(--shell-accent,#0f766e);font-size:11px;white-space:nowrap;}
+.shared-confirm-note span{display:-webkit-box;overflow:hidden;font-size:11px;line-height:1.55;-webkit-box-orient:vertical;-webkit-line-clamp:2;}
+.shared-confirm-actions{display:flex;align-items:center;justify-content:flex-end;gap:9px;padding:10px 22px;border-top:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 16%,#fff);background:color-mix(in srgb,var(--shell-canvas,#f4fbf8) 32%,#fff);}
+.shared-confirm-actions button{height:34px;min-width:94px;padding:0 15px;border:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 26%,#fff);border-radius:5px;background:#fff;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 80%,#1f2937);font-size:11px;font-weight:700;white-space:nowrap;cursor:pointer;}
+.shared-confirm-actions .shared-confirm-primary{max-width:280px;overflow:hidden;border-color:var(--shell-accent,#0f766e);background:var(--shell-accent,#0f766e);color:#fff;text-overflow:ellipsis;}
+@media(max-width:760px){.shared-confirm-layer{padding:16px}.shared-confirm-dialog{width:calc(100vw - 32px);height:480px;grid-template-rows:112px minmax(0,1fr) 62px}.shared-confirm-body{padding:14px 16px}.shared-confirm-header,.shared-confirm-actions{padding-left:16px;padding-right:16px}.shared-confirm-summary{grid-template-columns:1fr}.shared-confirm-summary>div:nth-child(n+4){display:none}.shared-confirm-evidence b:nth-of-type(n+4){display:none}}
+'''
+
+
+def _publish_react_page_entries(prototype_dir: Path, dist_dir: Path, screenshots: list[Any], *, renderer: str) -> None:
+    assets_source = dist_dir / "assets"
+    assets_target = prototype_dir / "assets"
+    if not assets_source.exists():
+        raise RuntimeError("React + Vite 构建产物缺少 assets")
+    if assets_target.exists():
+        shutil.rmtree(assets_target)
+    shutil.copytree(assets_source, assets_target)
+    css_links = "".join(f'<link rel="stylesheet" href="./assets/{escape(path.name)}">' for path in sorted(assets_target.glob("*.css")))
+    for item in screenshots:
+        page_key = str(getattr(item, "key", "") or "")
+        page_kind = str(getattr(item, "page_kind", "") or "general")
+        module_key = str(getattr(item, "module_key", "") or "")
+        title = str(getattr(item, "title", "") or page_key)
+        html_path = Path(str(getattr(item, "html_path", "") or ""))
+        html_path.write_text(
+            '<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">'
+            f'<meta name="soft-react-screen" content="{escape(page_key)}"><title>{escape(title)}</title>{css_links}</head>'
+            f'<body data-ai-frontend="true" data-renderer="{escape(renderer)}" data-page-kind="{escape(page_kind)}" data-module-key="{escape(module_key)}"><div id="root"></div>'
+            f'<script>window.__SOFT_SCREEN_KEY__={json.dumps(page_key, ensure_ascii=False)};</script>'
+            '<script type="module" src="./assets/app.js"></script></body></html>',
+            encoding="utf-8",
+        )
+
+
+def _generate_stable_component_shell_pages(
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    screenshots: list[Any],
+    module_by_key: dict[str, FeatureModule],
+    visual_reference_report: dict[str, Any],
+    style_reference: dict[str, Any],
+    emit=None,
+    codegen_progress_start: int = 44,
+) -> dict[str, Any]:
+    total = len(screenshots)
+    pages: list[dict[str, Any]] = []
+    design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
+    shell_spec = _stable_shell_spec(task, blueprint, ui_blueprint, visual_reference_report)
+    for index, item in enumerate(screenshots, start=1):
+        progress = codegen_progress_start + min(4, int(index / max(total, 1) * 4))
+        _emit(emit, progress, f"根据参考图选择稳定组件架构并生成界面 {index}/{total}")
+        page_key = str(getattr(item, "key", "") or f"page_{index}")
+        page_kind = str(getattr(item, "page_kind", "") or "general")
+        module_key = str(getattr(item, "module_key", "") or "")
+        module = module_by_key.get(module_key)
+        html_path = Path(str(getattr(item, "html_path", "") or ""))
+        if not str(html_path).strip() or html_path.name == "":
+            raise RuntimeError(f"{page_key} 缺少界面 HTML 输出路径。")
+        html = _stable_shell_html(
+            task=task,
+            blueprint=blueprint,
+            ui_blueprint=ui_blueprint,
+            screenshot=item,
+            module=module,
+            shell_spec=shell_spec,
+            design_brief=design_brief,
+            index=index,
+        )
+        html_path.parent.mkdir(parents=True, exist_ok=True)
+        html_path.write_text(html, encoding="utf-8")
+        pages.append(
+            {
+                "key": page_key,
+                "file": html_path.name,
+                "page_kind": page_kind,
+                "module_key": module_key,
+                "source": "stable-component-shell",
+                "visual_reference": _report_reference_summary(style_reference),
+                "architecture": shell_spec,
+            }
+        )
+        trace_event(
+            "ai_frontend_stable_shell_page_success",
+            page_key=page_key,
+            index=index,
+            total=total,
+            module_key=module_key,
+            page_kind=page_kind,
+        )
+    return {
+        "enabled": True,
+        "ready": len(pages) == total,
+        "source": "gpt-visual-reference-stable-component-shell",
+        "page_count": len(pages),
+        "architecture": shell_spec,
+        "visual_references": visual_reference_report,
+        "pages": pages,
+    }
+
+
+def _stable_shell_spec(task: GenerationTask, blueprint: ProductBlueprint, ui_blueprint: UiBlueprint, visual_reference_report: dict[str, Any]) -> dict[str, Any]:
+    design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
+    identity = design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {}
+    reference = visual_reference_report.get("style_reference") if isinstance(visual_reference_report, dict) else {}
+    tokens = reference.get("visual_tokens") if isinstance(reference, dict) else []
+    return {
+        "strategy": "reference-driven-stable-component-shell",
+        "renderer": "admin",
+        "viewport": "1280x720",
+        "shell": "desktop-operations-console",
+        "component_library": "local-stable-admin-components",
+        "palette_key": str((identity or {}).get("palette_key") or "industrial-teal-amber"),
+        "style_tokens": [str(item) for item in (tokens or [])[:8]],
+        "software_name": task.software_name,
+        "module_count": len(getattr(blueprint, "modules", []) or []),
+    }
+
+
+def _stable_shell_html(
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    screenshot: Any,
+    module: FeatureModule | None,
+    shell_spec: dict[str, Any],
+    design_brief: dict[str, Any],
+    index: int,
+) -> str:
+    page_key = str(getattr(screenshot, "key", "") or f"page_{index}")
+    page_kind = str(getattr(screenshot, "page_kind", "") or "general")
+    module_key = str(getattr(screenshot, "module_key", "") or "")
+    title = str(getattr(screenshot, "title", "") or _page_title(page_kind, module))
+    active_module = module or (getattr(blueprint, "modules", []) or [None])[0]
+    nav = _stable_nav(blueprint, active_module)
+    if page_kind == "login":
+        body = _stable_login_body(task, blueprint, shell_spec)
+    elif page_kind == "dashboard":
+        body = _stable_dashboard_body(task, blueprint, shell_spec)
+    elif page_kind == "statistics":
+        body = _stable_statistics_body(task, blueprint, shell_spec)
+    elif page_kind == "operation":
+        body = _stable_operation_body(task, blueprint, active_module, title, shell_spec, screenshot=screenshot)
+    else:
+        body = _stable_module_body(task, blueprint, active_module, title, shell_spec)
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=1280,height=720,initial-scale=1" />
+<title>{escape(title)}</title>
+{_stable_shell_css(shell_spec)}
+</head>
+<body>
+<div class="stable-app">
+  <aside class="stable-side">
+    <div class="stable-brand"><span>{escape(_brand_mark(task.software_name))}</span><b>{escape(_clip(task.software_name, 18))}</b></div>
+    <nav>{nav}</nav>
+    <div class="stable-side-foot">版本 {escape(task.version)} · 运行监测</div>
+  </aside>
+  <main class="stable-main">
+    <header class="stable-top">
+      <div><b>{escape(title)}</b><span>{escape(_clip(blueprint.scenario or blueprint.summary or task.product_type, 54))}</span></div>
+      <div class="stable-top-actions"><span>在线</span><span>告警 {len(blueprint.modules) + 7}</span><span>2026-07-10 18:30</span></div>
+    </header>
+    {body}
+  </main>
+</div>
+</body>
+</html>"""
+    return _prepare_runtime_html(
+        html,
+        title=title,
+        renderer="admin",
+        page_kind=page_kind,
+        module_key=module_key,
+    )
+
+
+def _stable_shell_css(shell_spec: dict[str, Any]) -> str:
+    return """
+<style>
+html,body{margin:0;width:1280px;height:720px;overflow:hidden;box-sizing:border-box;background:#f3f6f8;color:#172033;font-family:"Microsoft YaHei","PingFang SC",Arial,sans-serif}
+*,*::before,*::after{box-sizing:inherit}
+.stable-app{width:1280px;height:720px;display:grid;grid-template-columns:176px 1fr;background:#f3f6f8;overflow:hidden}
+.stable-side{min-width:0;background:#172033;color:#dbe7f3;display:flex;flex-direction:column;border-right:1px solid #0f172a}
+.stable-brand{height:58px;display:flex;align-items:center;gap:9px;padding:0 13px;border-bottom:1px solid rgba(255,255,255,.08)}
+.stable-brand span{width:28px;height:28px;border-radius:6px;background:#0f9f8f;color:#fff;display:grid;place-items:center;font-weight:800}
+.stable-brand b{font-size:13px;line-height:1.2;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stable-side nav{padding:10px 8px;display:grid;gap:5px;overflow:hidden}
+.stable-nav-item{height:31px;display:flex;align-items:center;gap:8px;padding:0 9px;border-radius:5px;color:#bfd0df;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stable-nav-item.active{background:#0f766e;color:#fff}
+.stable-nav-item i{width:7px;height:7px;border-radius:50%;background:#38bdf8;flex:0 0 auto}
+.stable-side-foot{margin-top:auto;height:34px;display:flex;align-items:center;padding:0 12px;border-top:1px solid rgba(255,255,255,.08);font-size:11px;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stable-main{min-width:0;height:720px;display:grid;grid-template-rows:58px 1fr;overflow:hidden}
+.stable-top{min-width:0;background:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 18px;border-bottom:1px solid #dbe4ee}
+.stable-top b{display:block;font-size:18px;line-height:1.2;max-width:560px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stable-top span{display:block;margin-top:4px;color:#64748b;font-size:12px;max-width:650px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stable-top-actions{display:flex;gap:8px;align-items:center;max-width:420px;overflow:hidden}
+.stable-top-actions span{margin:0;height:24px;padding:0 8px;border:1px solid #cfe0ed;border-radius:12px;background:#f8fafc;color:#475569;font-size:11px;display:flex;align-items:center;white-space:nowrap}
+.stable-workspace{height:662px;padding:12px;display:grid;gap:10px;overflow:hidden}
+.stable-grid{display:grid;gap:10px;min-width:0;min-height:0}
+.cols-3{grid-template-columns:1.04fr 1.22fr .9fr}.cols-2{grid-template-columns:1.35fr .9fr}.rows-main{grid-template-rows:92px 1fr 188px}
+.stable-card{min-width:0;min-height:0;background:#fff;border:1px solid #dbe4ee;border-radius:7px;overflow:hidden;box-shadow:0 6px 18px rgba(15,23,42,.045)}
+.stable-card-h{height:34px;display:flex;align-items:center;justify-content:space-between;padding:0 11px;border-bottom:1px solid #e5edf5;background:#f8fafc}
+.stable-card-h b{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.stable-card-h span{font-size:11px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.metric-row{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.metric{height:82px;padding:10px;border:1px solid #dbe4ee;border-radius:7px;background:#fff;overflow:hidden}
+.metric span{font-size:12px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}.metric b{font-size:23px;line-height:1.2;color:#0f766e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;margin-top:7px}
+.runtime-record-panel{padding:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.runtime-record-panel div{min-width:0;border:1px solid #e5edf5;border-radius:6px;padding:7px;background:#fbfdff;overflow:hidden}.runtime-record-panel span{display:block;color:#64748b;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.runtime-record-panel b{display:block;color:#172033;font-size:13px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stable-map{position:relative;height:100%;min-height:210px;background:linear-gradient(135deg,#dcebf1,#f6f1e6);overflow:hidden}
+.stable-map::before{content:"";position:absolute;inset:24px;background:repeating-linear-gradient(36deg,rgba(15,118,110,.12) 0 18px,rgba(14,165,233,.10) 19px 32px);border:1px solid rgba(15,118,110,.18)}
+.map-pin{position:absolute;min-width:62px;height:24px;border-radius:12px;background:#0f766e;color:#fff;font-size:11px;line-height:24px;text-align:center;padding:0 8px;box-shadow:0 5px 16px rgba(15,118,110,.22);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.p1{left:68px;top:64px}.p2{left:210px;top:118px;background:#d97706}.p3{left:340px;top:72px;background:#dc2626}.p4{left:150px;top:176px;background:#2563eb}
+.table-frame{height:100%;overflow:hidden}.stable-table{width:100%;table-layout:fixed;border-collapse:collapse;font-size:12px}.stable-table th,.stable-table td{height:28px;max-height:28px;border-bottom:1px solid #e8eef5;padding:0 8px;line-height:1.12;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.stable-table th{background:#f8fafc;color:#475569;font-weight:700}
+.tag{display:inline-flex;height:20px;max-width:100%;align-items:center;justify-content:center;border-radius:10px;padding:0 7px;font-size:11px;line-height:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border:1px solid #cbd5e1;color:#475569;background:#f8fafc}.tag.green{border-color:#86efac;color:#15803d;background:#f0fdf4}.tag.orange{border-color:#fdba74;color:#c2410c;background:#fff7ed}.tag.red{border-color:#fca5a5;color:#b91c1c;background:#fef2f2}
+.stable-actions{display:flex;gap:7px;flex-wrap:wrap;align-content:start;overflow:hidden}.opbtn,.stable-btn{height:22px;max-height:22px;border:1px solid #cbd5e1;background:#fff;border-radius:5px;padding:0 9px;font-size:11px;line-height:1;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#334155}.opbtn.primary,.stable-btn.primary{background:#0f766e;border-color:#0f766e;color:#fff}
+.stable-form{padding:12px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.stable-form label{display:flex;flex-direction:column;gap:5px;color:#5b6678;font-size:12px}.stable-form input{height:34px;border:1px solid #d6dee8;border-radius:5px;padding:0 9px;background:#fff;color:#172033;box-sizing:border-box;min-width:0}
+.stable-upload{margin:12px;padding:18px;border:1px dashed #9fb0c5;border-radius:8px;background:#f8fafc;display:flex;flex-direction:column;gap:10px}.stable-upload b{font-size:15px}.stable-upload span{color:#64748b;font-size:12px}.stable-upload .opbtn{align-self:flex-start}
+.operation-result{min-height:42px;padding:9px 10px;border-left:4px solid #0f766e;background:#ecfdf5;color:#166534;font-size:12px;line-height:1.35;overflow:hidden}
+.chart-bars{height:180px;display:flex;align-items:end;gap:8px;padding:14px 18px 12px}.chart-bars i{flex:1;border-radius:4px 4px 0 0;background:linear-gradient(180deg,#2dd4bf,#0f766e);min-height:28px}
+.login-panel{width:420px;margin:44px auto;background:#fff;border:1px solid #dbe4ee;border-radius:8px;padding:22px;box-shadow:0 14px 44px rgba(15,23,42,.12)}.login-panel input{width:100%;height:34px;border:1px solid #cbd5e1;border-radius:5px;margin:8px 0;padding:0 10px}.login-panel button{width:100%;height:36px;border:0;border-radius:5px;background:#0f766e;color:#fff;font-weight:700}
+</style>""".strip()
+
+
+def _stable_nav(blueprint: ProductBlueprint, active_module: FeatureModule | None) -> str:
+    items = [("dashboard", "系统首页"), ("statistics", "统计报表")]
+    for module in (getattr(blueprint, "modules", []) or [])[:9]:
+        items.insert(-1, (module.key, module.title))
+    active_key = getattr(active_module, "key", "") if active_module else "dashboard"
+    html = []
+    for key, title in items:
+        cls = "stable-nav-item active" if key == active_key else "stable-nav-item"
+        html.append(f'<div class="{cls}" data-module-key="{escape(key)}"><i></i>{escape(_clip(title, 16))}</div>')
+    return "".join(html)
+
+
+def _stable_login_body(task: GenerationTask, blueprint: ProductBlueprint, shell_spec: dict[str, Any]) -> str:
+    return f"""
+<section class="stable-workspace">
+  <div class="login-panel">
+    <h2>{escape(task.software_name)}</h2>
+    <p>{escape(_clip(blueprint.positioning or blueprint.summary, 56))}</p>
+    <input value="operator@mine.local" aria-label="账号" />
+    <input value="******" aria-label="密码" />
+    <input value="7K8Q" aria-label="验证码" />
+    <button>登录系统</button>
+  </div>
+</section>"""
+
+
+def _stable_dashboard_body(task: GenerationTask, blueprint: ProductBlueprint, shell_spec: dict[str, Any]) -> str:
+    modules = (getattr(blueprint, "modules", []) or [])[:4]
+    metrics = _metric_items(blueprint)
+    primary_module = modules[0] if modules else None
+    map_labels = _stable_map_labels(primary_module, modules)
+    quick_actions = [
+        _stable_actions(module)[0] if _stable_actions(module) else f"查看{_stable_subject(module)}"
+        for module in modules
+    ]
+    return f"""
+<section class="stable-workspace rows-main">
+  <div class="metric-row">{''.join(_metric_card(name, value) for name, value in metrics[:4])}</div>
+  <div class="stable-grid cols-3">
+    <section class="stable-card"><div class="stable-card-h"><b>当前{escape(_stable_subject(primary_module))}</b><span>实时更新</span></div>{_runtime_panel(primary_module)}</section>
+    <section class="stable-card"><div class="stable-card-h"><b>{escape(_stable_subject(primary_module))}分布与运行态势</b><span>当前范围</span></div><div class="stable-map">{''.join(f'<span class="map-pin p{index + 1}">{escape(_clip(label, 8))}</span>' for index, label in enumerate(map_labels[:4]))}</div></section>
+    <section class="stable-card"><div class="stable-card-h"><b>快捷操作</b><span>当前可用</span></div><div class="stable-actions" style="padding:12px">{''.join(f'<button class="opbtn{ " primary" if index == 0 else ""}">{escape(_clip(action, 8))}</button>' for index, action in enumerate(quick_actions))}</div><div class="operation-result" style="margin:12px">{escape(_stable_result_text(primary_module, quick_actions[0] if quick_actions else '查看'))}</div></section>
+  </div>
+  <section class="stable-card table-frame"><div class="stable-card-h"><b>核心模块运行明细</b><span>最近更新</span></div>{_stable_table(blueprint, modules, max_rows=3)}</section>
+</section>"""
+
+
+def _stable_module_body(task: GenerationTask, blueprint: ProductBlueprint, module: FeatureModule | None, title: str, shell_spec: dict[str, Any]) -> str:
+    labels = _stable_map_labels(module, [module] if module else [])
+    return f"""
+<section class="stable-workspace">
+  <div class="stable-grid cols-2" style="height:100%">
+    <section class="stable-card"><div class="stable-card-h"><b>{escape(title)}</b><span>信息与状态</span></div>{_runtime_panel(module)}<div class="operation-result" style="margin:10px">{escape(_stable_result_text(module, '查看'))}</div></section>
+    <section class="stable-card"><div class="stable-card-h"><b>趋势与关联</b><span>{escape(_stable_subject(module))}视图</span></div><div class="stable-map">{''.join(f'<span class="map-pin p{index + 1}">{escape(_clip(label, 8))}</span>' for index, label in enumerate(labels[:4]))}</div></section>
+    <section class="stable-card table-frame" style="grid-column:1 / 3"><div class="stable-card-h"><b>业务数据列表</b><span>查询结果</span></div>{_stable_table(blueprint, [module] if module else [], max_rows=4)}</section>
+  </div>
+</section>"""
+
+
+def _stable_operation_body(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    module: FeatureModule | None,
+    title: str,
+    shell_spec: dict[str, Any],
+    *,
+    screenshot: Any | None = None,
+) -> str:
+    action = str(getattr(screenshot, "interaction_action", "") or "处理")
+    mode = str(getattr(screenshot, "interaction_mode", "") or "workflow")
+    fields = list(getattr(module, "data_fields", []) or [f"{_stable_subject(module)}编号", f"{_stable_subject(module)}名称", "处理状态", "责任人员"])[:6]
+    if mode == "query":
+        filters = "".join(
+            f'<label>{escape(_clip(field, 12))}<input value="{escape(_sample_value(getattr(module, "title", ""), field, index))}" /></label>'
+            for index, field in enumerate(fields[:4])
+        )
+        return f"""
+<section class="stable-workspace">
+  <section class="stable-card"><div class="stable-card-h"><b>{escape(title)}</b><span>查询条件</span></div><div class="stable-form">{filters}</div><div class="stable-actions" style="padding:0 12px 12px"><button class="opbtn primary">执行查询</button><button class="opbtn">重置条件</button><span>共 18 条结果</span></div></section>
+  <section class="stable-card table-frame"><div class="stable-card-h"><b>查询结果列表</b><span>当前范围已刷新</span></div>{_stable_table(blueprint, [module] if module else [], max_rows=4)}<div class="operation-result" style="margin:8px 12px">查询结果：已按当前条件刷新列表，筛选范围和查询时间已记录。</div></section>
+</section>"""
+    if mode == "form":
+        form_fields = "".join(
+            f'<label>{escape(_clip(field, 14))}<input value="{escape(_sample_value(getattr(module, "title", ""), field, index))}" /></label>'
+            for index, field in enumerate(fields)
+        )
+        return f"""
+<section class="stable-workspace">
+  <div class="stable-grid cols-2" style="height:100%">
+    <section class="stable-card"><div class="stable-card-h"><b>{escape(title)}</b><span>字段维护</span></div><div class="stable-form">{form_fields}</div><div class="stable-actions" style="padding:0 12px 12px"><button class="opbtn primary">保存{escape(action)}</button><button class="opbtn">取消</button></div></section>
+    <section class="stable-card"><div class="stable-card-h"><b>校验与保存结果</b><span>即时检查</span></div>{_runtime_panel(module)}<div class="operation-result" style="margin:10px">保存结果：必填字段已通过校验，{escape(_stable_subject(module))}状态与更新时间已同步保存。</div></section>
+  </div>
+</section>"""
+    if mode == "import":
+        return f"""
+<section class="stable-workspace">
+  <div class="stable-grid cols-2" style="height:100%">
+    <section class="stable-card"><div class="stable-card-h"><b>{escape(title)}</b><span>文件与字段映射</span></div><div class="stable-upload"><b>{escape(_clip(getattr(module, "title", "业务数据"), 14))}_20260710.xlsx</b><span>2.8 MB · 126 条记录 · 格式校验通过</span><button class="opbtn">重新选择文件</button></div>{_runtime_panel(module)}</section>
+    <section class="stable-card"><div class="stable-card-h"><b>导入校验结果</b><span>可导入 121 / 需修正 5</span></div>{_stable_table(blueprint, [module] if module else [], max_rows=3)}<div class="stable-actions" style="padding:10px"><button class="opbtn primary">确认导入</button><button class="opbtn">下载错误明细</button></div><div class="operation-result" style="margin:0 10px 10px">导入结果：字段映射已完成，5 条异常记录等待修正，其余记录可继续导入。</div></section>
+  </div>
+</section>"""
+    if mode == "export":
+        return f"""
+<section class="stable-workspace">
+  <div class="stable-grid cols-2" style="height:100%">
+    <section class="stable-card"><div class="stable-card-h"><b>{escape(title)}</b><span>导出范围</span></div><div class="stable-form"><label>数据范围<input value="当前查询结果 18 条" /></label><label>文件格式<input value="XLSX" /></label><label>字段范围<input value="编号、状态、责任人、更新时间" /></label><label>文件名称<input value="{escape(_clip(getattr(module, "title", "业务数据"), 12))}_20260710" /></label></div><div class="stable-actions" style="padding:0 12px 12px"><button class="opbtn primary">生成导出文件</button><button class="opbtn">预览字段</button></div></section>
+    <section class="stable-card"><div class="stable-card-h"><b>文件生成结果</b><span>已完成</span></div>{_runtime_panel(module)}<div class="operation-result" style="margin:10px">导出结果：文件已生成，可下载 XLSX；当前筛选条件、导出人员和生成时间已记录。</div><div class="stable-actions" style="padding:0 10px"><button class="opbtn primary">下载文件</button><button class="opbtn">复制校验码</button></div></section>
+  </div>
+</section>"""
+    if mode == "analysis":
+        metrics = _metric_items(blueprint)
+        return f"""
+<section class="stable-workspace rows-main">
+  <div class="metric-row">{''.join(_metric_card(name, value) for name, value in metrics[:4])}</div>
+  <div class="stable-grid cols-2"><section class="stable-card"><div class="stable-card-h"><b>{escape(title)}</b><span>近 30 日</span></div><div class="chart-bars"><i style="height:48%"></i><i style="height:66%"></i><i style="height:58%"></i><i style="height:82%"></i><i style="height:72%"></i></div></section><section class="stable-card"><div class="stable-card-h"><b>分组结果</b><span>单位：条 / %</span></div>{_runtime_panel(module)}</section></div>
+  <section class="stable-card table-frame"><div class="stable-card-h"><b>统计明细</b><span>当前范围</span></div>{_stable_table(blueprint, [module] if module else [], max_rows=3)}<div class="operation-result" style="margin:8px 12px">统计结果：指标和趋势已按当前范围刷新，可继续导出统计快照。</div></section>
+</section>"""
+    operations = _stable_actions(module) or ["查看", "更新", "确认", "完成"]
+    return f"""
+<section class="stable-workspace">
+  <div class="stable-grid cols-2" style="height:100%">
+    <section class="stable-card"><div class="stable-card-h"><b>{escape(title)}</b><span>操作处理</span></div>{_runtime_panel(module)}<div class="stable-actions" style="padding:0 10px 10px">{''.join(f'<button class="opbtn{ " primary" if i == 0 else ""}">{escape(_clip(op, 8))}</button>' for i, op in enumerate(operations[:6]))}</div><div class="operation-result" style="margin:0 10px 10px">{escape(_stable_result_text(module, action))}</div></section>
+    <section class="stable-card"><div class="stable-card-h"><b>处理流程轨迹</b><span>结果记录</span></div><div class="chart-bars"><i style="height:68%"></i><i style="height:82%"></i><i style="height:54%"></i><i style="height:76%"></i><i style="height:62%"></i></div>{_stable_table(blueprint, [module] if module else [], max_rows=3)}</section>
+  </div>
+</section>"""
+
+
+def _stable_statistics_body(task: GenerationTask, blueprint: ProductBlueprint, shell_spec: dict[str, Any]) -> str:
+    modules = (getattr(blueprint, "modules", []) or [])[:6]
+    return f"""
+<section class="stable-workspace rows-main">
+  <div class="metric-row">{''.join(_metric_card(name, value) for name, value in _metric_items(blueprint)[:4])}</div>
+  <div class="stable-grid cols-2">
+    <section class="stable-card"><div class="stable-card-h"><b>近 30 日趋势</b><span>单位：条 / %</span></div><div class="chart-bars"><i style="height:52%"></i><i style="height:68%"></i><i style="height:61%"></i><i style="height:83%"></i><i style="height:74%"></i><i style="height:90%"></i><i style="height:65%"></i></div></section>
+    <section class="stable-card"><div class="stable-card-h"><b>风险分布</b><span>分组统计</span></div><div class="stable-map"><span class="map-pin p1">东区 18</span><span class="map-pin p2">西区 11</span><span class="map-pin p3">告警 6</span></div></section>
+  </div>
+  <section class="stable-card table-frame"><div class="stable-card-h"><b>模块统计明细</b><span>2026-07-10</span></div>{_stable_table(blueprint, modules, max_rows=3)}</section>
+</section>"""
+
+
+def _runtime_panel(module: FeatureModule | None) -> str:
+    title = getattr(module, "title", "") or "当前事项"
+    subject = _stable_subject(module)
+    fields = list(getattr(module, "data_fields", []) or [f"{subject}编号", f"{subject}名称", "当前状态", "责任人员"])[:4]
+    return "<div class=\"runtime-record-panel\">" + "".join(
+        f"<div><span>{escape(_clip(field, 12))}</span><b data-runtime-field=\"{escape(key)}\">{escape(_stable_sample_value(module, title, field, index))}</b></div>"
+        for index, (field, key) in enumerate(zip(fields, ["code", "name", "scope", "status"]))
+    ) + "</div>"
+
+
+def _stable_specs(module: FeatureModule | None, action: str = "") -> list[dict[str, Any]]:
+    specs = [spec for spec in (getattr(module, "operation_specs", []) or []) if isinstance(spec, dict)]
+    action_text = str(action or "").strip()
+    if not action_text:
+        return specs
+    matched = []
+    for spec in specs:
+        label = str(spec.get("label") or spec.get("action") or spec.get("name") or "").strip()
+        if label and (action_text in label or label in action_text):
+            matched.append(spec)
+    return matched or specs
+
+
+def _stable_subject(module: FeatureModule | None) -> str:
+    title = str(getattr(module, "title", "") or "").strip()
+    for suffix in ("智能管理平台", "管理平台", "管理系统", "信息系统", "工作台", "管理", "平台", "系统", "模块"):
+        if title.endswith(suffix) and len(title) > len(suffix) + 1:
+            title = title[: -len(suffix)].strip()
+            break
+    return _clip(title or "事项", 12)
+
+
+def _stable_actions(module: FeatureModule | None) -> list[str]:
+    actions: list[str] = []
+    for spec in _stable_specs(module):
+        value = str(spec.get("label") or spec.get("action") or spec.get("name") or "").strip()
+        if value and value not in actions:
+            actions.append(value)
+    for value in getattr(module, "operations", []) or []:
+        text = str(value or "").strip()
+        if text and not text.startswith("{") and text not in actions:
+            actions.append(text)
+    return actions[:6]
+
+
+def _stable_states(module: FeatureModule | None) -> list[str]:
+    states: list[str] = []
+    for spec in _stable_specs(module):
+        for key in ("pre_state", "preState", "post_state", "postState"):
+            value = str(spec.get(key) or "").strip()
+            if value and value not in states and len(value) <= 14:
+                states.append(value)
+    return states[:4] or ["待确认", "进行中", "已完成"]
+
+
+def _stable_result_text(module: FeatureModule | None, action: str) -> str:
+    states = _stable_states(module)
+    status = states[-1]
+    evidence = ""
+    for spec in _stable_specs(module, action):
+        evidence = str(spec.get("result_evidence") or spec.get("resultEvidence") or "").strip()
+        if evidence:
+            break
+    evidence = _clip(evidence or f"{_stable_subject(module)}状态和更新时间", 24)
+    return f"{action}结果：{_stable_code(module, 1)} 已进入“{status}”状态，{evidence}已保存。"
+
+
+def _stable_code(module: FeatureModule | None, index: int) -> str:
+    key = re.sub(r"[^A-Za-z0-9]", "", str(getattr(module, "key", "") or "").upper())[:4]
+    if len(key) < 2:
+        key = f"YW{sum(ord(char) for char in _stable_subject(module)) % 97:02d}"
+    return f"{key}-{1000 + index}"
+
+
+def _stable_sample_value(module: FeatureModule | None, title: str, field: str, index: int) -> str:
+    label = str(field or "")
+    if re.search(r"编号|编码|单号|代码|ID", label, re.I):
+        return _stable_code(module, index + 1)
+    if re.search(r"名称|标题|对象|事项", label):
+        return f"{_stable_subject(module)}{index + 1}"
+    if re.search(r"状态|进度", label):
+        states = _stable_states(module)
+        return states[index % len(states)]
+    if re.search(r"人员|角色|岗位|责任", label):
+        for spec in _stable_specs(module):
+            role = str(spec.get("role") or "").strip()
+            if role:
+                return role
+        return "责任人员"
+    if re.search(r"时间|日期|更新", label):
+        return "2026-07-10 10:30"
+    return _sample_value(title, field, index)
+
+
+def _stable_map_labels(module: FeatureModule | None, modules: list[FeatureModule | None]) -> list[str]:
+    values = [str(item) for item in (getattr(module, "entities", []) or []) if str(item).strip()]
+    values.extend(str(item) for item in (getattr(module, "data_fields", []) or []) if str(item).strip())
+    values.extend(str(getattr(item, "title", "") or "") for item in modules if getattr(item, "title", ""))
+    unique: list[str] = []
+    for value in values:
+        if value and value not in unique:
+            unique.append(value)
+    return unique[:4] or [f"{_stable_subject(module)}范围", "当前状态", "更新时间", "处理结果"]
+
+
+def _stable_table(blueprint: ProductBlueprint, modules: list[FeatureModule | None], *, max_rows: int = 5) -> str:
+    rows = []
+    source_modules = [module for module in modules if module] or list(getattr(blueprint, "modules", []) or [])[:5]
+    for index, module in enumerate(source_modules[:max(1, max_rows)], start=1):
+        status_class = ["green", "orange", "red"][index % 3]
+        states = _stable_states(module)
+        status = states[index % len(states)]
+        code = _stable_code(module, index)
+        action = (_stable_actions(module) or ["查看"])[0]
+        rows.append(
+            f"<tr><td>{escape(code)}</td><td>{escape(_clip(module.title, 16))}</td><td>{escape(_clip((module.data_fields or ['当前状态'])[0], 12))}</td><td><span class=\"tag {status_class}\">{escape(status)}</span></td><td>2026-07-10</td><td><button class=\"opbtn\">{escape(_clip(action, 8))}</button></td></tr>"
+        )
+    return f"""<table class="stable-table"><thead><tr><th>编号</th><th>模块</th><th>监测项</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"""
+
+
+def _metric_items(blueprint: ProductBlueprint) -> list[tuple[str, str]]:
+    metrics = list(getattr(blueprint, "report_metrics", []) or [])[:4]
+    subject = _stable_subject((getattr(blueprint, "modules", []) or [None])[0])
+    defaults = [f"{subject}数量", f"{subject}进行中", f"{subject}完成率", f"{subject}更新时间"]
+    names = (metrics + defaults)[:4]
+    values = ["128", "6", "92.6%", "96.8%"]
+    return list(zip(names, values))
+
+
+def _metric_card(name: str, value: str) -> str:
+    return f"<div class=\"metric\"><span>{escape(_clip(name, 14))}</span><b>{escape(value)}</b></div>"
+
+
+def _sample_value(title: str, field: str, index: int) -> str:
+    samples = ["KS-2026-1001", title or "运行设备", "主井设备区", "监测中"]
+    return samples[index % len(samples)]
+
+
+def _page_title(page_kind: str, module: FeatureModule | None) -> str:
+    if page_kind == "login":
+        return "登录界面"
+    if page_kind == "dashboard":
+        return "系统首页"
+    if page_kind == "statistics":
+        return "统计报表"
+    return getattr(module, "title", "") or "业务界面"
+
+
+def _brand_mark(name: str) -> str:
+    text = str(name or "软").strip()
+    return text[0] if text else "软"
+
+
+def _clip(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: max(1, limit - 1)] + "…"
+
+
+def generate_style_reference_assets(
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    screenshots: list[Any],
+    provider: LLMProvider | None,
+    emit=None,
+    require_llm: bool = False,
+) -> dict[str, Any]:
+    if provider is None or isinstance(provider, LocalTemplateProvider):
+        if require_llm:
+            raise RuntimeError("正式 GPT 流程要求先由 gpt-image-2 生成全局视觉风格参考图。")
+        return {"enabled": False, "ready": False, "source": "local-template", "pages": []}
+    if not screenshots:
+        raise RuntimeError("全局视觉风格参考图缺少页面清单。")
+    if getattr(task, "resume_existing_output", False) and str(getattr(task, "resume_stage", "") or "") in {
+        "manual",
+        "manual_docx",
+        "source_doc",
+        "source_docx",
+        "pdf",
+        "info",
+        "package",
+        "validate",
+        "done",
+    }:
+        recovered = _recover_late_resume_image2_reference(
+            task=task,
+            ui_blueprint=ui_blueprint,
+            screenshots=screenshots,
+            provider=provider,
+        )
+        if recovered:
+            _emit(emit, 43, "复用截图阶段保留的 gpt-image-2 视觉参考候选")
+            return recovered
+    module_by_key = {module.key: module for module in blueprint.modules}
+    design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
+    context = _codegen_context(task, blueprint, ui_blueprint)
+    return _generate_visual_reference_assets(
+        task=task,
+        blueprint=blueprint,
+        ui_blueprint=ui_blueprint,
+        screenshots=screenshots,
+        module_by_key=module_by_key,
+        provider=provider,
+        context=context,
+        design_brief=design_brief,
+        emit=emit,
+        require_llm=require_llm,
+    )
+
+
+def _generate_page_html(
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    provider: LLMProvider,
+    screenshot: Any,
+    module: FeatureModule | None,
+    visual_reference: dict[str, Any] | None,
+    context: dict[str, Any],
+    design_brief: dict[str, Any],
+    index: int,
+    total: int,
+) -> str:
+    page_key = str(getattr(screenshot, "key", "") or f"page_{index}")
+    page_kind = str(getattr(screenshot, "page_kind", "") or "general")
+    module_key = str(getattr(screenshot, "module_key", "") or "")
+    renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
+    prompt = _page_prompt(
+        task=task,
+        blueprint=blueprint,
+        ui_blueprint=ui_blueprint,
+        screenshot=screenshot,
+        module=module,
+        visual_reference=visual_reference,
+        context=context,
+        design_brief=design_brief,
+        index=index,
+        total=total,
+    )
+    user_message: dict[str, Any]
+    image_path = Path(str((visual_reference or {}).get("image_path") or ""))
+    if image_path.is_file():
+        user_message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": _image_data_url(image_path)}},
+            ],
+        }
+    else:
+        user_message = {"role": "user", "content": prompt}
+    started_at = time.perf_counter()
+    trace_event(
+        "ai_frontend_page_begin",
+        page_key=page_key,
+        page_kind=page_kind,
+        renderer=renderer,
+        module_key=module_key,
+        index=index,
+        total=total,
+        visual_reference_ready=image_path.is_file(),
+    )
+    content = provider.chat(
+        [
+            {"role": "system", "content": _system_prompt()},
+            user_message,
+        ],
+        temperature=0.48,
+        max_tokens=5200,
+        response_format={"type": "json_object"},
+        trace_label=f"ai_frontend:{page_key}",
+        timeout=_ai_frontend_timeout_seconds(provider),
+        retry_policy=TextRetryPolicy(max_retries=2),
+    )
+    data = _parse_json(content)
+    html = str(data.get("html") or "").strip()
+    if len(html) < 1800:
+        raise ValueError("模型返回 HTML 过短")
+    if not re.search(r"<html\b", html, flags=re.I) or not re.search(r"<body\b", html, flags=re.I):
+        raise ValueError("模型返回内容不是完整 HTML 页面")
+    _reject_direct_image_embedding(html)
+    _reject_internal_visible_terms(html)
+    html = _prepare_runtime_html(
+        html,
+        title=str(getattr(screenshot, "title", "") or page_key),
+        renderer=renderer,
+        page_kind=page_kind,
+        module_key=module_key,
+    )
+    trace_event(
+        "ai_frontend_page_success",
+        page_key=page_key,
+        elapsed_seconds=round(time.perf_counter() - started_at, 3),
+        html_chars=len(html),
+    )
+    return html
+
+
+def _load_reusable_page(screenshot: Any, *, creative_key: str = "") -> Path | None:
+    html_path = Path(str(getattr(screenshot, "html_path", "") or ""))
+    if not html_path.exists() or not html_path.is_file():
+        return None
+    try:
+        html = html_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if len(html) < 1800:
+        return None
+    if not re.search(r"<html\b", html, flags=re.I) or not re.search(r"<body\b", html, flags=re.I):
+        return None
+    if creative_key and f'name="soft-creative-key" content="{creative_key}"' not in html:
+        return None
+    try:
+        _reject_direct_image_embedding(html)
+        _reject_internal_visible_terms(html)
+    except ValueError:
+        return None
+    return html_path
+
+
+def _page_creative_key(task: GenerationTask, design_brief: dict[str, Any], screenshot: Any) -> str:
+    identity = design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {}
+    payload = {
+        "task_seed": str(getattr(task, "seed", "") or ""),
+        "identity_signature": str(identity.get("identity_signature") or "") if isinstance(identity, dict) else "",
+        "page_key": str(getattr(screenshot, "key", "") or ""),
+        "page_kind": str(getattr(screenshot, "page_kind", "") or ""),
+        "module_key": str(getattr(screenshot, "module_key", "") or ""),
+    }
+    if payload["page_kind"] == "operation":
+        payload.update(
+            {
+                "interaction_action": str(getattr(screenshot, "interaction_action", "") or ""),
+                "interaction_mode": str(getattr(screenshot, "interaction_mode", "") or ""),
+                "interaction_surface": str(getattr(screenshot, "interaction_surface", "") or ""),
+                "requires_confirmation": bool(getattr(screenshot, "requires_confirmation", False)),
+                "interaction_action_key": str(getattr(screenshot, "interaction_action_key", "") or ""),
+                "interaction_role": str(getattr(screenshot, "interaction_role", "") or ""),
+                "interaction_trigger": str(getattr(screenshot, "interaction_trigger", "") or ""),
+                "interaction_input_fields": list(getattr(screenshot, "interaction_input_fields", None) or []),
+                "interaction_pre_state": str(getattr(screenshot, "interaction_pre_state", "") or ""),
+                "interaction_post_state": str(getattr(screenshot, "interaction_post_state", "") or ""),
+                "interaction_result_evidence": str(getattr(screenshot, "interaction_result_evidence", "") or ""),
+            }
+        )
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+
+
+def _stamp_creative_key(html: str, creative_key: str) -> str:
+    if not creative_key or 'name="soft-creative-key"' in html:
+        return html
+    marker = f'<meta name="soft-creative-key" content="{creative_key}">'
+    return re.sub(r"(<head\b[^>]*>)", rf"\1{marker}", html, count=1, flags=re.I)
+
+
+def _load_reusable_visual_reference_report(visual_dir: Path, *, image_size: str, total: int, cache_key: str = "") -> dict[str, Any] | None:
+    manifest_path = visual_dir / "visual-reference-manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        report = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(report, dict) or not report.get("ready"):
+        return None
+    if str(report.get("mode") or "") != "style_reference":
+        return None
+    if str(report.get("image_size") or "") and str(report.get("image_size") or "") != image_size:
+        return None
+    if cache_key and str(report.get("cache_key") or "") != cache_key:
+        return None
+    style_reference = report.get("style_reference")
+    if not isinstance(style_reference, dict):
+        return None
+    image_path = Path(str(style_reference.get("image_path") or ""))
+    if not image_path.exists() or image_path.stat().st_size <= 1024:
+        return None
+    pages = report.get("pages")
+    if not isinstance(pages, list) or not any(isinstance(item, dict) and item.get("ready") for item in pages):
+        return None
+    report["page_count"] = total
+    report["applies_to_page_count"] = total
+    style_reference["applies_to_page_count"] = total
+    for item in pages:
+        if isinstance(item, dict):
+            item["applies_to_page_count"] = total
+    return report
+
+
+def _recover_rejected_visual_reference_report(
+    *,
+    visual_dir: Path,
+    image_size: str,
+    total: int,
+    cache_key: str,
+    provider: LLMProvider,
+) -> dict[str, Any] | None:
+    prompt_path = visual_dir / "style_reference.prompt.json"
+    rejected_path = visual_dir / "style_reference.rejected.png"
+    image_path = visual_dir / "style_reference.png"
+    if not prompt_path.exists() or not rejected_path.exists() or rejected_path.stat().st_size <= 1024:
+        return None
+    try:
+        prompt_payload = json.loads(prompt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if cache_key and str(prompt_payload.get("cache_key") or "") != cache_key:
+        return None
+    if str(prompt_payload.get("image_size") or "") and str(prompt_payload.get("image_size") or "") != image_size:
+        return None
+    try:
+        raw = rejected_path.read_bytes()
+        image_meta = _inspect_generated_image(raw)
+        image_path.write_bytes(raw)
+        width, height = _image_dimensions(image_path)
+    except Exception:
+        return None
+    prompt_data = prompt_payload.get("prompt") if isinstance(prompt_payload.get("prompt"), dict) else {}
+    page_report = {
+        "key": "style_reference",
+        "mode": "style_reference",
+        "reference_page_key": str(prompt_payload.get("reference_page_key") or "dashboard"),
+        "page_kind": str(prompt_payload.get("page_kind") or "dashboard"),
+        "module_key": str(prompt_payload.get("module_key") or ""),
+        "applies_to_page_count": int(prompt_payload.get("applies_to_page_count") or total or 0),
+        "prompt_path": str(prompt_path),
+        "image_path": str(image_path),
+        "image_sha256": _sha256_file(image_path),
+        "image_width": width,
+        "image_height": height,
+        "image_model": _configured_image_model(provider),
+        "image_size": image_size,
+        "image_source": "recovered_rejected_image",
+        "image_quality": image_meta.get("image_quality", {}),
+        "prompt_summary": _prompt_summary(prompt_data),
+        "ready": True,
+        "recovered_from_rejected": True,
+    }
+    report = _visual_reference_report(
+        visual_dir=visual_dir,
+        pages=[page_report],
+        total=total,
+        image_size=image_size,
+        cache_key=cache_key,
+        provider=provider,
+    )
+    _write_visual_reference_manifest(visual_dir, report)
+    return report
+
+
+def _recover_existing_visual_reference_report(
+    *,
+    visual_dir: Path,
+    image_size: str,
+    total: int,
+    cache_key: str,
+    task: GenerationTask,
+    ui_blueprint: UiBlueprint,
+    provider: LLMProvider,
+) -> dict[str, Any] | None:
+    """Recover a valid style image when only the manifest was overwritten by a failed retry."""
+    prompt_path = visual_dir / "style_reference.prompt.json"
+    image_path = visual_dir / "style_reference.png"
+    if not prompt_path.exists() or not image_path.exists() or image_path.stat().st_size <= 1024:
+        return None
+    try:
+        prompt_payload = json.loads(prompt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if str(prompt_payload.get("image_size") or "") not in {"", image_size}:
+        return None
+    prompt_total = int(prompt_payload.get("applies_to_page_count") or 0)
+    prompt_cache_key = str(prompt_payload.get("cache_key") or "")
+    acceptable_keys = {
+        cache_key,
+        _legacy_visual_reference_cache_key(task, ui_blueprint, prompt_total, image_size),
+    }
+    if prompt_cache_key and prompt_cache_key not in acceptable_keys:
+        return None
+    try:
+        raw = image_path.read_bytes()
+        image_meta = _inspect_generated_image(raw)
+        width, height = _image_dimensions(image_path)
+    except Exception:
+        return None
+    prompt_data = prompt_payload.get("prompt") if isinstance(prompt_payload.get("prompt"), dict) else {}
+    page_report = {
+        "key": "style_reference",
+        "mode": "style_reference",
+        "reference_page_key": str(prompt_payload.get("reference_page_key") or "dashboard"),
+        "page_kind": str(prompt_payload.get("page_kind") or "dashboard"),
+        "module_key": str(prompt_payload.get("module_key") or ""),
+        "applies_to_page_count": total,
+        "prompt_path": str(prompt_path),
+        "image_path": str(image_path),
+        "image_sha256": _sha256_file(image_path),
+        "image_width": width,
+        "image_height": height,
+        "image_model": _configured_image_model(provider),
+        "image_size": image_size,
+        "image_source": "recovered_existing_style_reference",
+        "image_quality": image_meta.get("image_quality", {}),
+        "prompt_summary": _prompt_summary(prompt_data),
+        "ready": True,
+        "recovered_existing_image": True,
+    }
+    report = _visual_reference_report(
+        visual_dir=visual_dir,
+        pages=[page_report],
+        total=total,
+        image_size=image_size,
+        cache_key=cache_key,
+        provider=provider,
+    )
+    _write_visual_reference_manifest(visual_dir, report)
+    return report
+
+
+def _system_prompt() -> str:
+    return (
+        "你是资深中文企业软件 UI 设计师和前端工程师。"
+        "你要为软件著作权操作手册生成真实可运行的界面页面代码。"
+        "你会收到 gpt-image-2 生成的全局视觉风格参考图，请按参考图的色彩、密度、导航风格、控件质感和组件语言生成 HTML/CSS。"
+        "只返回 JSON 对象，字段为 html。不要返回 Markdown，不要解释。"
+        "页面必须像真实软件截图，不能像模板、原型图、营销页或生成说明。"
+        "禁止把参考图作为 img、背景图或 data URL 直接嵌入页面，必须用真实 HTML/CSS 组件复刻。"
+    )
+
+
+def _page_prompt(
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    screenshot: Any,
+    module: FeatureModule | None,
+    visual_reference: dict[str, Any] | None,
+    context: dict[str, Any],
+    design_brief: dict[str, Any],
+    index: int,
+    total: int,
+) -> str:
+    renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
+    viewport = {"admin": "1280x720", "mobile_app": "720x1280", "game": "720x1280"}.get(renderer, "1280x720")
+    module_data = _module_payload(module)
+    screen_payload = {
+        "key": getattr(screenshot, "key", ""),
+        "title": getattr(screenshot, "title", ""),
+        "caption": getattr(screenshot, "caption", ""),
+        "page_kind": getattr(screenshot, "page_kind", ""),
+        "module_key": getattr(screenshot, "module_key", ""),
+        "page_structure_seed": _page_creative_key(task, design_brief, screenshot),
+        "interaction_action": str(getattr(screenshot, "interaction_action", "") or ""),
+        "interaction_mode": str(getattr(screenshot, "interaction_mode", "") or ""),
+        "interaction_surface": str(getattr(screenshot, "interaction_surface", "") or ""),
+        "requires_confirmation": bool(getattr(screenshot, "requires_confirmation", False)),
+        "interaction_action_key": str(getattr(screenshot, "interaction_action_key", "") or ""),
+        "interaction_role": str(getattr(screenshot, "interaction_role", "") or ""),
+        "interaction_trigger": str(getattr(screenshot, "interaction_trigger", "") or ""),
+        "interaction_input_fields": list(getattr(screenshot, "interaction_input_fields", None) or []),
+        "interaction_pre_state": str(getattr(screenshot, "interaction_pre_state", "") or ""),
+        "interaction_post_state": str(getattr(screenshot, "interaction_post_state", "") or ""),
+        "interaction_result_evidence": str(getattr(screenshot, "interaction_result_evidence", "") or ""),
+    }
+    visual_identity = design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {}
+    product_experience = design_brief.get("product_experience_spec") if isinstance(design_brief, dict) else {}
+    reference_payload = _prompt_reference_payload(visual_reference)
+    operation_rule = _operation_prompt_rule(screenshot) or "按当前页面层级生成真实可操作界面。"
+    return f"""
+请生成第 {index}/{total} 张操作手册截图对应的完整 HTML 页面。
+
+软件上下文：
+{json.dumps(context, ensure_ascii=False, indent=2)}
+
+当前页面：
+{json.dumps(screen_payload, ensure_ascii=False, indent=2)}
+
+当前模块：
+{json.dumps(module_data, ensure_ascii=False, indent=2)}
+
+产品体验规格：
+{json.dumps(product_experience if isinstance(product_experience, dict) else {{}}, ensure_ascii=False, indent=2)}
+
+视觉身份规格：
+{json.dumps(visual_identity if isinstance(visual_identity, dict) else {{}}, ensure_ascii=False, indent=2)}
+
+gpt-image-2 全局视觉风格参考图：
+{json.dumps(reference_payload, ensure_ascii=False, indent=2)}
+
+强制要求：
+- 只返回 JSON：{{"html":"完整 HTML 字符串"}}
+- 画布尺寸必须适合 {viewport}，页面首屏必须铺满，不能右侧大空白，不能像线框图。
+- renderer={renderer}；如果是 admin，要像真实桌面业务软件；如果是 mobile_app，要像真实手机 App/小程序；如果是 game，要像真实手机游戏界面。
+- 如果 renderer 是 mobile_app 或 game，根内容壳必须铺满 720px 逻辑宽度；禁止 `max-width:375px/390px/430px`、窄手机模型居中或左右大面积空白。
+- 页面内容必须严格围绕软件名称、模块字段、业务对象、流程、统计指标和当前页面用途设计。
+- {operation_rule}
+- 必须根据随消息附带的全局风格参考图延续视觉语言：导航风格、控件边界、卡片密度、表格/图表/地图/面板质感、色彩和留白应与参考图一致；同一材料包所有页面必须使用同一套字体、主色、侧栏/顶栏外壳、按钮样式、状态标签样式和表格密度。
+- 参考图只提供全局风格，不代表当前页面结构；当前页面必须按“当前页面”和“当前模块”的用途重新组织布局，不能复制参考图成为所有页面同构。
+- `page_structure_seed` 是本页独有的构图种子。请据此自主决定信息层级、主工作区占比、侧面板位置、控件组合和阅读动线；禁止套用固定的“侧栏 + 四指标卡 + 筛选栏 + 表格”骨架。
+- 相邻页面至少在以下三项中有两项明显不同：主内容拓扑、首屏视觉焦点、工具区位置、数据呈现方式、操作路径。共享设计语言不等于共享 DOM 骨架。
+- 参考图只用于视觉约束，禁止把参考图、提示词、gpt-image-2、视觉参考稿等词写到页面中，禁止直接嵌入参考图图片。
+- 同一本手册内页面结构要有差异：登录、首页、主界面、查询、导入、导出、统计、复核/发布等不能只是同背景加弹窗。
+- 使用内联 CSS，不引用外部 CDN、图片、字体或网络资源，不使用 SVG 大面积插画，不写营销介绍。
+- 可使用纯 HTML/CSS 表格、图表、地图感工作区、工单卡片、时间线、审批栏、设备面板等真实业务组件。
+- 所有文字必须在 1280x720 或 720x1280 画布内可读且不重叠：按钮、状态标签、表格单元格、长编号、指标数字必须使用 nowrap、ellipsis、固定行高或足够容器宽度；禁止让“待确认”“开始校验”“当前记录编号”等文字竖向断行、越过边框或压到相邻内容。
+- 装饰性柱、进度条、趋势块必须放在独立绘图区内，禁止用 absolute/fixed 把无文字色块叠在指标数字、状态名称、辅助说明或坐标标签上；同一指标卡已有数字和文字时，不要再叠加会穿过文字的装饰柱。
+- 每个面板标题必须能概括面板内全部直接子项；当子项横跨检验批、材料、试验、测量、隐蔽验收等多个模块时，使用“综合质量任务”“业务任务进度”等上位名称，禁止只用其中一两个模块命名整个面板。
+- 所有可见文字必须是客户能看到的业务语言，禁止出现：AI、GPT、提示词、image2、视觉参考、参考稿、接口返回、运行服务、生成项目、浏览器页面、source-ui-evidence、generated_source、ui-prototype。
+- 页面中要预留可被运行数据覆盖的可见业务区域：表格可使用 .table-frame，当前记录卡可使用 .runtime-record-panel，地图点可使用 .map-pin，处理结果可使用 .operation-result。
+- 不要写任何 API Key、Base URL、真实公司信息或承诺包过。
+""".strip()
+
+
+def _load_reusable_visual_prompt(
+    prompt_path: Path, *, cache_key: str, reference_page_key: str, image_size: str,
+) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(prompt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(payload, dict) or not cache_key:
+        return None
+    if any(payload.get(key) != value for key, value in {
+        "cache_key": cache_key,
+        "mode": "style_reference",
+        "reference_page_key": reference_page_key,
+        "image_size": image_size,
+    }.items()):
+        return None
+    data = payload.get("prompt")
+    if not isinstance(data, dict) or not isinstance(data.get("visual_prompt"), str):
+        return None
+    if len(data["visual_prompt"].strip()) < 180:
+        return None
+    tokens = data.get("visual_tokens", [])
+    if not isinstance(tokens, list) or any(not isinstance(token, str) for token in tokens):
+        return None
+    try:
+        _validate_image_prompt_text(data["visual_prompt"])
+    except ValueError:
+        return None
+    return data
+
+
+def _generate_visual_reference_assets(
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    screenshots: list[Any],
+    module_by_key: dict[str, FeatureModule],
+    provider: LLMProvider,
+    context: dict[str, Any],
+    design_brief: dict[str, Any],
+    emit,
+    require_llm: bool,
+) -> dict[str, Any]:
+    total = len(screenshots)
+    visual_dir = _visual_reference_dir(screenshots)
+    visual_dir.mkdir(parents=True, exist_ok=True)
+    pages: list[dict[str, Any]] = []
+    image_size = _visual_reference_size(str(getattr(ui_blueprint, "renderer", "") or "admin"))
+    cache_key = _visual_reference_cache_key(task, ui_blueprint, total, image_size)
+    cached_report = _load_reusable_visual_reference_report(visual_dir, image_size=image_size, total=total, cache_key=cache_key)
+    if cached_report:
+        _emit(emit, 43, "复用已生成的 gpt-image-2 全局视觉风格参考图")
+        trace_event(
+            "ai_visual_reference_reused",
+            image_model=str(cached_report.get("image_model") or ""),
+            image_size=str(cached_report.get("image_size") or ""),
+            reference_count=int(cached_report.get("reference_count") or 0),
+        )
+        return cached_report
+    existing_report = _recover_existing_visual_reference_report(
+        visual_dir=visual_dir,
+        image_size=image_size,
+        total=total,
+        cache_key=cache_key,
+        task=task,
+        ui_blueprint=ui_blueprint,
+        provider=provider,
+    )
+    if existing_report:
+        _emit(emit, 43, "复用现有全局视觉风格参考图")
+        return existing_report
+    recovered_report = _recover_rejected_visual_reference_report(
+        visual_dir=visual_dir,
+        image_size=image_size,
+        total=total,
+        cache_key=cache_key,
+        provider=provider,
+    )
+    if recovered_report:
+        _emit(emit, 43, "复用已恢复的 gpt-image-2 全局视觉风格参考图")
+        return recovered_report
+    item = _select_style_reference_screenshot(screenshots)
+    page_key = "style_reference"
+    reference_page_key = str(getattr(item, "key", "") or "page_1")
+    module = module_by_key.get(str(getattr(item, "module_key", "") or ""))
+    image_path = visual_dir / "style_reference.png"
+    prompt_path = visual_dir / "style_reference.prompt.json"
+    try:
+        prompt_data = _load_reusable_visual_prompt(
+            prompt_path, cache_key=cache_key,
+            reference_page_key=reference_page_key, image_size=image_size,
+        )
+        if prompt_data is not None:
+            _emit(emit, 42, "复用已保存的全局视觉风格提示词")
+            trace_event("ai_visual_prompt_reused", page_key=reference_page_key, cache_key=cache_key)
+        else:
+            _emit(emit, 42, "生成全局视觉风格提示词")
+            prompt_data = _generate_visual_prompt(
+                task=task,
+                blueprint=blueprint,
+                ui_blueprint=ui_blueprint,
+                provider=provider,
+                screenshot=item,
+                module=module,
+                context=context,
+                design_brief=design_brief,
+                index=1,
+                total=1,
+            )
+        prompt_text = _style_reference_prompt_text(
+            prompt_data,
+            task=task,
+            blueprint=blueprint,
+            ui_blueprint=ui_blueprint,
+            screenshot=item,
+            module=module,
+            design_brief=design_brief,
+        )
+        _validate_image_prompt_text(prompt_text)
+        prompt_path.write_text(
+            json.dumps(
+                {
+                    "key": page_key,
+                    "mode": "style_reference",
+                    "reference_page_key": reference_page_key,
+                    "page_kind": str(getattr(item, "page_kind", "") or ""),
+                    "module_key": str(getattr(item, "module_key", "") or ""),
+                    "applies_to_page_count": total,
+                    "cache_key": cache_key,
+                    "prompt": prompt_data,
+                    "image_prompt_text": prompt_text,
+                    "image_size": image_size,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        _emit(emit, 43, "生成 gpt-image-2 全局视觉风格参考图")
+        image_meta = provider.generate_image(
+            prompt=prompt_text,
+            output_path=image_path,
+            size=image_size,
+            trace_label="ui_visual_reference:style_reference",
+        )
+        width, height = _image_dimensions(image_path)
+        page_report = {
+            "key": page_key,
+            "mode": "style_reference",
+            "reference_page_key": reference_page_key,
+            "page_kind": str(getattr(item, "page_kind", "") or ""),
+            "module_key": str(getattr(item, "module_key", "") or ""),
+            "applies_to_page_count": total,
+            "prompt_path": str(prompt_path),
+            "image_path": str(image_path),
+            "image_sha256": _sha256_file(image_path),
+            "image_width": width,
+            "image_height": height,
+            "image_model": image_meta.get("model", ""),
+            "image_size": image_meta.get("size", image_size),
+            "image_source": image_meta.get("source", ""),
+            "image_request_attempts": image_meta.get("attempts", 0),
+            "image_request_elapsed_seconds": image_meta.get("elapsed_seconds", 0),
+            "image_quality": image_meta.get("image_quality", {}),
+            "prompt_summary": _prompt_summary(prompt_data),
+            "ready": image_path.exists() and image_path.stat().st_size > 1024,
+        }
+        pages.append(page_report)
+    except Exception as exc:
+        safe_error = sanitize_error_message(exc, limit=500)
+        pages.append(
+            {
+                "key": page_key,
+                "mode": "style_reference",
+                "reference_page_key": reference_page_key,
+                "page_kind": str(getattr(item, "page_kind", "") or ""),
+                "module_key": str(getattr(item, "module_key", "") or ""),
+                "applies_to_page_count": total,
+                "prompt_path": str(prompt_path if prompt_path.exists() else ""),
+                "image_path": str(image_path),
+                "image_model": _configured_image_model(provider),
+                "image_size": image_size,
+                "ready": False,
+                "error": safe_error,
+            }
+        )
+        failure_report = _visual_reference_report(
+            visual_dir=visual_dir,
+            pages=pages,
+            total=total,
+            image_size=image_size,
+            cache_key=cache_key,
+            provider=provider,
+            error=safe_error,
+            failed_page_key=page_key,
+        )
+        _write_visual_reference_manifest(visual_dir, failure_report)
+        if require_llm:
+            raise RuntimeError(f"全局视觉风格参考图生成失败：{safe_error}") from exc
+    report = _visual_reference_report(
+        visual_dir=visual_dir,
+        pages=pages,
+        total=total,
+        image_size=image_size,
+        cache_key=cache_key,
+        provider=provider,
+    )
+    _write_visual_reference_manifest(visual_dir, report)
+    return report
+
+
+def _visual_reference_report(
+    *,
+    visual_dir: Path,
+    pages: list[dict[str, Any]],
+    total: int,
+    image_size: str,
+    provider: LLMProvider,
+    cache_key: str = "",
+    error: str = "",
+    failed_page_key: str = "",
+) -> dict[str, Any]:
+    ready_count = sum(1 for item in pages if item.get("ready"))
+    prompt_ready_count = sum(1 for item in pages if item.get("prompt_path") and Path(str(item.get("prompt_path"))).exists())
+    image_model = next((str(item.get("image_model") or "") for item in pages if item.get("image_model")), "")
+    if not image_model:
+        image_model = _configured_image_model(provider)
+    style_reference = next((item for item in pages if item.get("ready")), pages[0] if pages else {})
+    report = {
+        "enabled": True,
+        "mode": "style_reference",
+        "ready": ready_count >= 1,
+        "prompt_ready": prompt_ready_count >= 1,
+        "source": "gpt-style-reference-prompt+image2",
+        "prompt_count": len(pages),
+        "prompt_ready_count": prompt_ready_count,
+        "reference_count": ready_count,
+        "reference_target_count": len(pages) or 1,
+        "page_count": total,
+        "applies_to_page_count": total,
+        "style_reference": style_reference,
+        "style_reference_ready": bool(style_reference.get("ready")) if isinstance(style_reference, dict) else False,
+        "image_size": image_size,
+        "cache_key": cache_key,
+        "image_model": image_model,
+        "image_retry_count": _configured_image_retry_count(provider),
+        "directory": str(visual_dir),
+        "pages": pages,
+    }
+    if error:
+        report["error"] = error
+    if failed_page_key:
+        report["failed_page_key"] = failed_page_key
+    return report
+
+
+def _visual_reference_cache_key(task: GenerationTask, ui_blueprint: UiBlueprint, total: int, image_size: str) -> str:
+    design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
+    identity = design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {}
+    experience = design_brief.get("product_experience_spec") if isinstance(design_brief, dict) else {}
+    payload = {
+        "cache_contract": "style-identity-v3",
+        "creative_seed": str(getattr(task, "seed", "") or ""),
+        "software_name": str(getattr(task, "software_name", "") or ""),
+        "product_type": str(getattr(task, "product_type", "") or ""),
+        "renderer": str(getattr(ui_blueprint, "renderer", "") or ""),
+        "identity_signature": str(identity.get("identity_signature") or "") if isinstance(identity, dict) else "",
+        "experience_shape": str(experience.get("experience_shape") or "") if isinstance(experience, dict) else "",
+        "image_size": str(image_size or ""),
+    }
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
+
+
+def _legacy_visual_reference_cache_key(
+    task: GenerationTask,
+    ui_blueprint: UiBlueprint,
+    total: int,
+    image_size: str,
+) -> str:
+    design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
+    identity = design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {}
+    experience = design_brief.get("product_experience_spec") if isinstance(design_brief, dict) else {}
+    payload = {
+        "creative_seed": str(getattr(task, "seed", "") or ""),
+        "software_name": str(getattr(task, "software_name", "") or ""),
+        "product_type": str(getattr(task, "product_type", "") or ""),
+        "renderer": str(getattr(ui_blueprint, "renderer", "") or ""),
+        "identity_signature": str(identity.get("identity_signature") or "") if isinstance(identity, dict) else "",
+        "experience_shape": str(experience.get("experience_shape") or "") if isinstance(experience, dict) else "",
+        "page_count": int(total or 0),
+        "image_size": str(image_size or ""),
+    }
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
+
+
+def _select_style_reference_screenshot(screenshots: list[Any]) -> Any:
+    if not screenshots:
+        raise RuntimeError("AI 前端代码生成缺少截图页面清单。")
+
+    def score(item: Any) -> int:
+        key = str(getattr(item, "key", "") or "").lower()
+        page_kind = str(getattr(item, "page_kind", "") or "").lower()
+        title = str(getattr(item, "title", "") or "")
+        text = f"{key} {page_kind} {title}".lower()
+        if page_kind == "dashboard" or "dashboard" in text or "首页" in title or "主界面" in title:
+            return 100
+        if page_kind in {"home", "main"}:
+            return 90
+        if page_kind == "module":
+            return 70
+        if page_kind == "login":
+            return 40
+        return 50
+
+    return max(screenshots, key=score)
+
+
+def _write_visual_reference_manifest(visual_dir: Path, report: dict[str, Any]) -> None:
+    visual_dir.mkdir(parents=True, exist_ok=True)
+    (visual_dir / "visual-reference-manifest.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _recover_late_resume_image2_reference(
+    *,
+    task: GenerationTask,
+    ui_blueprint: UiBlueprint,
+    screenshots: list[Any],
+    provider: LLMProvider,
+) -> dict[str, Any] | None:
+    visual_dir = _visual_reference_dir(screenshots)
+    image_size = _visual_reference_size(str(getattr(ui_blueprint, "renderer", "") or "admin"))
+    renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
+    candidates = [visual_dir / "style_reference.rejected.png", visual_dir / "style_reference.png"]
+    selected: Path | None = None
+    image_meta: dict[str, Any] = {}
+    width = 0
+    height = 0
+    for candidate in candidates:
+        if not candidate.is_file() or candidate.stat().st_size <= 1024:
+            continue
+        width, height = _image_dimensions(candidate)
+        orientation_ready = width > height if renderer == "admin" else height > width
+        if not orientation_ready:
+            continue
+        try:
+            image_meta = _inspect_generated_image(candidate.read_bytes())
+        except Exception as exc:
+            if not _late_resume_screenshot_checkpoint_ready(visual_dir, len(screenshots)):
+                continue
+            image_meta = {
+                "image_quality": {
+                    "ready": True,
+                    "recovered_after_prior_quality_false_negative": True,
+                    "original_error": sanitize_error_message(exc, limit=240),
+                }
+            }
+        selected = candidate
+        break
+    if selected is None:
+        return None
+    visual_dir.mkdir(parents=True, exist_ok=True)
+    image_path = visual_dir / "style_reference.png"
+    if selected.resolve() != image_path.resolve():
+        shutil.copy2(selected, image_path)
+    prompt_path = visual_dir / "style_reference.recovered.json"
+    prompt_path.write_text(
+        json.dumps(
+            {
+                "mode": "late-resume-image2-recovery",
+                "software_name": str(getattr(task, "software_name", "") or ""),
+                "renderer": renderer,
+                "image_size": image_size,
+                "source_file": selected.name,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    page_report = {
+        "key": "style_reference",
+        "mode": "style_reference",
+        "reference_page_key": "dashboard",
+        "page_kind": "dashboard",
+        "module_key": "",
+        "applies_to_page_count": len(screenshots),
+        "prompt_path": str(prompt_path),
+        "image_path": str(image_path),
+        "image_sha256": _sha256_file(image_path),
+        "image_width": width,
+        "image_height": height,
+        "image_model": _configured_image_model(provider),
+        "image_size": image_size,
+        "image_source": "recovered_prior_image2_candidate",
+        "image_quality": image_meta.get("image_quality", {}),
+        "prompt_summary": {"recovered": True, "renderer": renderer},
+        "ready": True,
+        "recovered_from_prior_image2_candidate": True,
+    }
+    report = _visual_reference_report(
+        visual_dir=visual_dir,
+        pages=[page_report],
+        total=len(screenshots),
+        image_size=image_size,
+        cache_key=_visual_reference_cache_key(task, ui_blueprint, len(screenshots), image_size),
+        provider=provider,
+    )
+    report["recovered_from_prior_image2_candidate"] = True
+    _write_visual_reference_manifest(visual_dir, report)
+    trace_event(
+        "ai_visual_reference_late_resume_recovered",
+        renderer=renderer,
+        image_width=width,
+        image_height=height,
+        source_file=selected.name,
+    )
+    return report
+
+
+def _late_resume_screenshot_checkpoint_ready(visual_dir: Path, expected_count: int) -> bool:
+    try:
+        output_dir = visual_dir.parents[2]
+    except IndexError:
+        return False
+    checkpoint = _read_json_dict(output_dir / "ui_screenshots" / "screenshot-checkpoint.json")
+    pages = checkpoint.get("pages") if isinstance(checkpoint, dict) else None
+    if not isinstance(pages, dict) or len(pages) != int(expected_count or 0):
+        return False
+    return all(
+        (output_dir / "ui_screenshots" / f"{page_key}.png").is_file()
+        and (output_dir / "ui_screenshots" / f"{page_key}.png").stat().st_size > 1024
+        for page_key in pages
+    )
+
+
+def _configured_image_model(provider: LLMProvider) -> str:
+    config = getattr(provider, "config", None)
+    if config is None:
+        return ""
+    try:
+        return image_model_name(config)
+    except Exception:
+        return str(getattr(config, "image_model", "") or "")
+
+
+def _configured_image_retry_count(provider: LLMProvider) -> int:
+    config = getattr(provider, "config", None)
+    if config is None:
+        return 0
+    return int(getattr(config, "image_retry_count", getattr(config, "retry_count", 0)) or 0)
+
+
+def _generate_visual_prompt(
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    provider: LLMProvider,
+    screenshot: Any,
+    module: FeatureModule | None,
+    context: dict[str, Any],
+    design_brief: dict[str, Any],
+    index: int,
+    total: int,
+) -> dict[str, Any]:
+    page_key = str(getattr(screenshot, "key", "") or f"page_{index}")
+    page_kind = str(getattr(screenshot, "page_kind", "") or "general")
+    started_at = time.perf_counter()
+    trace_event(
+        "ai_visual_prompt_begin",
+        page_key=page_key,
+        page_kind=page_kind,
+        renderer=str(getattr(ui_blueprint, "renderer", "") or ""),
+        index=index,
+        total=total,
+    )
+    content = provider.chat(
+        [
+            {"role": "system", "content": _visual_prompt_system_prompt()},
+            {
+                "role": "user",
+                "content": _visual_prompt_user_prompt(
+                    task=task,
+                    blueprint=blueprint,
+                    ui_blueprint=ui_blueprint,
+                    screenshot=screenshot,
+                    module=module,
+                    context=context,
+                    design_brief=design_brief,
+                    index=index,
+                    total=total,
+                ),
+            },
+        ],
+        temperature=0.62,
+        max_tokens=1800,
+        response_format={"type": "json_object"},
+        trace_label=f"ui_visual_prompt:{page_key}",
+        retry_policy=TextRetryPolicy(max_retries=1),
+    )
+    data = _parse_json(content)
+    prompt = str(data.get("visual_prompt") or "").strip()
+    if len(prompt) < 180:
+        raise ValueError("视觉提示词过短")
+    data["visual_prompt"] = prompt
+    data.setdefault("layout_brief", "")
+    data.setdefault("negative_prompt", "")
+    data.setdefault("visual_tokens", [])
+    trace_event(
+        "ai_visual_prompt_success",
+        page_key=page_key,
+        elapsed_seconds=round(time.perf_counter() - started_at, 3),
+        prompt_chars=len(prompt),
+    )
+    return data
+
+
+def _visual_prompt_system_prompt() -> str:
+    return (
+        "你是资深企业软件视觉总监。"
+        "请编写供图片生成模型使用的真实软件界面截图提示词，只返回 JSON，不要 Markdown。"
+        "提示词必须用于生成单张高保真软件运行界面截图，不要解释生成过程。"
+    )
+
+
+def _visual_prompt_user_prompt(
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    screenshot: Any,
+    module: FeatureModule | None,
+    context: dict[str, Any],
+    design_brief: dict[str, Any],
+    index: int,
+    total: int,
+) -> str:
+    renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
+    viewport = {"admin": "1280x720 横向 16:9 桌面软件", "mobile_app": "720x1280 竖向 9:16 手机界面", "game": "720x1280 竖向 9:16 手机游戏"}.get(renderer, "1280x720 横向 16:9 桌面软件")
+    screen_payload = {
+        "key": getattr(screenshot, "key", ""),
+        "title": getattr(screenshot, "title", ""),
+        "caption": getattr(screenshot, "caption", ""),
+        "page_kind": getattr(screenshot, "page_kind", ""),
+        "module_key": getattr(screenshot, "module_key", ""),
+    }
+    payload = {
+        "creative_seed": str(getattr(task, "seed", "") or ""),
+        "software_context": context,
+        "screen": screen_payload,
+        "module": _module_payload(module),
+        "product_experience_spec": design_brief.get("product_experience_spec") if isinstance(design_brief, dict) else {},
+        "visual_identity_spec": design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {},
+    }
+    return f"""
+请为第 {index}/{total} 张软著说明书界面生成图片参考稿提示词。
+
+输入上下文：
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+
+要求：
+- 参考稿必须是 {viewport} 的真实软件截图视觉稿，不是营销海报、线框图、插画或说明页。
+- `visual_prompt` 必须以“单张软件运行界面截图：”开头，第一句话就写清楚软件名称和当前页面名称。
+- 必须根据软件名称、业务对象、模块字段、统计指标和当前页面角色设计，不能像通用模板。
+- creative_seed 只用于本次任务的原创构图选择；请把它解释为独立的版式方向、空间比例、导航关系和组件节奏，不要在画面中显示 seed。
+- 不要默认使用常见后台四宫格。可按业务选择主从分栏、工作台、时间轴、地图联动、流程泳道、矩阵、任务板、档案阅读器或监测台等不同构图。
+- 同一本手册每页要形成不同截图角色：登录、首页、模块工作区、操作处理、统计分析的结构应明显不同。
+- 明确写出导航形态、主体工作区、控件密度、表格/图表/地图/看板/流程/面板布局、配色和业务文字氛围。
+- 可出现少量中文业务界面文字，但不要出现任何生成说明、模型说明、提示词、接口、Base URL、API Key、内部文件名。
+- 不要让参考稿出现知识讲解页、概念对比页、VS 图、教程海报、水印、浏览器地址栏、代码、英文占位、乱码或大面积空白。
+
+返回 JSON：
+{{
+  "visual_prompt": "给图片模型的完整中文提示词，包含画面比例、布局、组件、色彩、业务内容和真实软件质感",
+  "layout_brief": "一句话描述页面布局",
+  "negative_prompt": "需要避免的视觉问题",
+  "visual_tokens": ["导航/布局/组件/配色等关键词"]
+}}
+""".strip()
+
+
+def _image_prompt_text(
+    prompt_data: dict[str, Any],
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    screenshot: Any,
+    module: FeatureModule | None,
+    design_brief: dict[str, Any],
+) -> str:
+    page_kind = str(getattr(screenshot, "page_kind", "") or "general")
+    is_module_page = page_kind == "module"
+    visual_prompt = _shorten_prompt_part(
+        _sanitize_image_prompt_terms(str(prompt_data.get("visual_prompt") or "").strip()),
+        340 if is_module_page else 520,
+    )
+    layout = _shorten_prompt_part(
+        _sanitize_image_prompt_terms(str(prompt_data.get("layout_brief") or "").strip()),
+        130 if is_module_page else 160,
+    )
+    tokens = "、".join(
+        _sanitize_image_prompt_terms(str(item))
+        for item in prompt_data.get("visual_tokens", [])[:12]
+        if str(item).strip()
+    )
+    parts = [
+        _image_prompt_context_frame(
+            task=task,
+            blueprint=blueprint,
+            ui_blueprint=ui_blueprint,
+            screenshot=screenshot,
+            module=module,
+            design_brief=design_brief,
+        ),
+        visual_prompt,
+    ]
+    if layout:
+        parts.append(f"布局约束：{layout}")
+    if tokens:
+        parts.append(f"视觉关键词：{tokens}")
+    if is_module_page:
+        parts.append(
+            "桌面软件骨架：顶部项目栏、左侧深色模块导航、筛选工具栏、主操作按钮、业务数据表格、指标卡片、流程或图表面板必须清晰可见。"
+            "地图、三维场景或遥感影像只能作为其中一个业务卡片内的视窗，周围必须有表格、按钮、状态标签和操作结果。"
+        )
+    parts.append("画面要求：仅生成一张运行中的软件界面截图，首屏完整铺满画面，有真实控件边界、导航、表格/图表/表单/地图/面板、按钮、状态标签和业务数据。")
+    parts.append("画面内容限定：只呈现该软件自身的业务菜单、字段、数值、流程状态、操作按钮和工作区内容。")
+    return _limit_image_prompt_text("\n".join(parts), default_limit=720 if is_module_page else 820)
+
+
+def _style_reference_prompt_text(
+    prompt_data: dict[str, Any],
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    screenshot: Any,
+    module: FeatureModule | None,
+    design_brief: dict[str, Any],
+) -> str:
+    renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
+    viewport = "720x1280 竖屏手机界面" if renderer in {"mobile_app", "game"} else "1280x720 横向桌面软件界面"
+    layout = _shorten_prompt_part(
+        _sanitize_image_prompt_terms(str(prompt_data.get("layout_brief") or "").strip()),
+        110,
+    )
+    visual_excerpt = _shorten_prompt_part(
+        _sanitize_image_prompt_terms(str(prompt_data.get("visual_prompt") or "").strip()),
+        190,
+    )
+    tokens = "、".join(
+        _sanitize_image_prompt_terms(str(item))
+        for item in prompt_data.get("visual_tokens", [])[:10]
+        if str(item).strip()
+    )
+    business_terms = _image_prompt_business_terms(blueprint=blueprint, module=module)
+    subtype_key = str(design_brief.get("industry_subtype_key") or "") if isinstance(design_brief, dict) else ""
+    design_viewer = subtype_key == "design_viewer"
+    if design_viewer:
+        skeleton = (
+            "横向桌面设计文件浏览器必须占满画面，使用紧凑的文档标签栏、返回与刷新工具、应用内资源路径/搜索栏、"
+            "左侧团队项目和文件树、中间文件缩略图或设计画布、右侧属性评论版本检查器以及底部缩放状态；"
+            "界面要像真实可操作的设计资源浏览与评审软件，禁止手机底部导航、营销卡片墙和大段功能说明。"
+        )
+    elif renderer in {"mobile_app", "game"}:
+        skeleton = (
+            "手机软件界面必须占满画面，并根据业务自主选择沉浸式工作区、卡片流、分段列表、地图联动或任务面板；"
+            "状态栏、导航与主操作的关系要像真实产品，但不要强制复用固定的顶部栏加底部标签骨架。"
+        )
+    else:
+        skeleton = (
+            "桌面业务软件界面必须占画面主体，并依据业务自主选择侧栏、顶栏、双栏工作台、监测墙、流程台、档案台或地图联动等构图；"
+            "画面至少 70% 是可识别的软件控件与工作区，地图或三维视图必须与真实业务控件形成联动，不能成为纯场景图。"
+        )
+    parts = [
+        f"生成一张全局视觉风格参考图：{task.software_name}，{viewport}，必须是单张真实软件运行界面截图。",
+        f"本次原创构图种子：{task.seed}。种子只用于选择独立的空间比例、导航形态、信息密度和组件节奏，不得显示在画面中。",
+        skeleton,
+        f"业务文字围绕：{business_terms}。",
+    ]
+    if layout:
+        parts.append(f"布局方向：{layout}")
+    if tokens:
+        parts.append(f"视觉关键词：{tokens}")
+    if visual_excerpt:
+        parts.append(f"风格细节参考：{visual_excerpt}")
+    forbidden = "代码窗口或教程说明页" if design_viewer else "浏览器地址栏、代码窗口或教程说明页"
+    parts.append(
+        f"严格禁止生成海报、概念图、纯地图、纯三维场景、空白占位图、问号占位图、{forbidden}；"
+        "必须有大量横平竖直的软件控件边界。"
+    )
+    return _limit_image_prompt_text("\n".join(parts), default_limit=860)
+
+
+def _validate_image_prompt_text(value: str) -> None:
+    text = str(value or "")
+    if re.search(r"\?{4,}", text):
+        raise ValueError("视觉提示词包含疑似乱码，已停止图片生成。")
+    if re.search(r"(?i)app\s*(?:与|和|vs|/)\s*tab", text):
+        raise ValueError("视觉提示词仍包含 App/Tab 对比语义，已停止图片生成。")
+
+
+def _image_prompt_context_frame(
+    *,
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    ui_blueprint: UiBlueprint,
+    screenshot: Any,
+    module: FeatureModule | None,
+    design_brief: dict[str, Any],
+) -> str:
+    renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
+    renderer_label = {
+        "admin": "横向桌面业务软件窗口",
+        "mobile_app": "竖屏手机业务软件界面",
+        "game": "竖屏手机游戏运行界面",
+    }.get(renderer, "横向桌面业务软件窗口")
+    screen_title = str(getattr(screenshot, "title", "") or getattr(screenshot, "key", "") or "业务页面")
+    module_title = str(getattr(module, "title", "") or "")
+    experience = {}
+    if isinstance(design_brief, dict):
+        raw_experience = design_brief.get("product_experience_spec")
+        experience = raw_experience if isinstance(raw_experience, dict) else {}
+    business_terms = _image_prompt_business_terms(blueprint=blueprint, module=module)
+    subject = f"{task.software_name} - {screen_title}"
+    if module_title and module_title not in subject:
+        subject = f"{subject} / {module_title}"
+    terminal = str(experience.get("terminal") or renderer_label)
+    return (
+        f"单张软件运行界面截图：{subject}。"
+        f"画面载体为{renderer_label}，目标终端为{terminal}，只能表现该软件正在使用中的业务操作界面。"
+        f"可见中文业务词围绕：{business_terms}。"
+    )
+
+
+def _image_prompt_business_terms(*, blueprint: ProductBlueprint, module: FeatureModule | None) -> str:
+    terms: list[str] = []
+    if module is not None:
+        terms.extend([module.title, module.description])
+        terms.extend(module.operations[:4])
+        terms.extend(module.data_fields[:5])
+    terms.extend(blueprint.business_objects[:5])
+    terms.extend(blueprint.report_metrics[:4])
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in terms:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        cleaned.append(text)
+    return "、".join(cleaned[:12]) or "业务清单、状态监测、处理结果、统计指标"
+
+
+def _sanitize_image_prompt_terms(value: str) -> str:
+    text = str(value or "")
+    replacements = [
+        (r"(?i)app[\s\S]{0,8}tab", "软件运行界面"),
+        (r"(?i)tab[\s\S]{0,8}app", "软件运行界面"),
+        (r"(?i)app\s*(?:与|和|vs|/)\s*tab", "软件运行界面"),
+        (r"(?i)tab\s*(?:与|和|vs|/)\s*app", "软件运行界面"),
+        (r"(?:概念|知识)?(?:区别|对比|比较)(?:风格|页面|图)?", "运行界面"),
+        (r"(?:说明|教程|科普|宣传)(?:页|图|海报|画面|风格)?", "运行界面"),
+        (r"(?:不是|避免|不要|禁止|不得)[^。；\n]{0,20}", ""),
+        (r"(?i)\btabs?\b", "软件内标签页"),
+        (r"(?i)\bapp\b", "手机端业务界面"),
+        (r"\bAPP\b", "手机端业务界面"),
+        (r"(?i)\bimage2\b", "图片模型"),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+    return text
+
+
+def _shorten_prompt_part(value: str, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    for marker in ("。", "；", "，", "、", ";", ","):
+        marker_index = cut.rfind(marker)
+        if marker_index >= int(limit * 0.65):
+            cut = cut[: marker_index + 1]
+            break
+    return cut.rstrip("，、；;,. ") + "。"
+
+
+def _limit_image_prompt_text(value: str, *, default_limit: int = 760) -> str:
+    raw_limit = os.getenv("SOFT_UI_VISUAL_REFERENCE_PROMPT_CHARS", "").strip()
+    try:
+        limit = max(560, min(1800, int(raw_limit))) if raw_limit else default_limit
+    except ValueError:
+        limit = default_limit
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    required_tail = (
+        "必须是单张高保真软件运行界面截图，有清晰业务控件、导航、卡片、表格或图表；"
+        "画面只包含该软件正在运行的业务界面和真实控件。"
+    )
+    head_limit = max(300, limit - len(required_tail) - 1)
+    return f"{text[:head_limit].rstrip()} {required_tail}"
+
+
+def _visual_reference_dir(screenshots: list[Any]) -> Path:
+    for item in screenshots:
+        html_path = Path(str(getattr(item, "html_path", "") or ""))
+        if html_path:
+            return html_path.parent / "visual-references"
+    return Path("visual-references")
+
+
+def _visual_reference_size(renderer: str) -> str:
+    explicit = os.getenv("SOFT_UI_VISUAL_REFERENCE_SIZE", "").strip()
+    if explicit:
+        return explicit
+    if renderer in {"mobile_app", "game"}:
+        return os.getenv("SOFT_UI_VISUAL_REFERENCE_MOBILE_SIZE", "720x1280").strip() or "720x1280"
+    return os.getenv("SOFT_UI_VISUAL_REFERENCE_DESKTOP_SIZE", "1280x720").strip() or "1280x720"
+
+
+def _visual_reference_ready(reference: dict[str, Any] | None) -> bool:
+    if not isinstance(reference, dict) or not reference.get("ready"):
+        return False
+    image_path = Path(str(reference.get("image_path") or ""))
+    return image_path.exists() and image_path.stat().st_size > 1024
+
+
+def _report_reference_summary(reference: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(reference, dict):
+        return {"ready": False}
+    return {
+        "ready": bool(reference.get("ready")),
+        "mode": str(reference.get("mode") or ""),
+        "reference_page_key": str(reference.get("reference_page_key") or ""),
+        "applies_to_page_count": int(reference.get("applies_to_page_count") or 0),
+        "image_path": str(reference.get("image_path") or ""),
+        "image_sha256": str(reference.get("image_sha256") or ""),
+        "image_model": str(reference.get("image_model") or ""),
+        "image_width": int(reference.get("image_width") or 0),
+        "image_height": int(reference.get("image_height") or 0),
+        "prompt_summary": str(reference.get("prompt_summary") or ""),
+    }
+
+
+def _prompt_reference_payload(reference: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(reference, dict):
+        return {"ready": False}
+    return {
+        "ready": bool(reference.get("ready")),
+        "mode": str(reference.get("mode") or ""),
+        "reference_page_key": str(reference.get("reference_page_key") or ""),
+        "applies_to_page_count": int(reference.get("applies_to_page_count") or 0),
+        "image_sha256": str(reference.get("image_sha256") or ""),
+        "image_width": int(reference.get("image_width") or 0),
+        "image_height": int(reference.get("image_height") or 0),
+        "prompt_summary": str(reference.get("prompt_summary") or ""),
+    }
+
+
+def _visual_reference_style_contract(reference: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(reference, dict):
+        return {"ready": False, "dominant_colors": []}
+    contract: dict[str, Any] = {
+        "ready": bool(reference.get("ready")),
+        "image_width": int(reference.get("image_width") or 0),
+        "image_height": int(reference.get("image_height") or 0),
+        "prompt_summary": str(reference.get("prompt_summary") or ""),
+        "dominant_colors": [],
+    }
+    image_path = Path(str(reference.get("image_path") or ""))
+    if not image_path.is_file():
+        return contract
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            rgb = image.convert("RGB")
+            contract["image_width"] = int(rgb.width)
+            contract["image_height"] = int(rgb.height)
+            rgb.thumbnail((96, 96))
+            quantized = rgb.quantize(colors=8)
+            palette = quantized.getpalette() or []
+            ranked = sorted(quantized.getcolors() or [], reverse=True)
+            colors: list[str] = []
+            for _count, color_index in ranked:
+                offset = int(color_index) * 3
+                if offset + 2 >= len(palette):
+                    continue
+                color = f"#{palette[offset]:02x}{palette[offset + 1]:02x}{palette[offset + 2]:02x}"
+                if color not in colors:
+                    colors.append(color)
+                if len(colors) >= 6:
+                    break
+            contract["dominant_colors"] = colors
+    except Exception as exc:
+        trace_event(
+            "ai_frontend_reference_contract_fallback",
+            error=sanitize_error_message(exc, limit=240),
+        )
+    return contract
+
+
+def _prompt_summary(prompt_data: dict[str, Any]) -> str:
+    text = " ".join(
+        str(item or "").strip()
+        for item in [
+            prompt_data.get("layout_brief"),
+            "、".join(str(token) for token in prompt_data.get("visual_tokens", []) if str(token).strip()),
+        ]
+        if str(item or "").strip()
+    )
+    return text[:220]
+
+
+def _image_data_url(path: Path) -> str:
+    raw = path.read_bytes()
+    mime = "image/jpeg" if path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
+    optimized = _optimized_reference_image_bytes(raw)
+    if optimized:
+        optimized_raw, optimized_mime = optimized
+        trace_event(
+            "ai_frontend_reference_image_optimized",
+            original_bytes=len(raw),
+            optimized_bytes=len(optimized_raw),
+            mime=optimized_mime,
+        )
+        raw = optimized_raw
+        mime = optimized_mime
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
+def _optimized_reference_image_bytes(raw: bytes) -> tuple[bytes, str] | None:
+    if len(raw) <= 260_000:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        with Image.open(io.BytesIO(raw)) as image:
+            rgb = image.convert("RGB")
+            rgb.thumbnail((960, 960))
+            buffer = io.BytesIO()
+            rgb.save(buffer, format="JPEG", quality=82, optimize=True)
+            optimized = buffer.getvalue()
+    except Exception:
+        return None
+    if len(optimized) >= len(raw):
+        return None
+    return optimized, "image/jpeg"
+
+
+def _ai_frontend_timeout_seconds(provider: LLMProvider) -> int:
+    raw = (
+        os.getenv("SOFT_LLM_AI_FRONTEND_TIMEOUT_SECONDS", "").strip()
+        or os.getenv("SOFT_LLM_CODEGEN_TIMEOUT_SECONDS", "").strip()
+    )
+    configured = int(getattr(getattr(provider, "config", None), "timeout", 90) or 90)
+    default = min(120, configured)
+    if raw:
+        try:
+            default = int(raw)
+        except ValueError:
+            pass
+    return max(60, min(240, default))
+
+
+def _image_dimensions(path: Path) -> tuple[int, int]:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            return int(image.width), int(image.height)
+    except Exception:
+        return 0, 0
+
+
+def _sha256_file(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _safe_key(value: str) -> str:
+    key = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(value or "page")).strip("._-")
+    return key or "page"
+
+
+def _codegen_context(task: GenerationTask, blueprint: ProductBlueprint, ui_blueprint: UiBlueprint) -> dict[str, Any]:
+    workflows: list[str] = []
+    for item in blueprint.workflows[:5]:
+        if isinstance(item, dict):
+            steps = " -> ".join(str(step) for step in item.get("steps", [])[:6])
+            workflows.append(f"{item.get('name', '业务流程')}：{steps}")
+    return {
+        "software_name": task.software_name,
+        "version": task.version,
+        "software_category": getattr(task, "software_category", ""),
+        "product_type": task.product_type,
+        "feature_hint": task.feature_hint,
+        "industry": blueprint.industry,
+        "scenario": blueprint.scenario,
+        "positioning": blueprint.positioning,
+        "summary": blueprint.summary,
+        "target_users": blueprint.target_users or blueprint.roles,
+        "business_objects": blueprint.business_objects[:12],
+        "report_metrics": blueprint.report_metrics[:12],
+        "quality_rules": blueprint.quality_rules[:8],
+        "workflows": workflows,
+        "renderer": ui_blueprint.renderer,
+        "visual_style": ui_blueprint.visual_style,
+        "screens": [
+            {
+                "key": screen.key,
+                "title": screen.title,
+                "view_type": screen.view_type,
+                "module_key": screen.module_key,
+                "components": screen.components[:6],
+            }
+            for screen in getattr(ui_blueprint, "screens", [])[:16]
+        ],
+        "modules": [_module_payload(module) for module in blueprint.modules[:8]],
+    }
+
+
+def _module_payload(module: FeatureModule | None) -> dict[str, Any]:
+    if module is None:
+        return {}
+    return {
+        "key": module.key,
+        "title": module.title,
+        "description": module.description,
+        "operations": module.operations[:8],
+        "operation_specs": list(getattr(module, "operation_specs", []) or [])[:7],
+        "data_fields": module.data_fields[:10],
+        "pages": module.pages[:6],
+        "rules": module.rules[:6],
+        "entities": list(getattr(module, "entities", []) or [])[:5],
+    }
+
+
+def _prepare_runtime_html(html: str, *, title: str, renderer: str, page_kind: str, module_key: str) -> str:
+    result = html.strip()
+    if not result.lower().startswith("<!doctype"):
+        result = "<!doctype html>\n" + result
+    if "<meta charset" not in result.lower():
+        result = re.sub(r"(<head[^>]*>)", r'\1\n<meta charset="utf-8" />', result, count=1, flags=re.I)
+    if "<title" not in result.lower():
+        title_html = f"<title>{escape(title)}</title>\n</head>"
+        result = re.sub(r"</head>", lambda _match: title_html, result, count=1, flags=re.I)
+    attrs = (
+        f'data-page-kind="{escape(page_kind)}" '
+        f'data-module-key="{escape(module_key)}" '
+        f'data-renderer="{escape(renderer)}" '
+        'data-ai-frontend="true"'
+    )
+    result = re.sub(r"<body\b([^>]*)>", lambda m: _body_tag_with_attrs(m.group(1), attrs), result, count=1, flags=re.I)
+    guard = _runtime_guard_style(renderer)
+    if "</head>" in result.lower():
+        result = re.sub(r"</head>", lambda _match: guard + "\n</head>", result, count=1, flags=re.I)
+    else:
+        result = result.replace("<body", f"<head>{guard}</head><body", 1)
+    return result
+
+
+def _body_tag_with_attrs(existing: str, attrs: str) -> str:
+    text = str(existing or "")
+    for name in ["data-page-kind", "data-module-key", "data-renderer"]:
+        text = re.sub(rf"\s{name}=(\"[^\"]*\"|'[^']*')", "", text, flags=re.I)
+    return f"<body{text} {attrs}>"
+
+
+def _runtime_guard_style(renderer: str) -> str:
+    if renderer in {"mobile_app", "game"}:
+        size = "body{width:720px!important;height:1280px!important;min-height:1280px!important;overflow:hidden!important;}"
+        admin_rules = ""
+    else:
+        size = "body{width:1280px!important;height:720px!important;min-height:720px!important;overflow:hidden!important;background:#fff8f3;}"
+        admin_rules = """
+body[data-ai-frontend="true"][data-renderer="admin"] .app{width:1280px!important;height:720px!important;max-width:1280px!important;max-height:720px!important;overflow:hidden!important;}
+body[data-ai-frontend="true"][data-renderer="admin"] :is(.main,.content,.workspace,.grid,.bottom,.middle){min-width:0!important;min-height:0!important;}
+body[data-ai-frontend="true"][data-renderer="admin"] table{width:100%!important;table-layout:fixed!important;border-collapse:collapse;}
+body[data-ai-frontend="true"][data-renderer="admin"] :is(th,td){min-width:0!important;max-width:100%!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;line-height:1.18!important;vertical-align:middle!important;}
+body[data-ai-frontend="true"][data-renderer="admin"] :is(button,.btn,.mini-btn,.tab,.nav-item,.select,.input,.mini-input,.tag,.badge,.status span,.field label,.op a){min-width:0!important;max-width:100%!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;line-height:1.18!important;word-break:keep-all!important;}
+body[data-ai-frontend="true"][data-renderer="admin"] :is(button,.btn,.mini-btn){display:inline-flex!important;align-items:center!important;justify-content:center!important;font-size:12px!important;padding-left:8px!important;padding-right:8px!important;}
+body[data-ai-frontend="true"][data-renderer="admin"] :is(.opbtn,button.opbtn){height:20px!important;min-height:20px!important;max-height:20px!important;font-size:11px!important;line-height:1!important;padding-top:0!important;padding-bottom:0!important;}
+body[data-ai-frontend="true"][data-renderer="admin"] :is(.tag,.badge){display:inline-flex!important;align-items:center!important;justify-content:center!important;padding-left:6px!important;padding-right:6px!important;}
+body[data-ai-frontend="true"][data-renderer="admin"] :is(.code,.num,.val,.metric .num,.mcell .val,.record-title .code){display:block!important;min-width:0!important;max-width:100%!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;line-height:1.12!important;}
+body[data-ai-frontend="true"][data-renderer="admin"] :is(.code,.record-title .code,.metric .num,.mcell .val,.val){font-size:20px!important;}
+body[data-ai-frontend="true"][data-renderer="admin"] :is(.runtime-record-panel b,.meta b,.rec .r-line b,.source-list b){min-width:0!important;max-width:100%!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;}
+body[data-ai-frontend="true"][data-renderer="admin"] :is(.operation-result){max-width:100%!important;overflow:hidden!important;text-overflow:ellipsis!important;line-height:1.28!important;}
+body[data-ai-frontend="true"][data-renderer="admin"] :is(.map-pin,.map-node,.relation-node,.flow-node) :is(b,strong,span,em){display:block!important;min-width:0!important;max-width:100%!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
+body[data-ai-frontend="true"][data-renderer="admin"][data-page-kind="login"] :is(.left-console,.login-hero,.login-brand) h1{max-width:none!important;font-size:31px!important;line-height:1.15!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
+body[data-ai-frontend="true"] .page-spec-root :is(button,th,td,.detail-item,.workflow-step,.timeline-item,.kanban-column,.mobile-list-item,.operation-result,.map-pin,.graph-node){overflow:visible!important;}
+body[data-ai-frontend="true"] .page-spec-root :is(button,th,td,.detail-item span,.detail-item strong,.workflow-step strong,.workflow-step small,.timeline-item strong,.timeline-item p,.kanban-column strong,.kanban-column article span,.mobile-list-item strong,.mobile-list-item span,.operation-result strong,.operation-result span,.map-pin b,.map-pin small,.graph-node span,.graph-node strong){white-space:normal!important;overflow-wrap:anywhere!important;word-break:break-word!important;text-overflow:clip!important;}
+body[data-ai-frontend="true"] .page-spec-root .page-spec-workspace{overflow:auto!important;}
+""".strip()
+    return f"""
+<style id="soft-ai-runtime-guard">
+html,body{{margin:0!important;box-sizing:border-box;}}
+*,*::before,*::after{{box-sizing:inherit;}}
+{size}
+body[data-ai-frontend="true"]{{font-family:"Microsoft YaHei","PingFang SC",Arial,sans-serif;-webkit-font-smoothing:antialiased;text-rendering:geometricPrecision;}}
+{admin_rules}
+body[data-renderer="mobile_app"][data-page-kind="operation"] #root,
+body[data-renderer="mobile_app"][data-page-kind="operation"] .screen-root,
+body[data-renderer="mobile_app"][data-page-kind="operation"] :is(.phone-shell,.mobile-shell,.app-shell){{width:720px!important;min-width:720px!important;max-width:720px!important;margin-left:0!important;margin-right:0!important;}}
+body[data-renderer="mobile_app"][data-page-kind="operation"] :is(.confirm-drawer,.detail-drawer,.confirm-panel,[class*="modal"],[class*="dialog"],[role="dialog"]){{position:fixed!important;left:50%!important;right:auto!important;top:50%!important;bottom:auto!important;transform:translate(-50%,-50%)!important;width:calc(100vw - 32px)!important;max-width:688px!important;max-height:calc(100vh - 48px)!important;margin:0!important;overflow:auto!important;z-index:10000!important;border-radius:12px!important;}}
+body[data-renderer="admin"][data-page-kind="operation"] :is(.confirm-drawer,.detail-drawer,.confirm-panel,[class*="modal"],[class*="dialog"],[role="dialog"]){{position:fixed!important;left:50%!important;right:auto!important;top:50%!important;bottom:auto!important;transform:translate(-50%,-50%)!important;width:min(720px,calc(100vw - 48px))!important;max-height:calc(100vh - 48px)!important;margin:0!important;overflow:auto!important;z-index:10000!important;border-radius:12px!important;}}
+.runtime-generated-record{{position:fixed;left:24px;right:24px;bottom:18px;z-index:9999;display:grid;grid-template-columns:1fr 1.2fr 1fr .7fr;gap:10px;padding:10px 12px;border-radius:8px;background:rgba(255,255,255,.94);border:1px solid rgba(148,163,184,.45);box-shadow:0 12px 28px rgba(15,23,42,.16);font-family:"Microsoft YaHei","PingFang SC",sans-serif;color:#1f2937;}}
+.runtime-generated-record span{{display:block;color:#64748b;font-size:11px;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+.runtime-generated-record b{{display:block;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+</style>
+""".strip()
+
+
+def _reject_internal_visible_terms(html: str) -> None:
+    visible = re.sub(r"<style\b.*?</style>", " ", html, flags=re.S | re.I)
+    visible = re.sub(r"<script\b.*?</script>", " ", visible, flags=re.S | re.I)
+    visible = re.sub(r"<[^>]+>", " ", visible)
+    patterns = [
+        "GPT",
+        "提示词",
+        "image2",
+        "视觉参考",
+        "参考稿",
+        "接口返回",
+        "运行服务",
+        "生成项目",
+        "浏览器页面",
+        "source-ui-evidence",
+        "generated_source",
+        "ui-prototype",
+    ]
+    hits = [item for item in patterns if re.search(re.escape(item), visible, flags=re.I)]
+    if re.search(r"AI\s*(生成|提示词|模型说明|接口|代码)", visible, flags=re.I):
+        hits.append("AI生成说明")
+    if hits:
+        raise ValueError("模型页面包含客户不可见内部说明：" + "、".join(sorted(set(hits))))
+
+
+def _reject_direct_image_embedding(html: str) -> None:
+    patterns = [
+        ("图片标签", r"<img\b"),
+        ("内联图片", r"data:image/"),
+        ("图片背景", r"background(?:-image)?\s*:[^;{}]*url\s*\("),
+        ("外部资源", r"\burl\s*\("),
+    ]
+    hits = [label for label, pattern in patterns if re.search(pattern, html, flags=re.I)]
+    if hits:
+        raise ValueError("模型页面疑似直接嵌入参考图或外部资源：" + "、".join(sorted(set(hits))))
+
+
+def _parse_json(content: str) -> dict[str, Any]:
+    return parse_json_object(content, label="frontend_codegen")
+
+
+def _emit(emit, progress: int, message: str, **extra) -> None:
+    if emit:
+        emit(progress, message, **extra)

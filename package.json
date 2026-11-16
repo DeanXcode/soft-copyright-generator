@@ -1,16 +1,20 @@
 {
   "name": "soft-copyright-generator-desktop",
-  "version": "0.1.0",
+  "version": "0.2.3",
   "private": true,
   "type": "module",
   "main": "desktop/electron/main.cjs",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "test": "python -m unittest discover -s tests",
     "build": "vite build",
+    "verify:audit": "node scripts/verify-npm-audit.mjs",
+    "verify:release": "powershell -ExecutionPolicy Bypass -File scripts\\verify-release.ps1",
+    "cleanup:artifacts": "powershell -ExecutionPolicy Bypass -File scripts\\cleanup-artifacts.ps1",
     "pack:dir": "npm run prepare:runtime && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --dir",
     "pack:win": "npm run prepare:runtime && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --win nsis",
     "pack:win:customer": "powershell -ExecutionPolicy Bypass -File scripts\\package-customer-nsis.ps1",
-    "prepare:playwright": "cross-env PLAYWRIGHT_BROWSERS_PATH=ms-playwright python -m playwright install chromium",
+    "prepare:playwright": "cross-env PLAYWRIGHT_BROWSERS_PATH=ms-playwright python -m playwright install --only-shell chromium",
     "prepare:python": "powershell -ExecutionPolicy Bypass -File scripts\\prepare-python-runtime.ps1",
     "prepare:libreoffice": "powershell -ExecutionPolicy Bypass -File scripts\\prepare-libreoffice-runtime.ps1",
     "prepare:runtime": "npm run prepare:playwright && npm run prepare:python",
@@ -23,13 +27,13 @@
     "@vitejs/plugin-react": "^5.1.1",
     "cross-env": "^10.1.0",
     "lucide-react": "^0.556.0",
-    "vite": "^7.2.7",
     "react": "^19.2.3",
-    "react-dom": "^19.2.3"
+    "react-dom": "^19.2.3",
+    "vite": "^7.2.7"
   },
   "devDependencies": {
     "electron": "39.8.10",
-    "electron-builder": "^26.0.12"
+    "electron-builder": "26.15.3"
   },
   "build": {
     "appId": "com.softcopyright.generator",
@@ -37,12 +41,17 @@
     "directories": {
       "output": "release/installer"
     },
+    "icon": "build/icon.ico",
     "files": [
       "dist/**/*",
       "desktop/electron/**/*",
       "package.json"
     ],
     "extraResources": [
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      },
       {
         "from": "backend",
         "to": "backend"
@@ -53,7 +62,11 @@
       },
       {
         "from": "ms-playwright",
-        "to": "ms-playwright"
+        "to": "ms-playwright",
+        "filter": [
+          "**/*",
+          "!chromium-*/**"
+        ]
       },
       {
         "from": "python-runtime",
@@ -62,15 +75,23 @@
       {
         "from": "requirements.txt",
         "to": "requirements.txt"
+      },
+      {
+        "from": "requirements-lock.txt",
+        "to": "requirements-lock.txt"
       }
     ],
     "win": {
+      "icon": "build/icon.ico",
       "signAndEditExecutable": false,
       "target": [
         "nsis"
       ]
     },
     "nsis": {
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
       "oneClick": false,
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,

@@ -55,7 +55,7 @@ function Test-RuntimeReady($PythonExe) {
   try {
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    & $PythonExe -c "import sys, docx, reportlab, playwright, softcopyright; print('embedded-python-ok')" > $null 2>$null
+    & $PythonExe -s -c "import sys, docx, reportlab, playwright, pypdf, softcopyright; print('embedded-python-ok')" > $null 2>$null
     $exitCode = $LASTEXITCODE
     $ErrorActionPreference = $previousErrorActionPreference
     return $exitCode -eq 0
@@ -117,10 +117,16 @@ $pythonExe = Join-Path $runtimePath "python.exe"
 Write-Host "Installing pip into embedded Python"
 Invoke-Checked $pythonExe @($getPipPath, "--no-warn-script-location")
 
-Write-Host "Installing project Python dependencies"
-Invoke-Checked $pythonExe @("-m", "pip", "install", "--no-warn-script-location", "-r", (Join-Path $root "requirements.txt"))
+$requirementsLock = Join-Path $root "requirements-lock.txt"
+if (-not (Test-Path -LiteralPath $requirementsLock)) {
+  throw "Missing locked Python dependencies: $requirementsLock"
+}
+
+Write-Host "Installing locked project Python dependencies"
+Invoke-Checked $pythonExe @("-m", "pip", "install", "--no-warn-script-location", "--require-hashes", "-r", $requirementsLock)
 
 Write-Host "Verifying embedded Python"
-Invoke-Checked $pythonExe @("-c", "import sys, docx, reportlab, playwright; print(sys.version); print('embedded-python-ok')")
+Invoke-Checked $pythonExe @("-s", "-c", "import sys, docx, reportlab, playwright, pypdf; print(sys.version); print('embedded-python-ok')")
+Invoke-Checked $pythonExe @("-s", "-m", "pip", "check")
 
 Write-Host "Python runtime ready: $runtimePath"

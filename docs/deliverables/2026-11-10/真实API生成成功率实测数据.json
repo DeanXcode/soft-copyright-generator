@@ -1,0 +1,846 @@
+{
+  "started_at": "2026-11-10T19:29:36.646351+08:00",
+  "status": "complete",
+  "config_origin": "installed-app/production.json",
+  "model": "gpt-6-sol",
+  "image_model": "gpt-image-2",
+  "scope": "current source, desktop defaults, sequential; initial includes built-in retries; at most one resume",
+  "source_sha256": {
+    "backend\\softcopyright\\generator.py": "d19e54ef4ed91ca7ead6fa26c5c67db448eccd72de03f0a125982e31247b668b",
+    "backend\\softcopyright\\llm\\provider.py": "6e1ea3be95627042f4ccf5363779264addaaacc224d08676fdf86fc56c980a01",
+    "backend\\softcopyright\\llm_manual.py": "a54da797ec1e87a8926346aedfbcdf91e1290994553650f1a37225610558dd6b"
+  },
+  "samples": [
+    {
+      "id": 1,
+      "name": "聚合剪辑软件",
+      "product_type": "APP",
+      "status": "complete",
+      "outline": {
+        "exit_code": 0,
+        "elapsed_seconds": 46.6,
+        "timed_out": false,
+        "message": "",
+        "trace": {
+          "event_counts": {
+            "feature_hint_inference_begin": 1,
+            "provider_request_begin": 2,
+            "provider_request_success": 2,
+            "feature_hint_inference_success": 1
+          },
+          "errors": [],
+          "tiny_responses": []
+        },
+        "module_count": 10,
+        "passed": true
+      },
+      "initial": {
+        "exit_code": 1,
+        "elapsed_seconds": 564.3,
+        "timed_out": false,
+        "message": "timeline_editing 前端模型请求失败，已停止剩余页面，避免长时间重复等待：PageSpec JSON 无法解析：Expecting ',' delimiter",
+        "trace": {
+          "event_counts": {
+            "blueprint_attempt_begin": 1,
+            "chat_json_begin": 15,
+            "provider_request_begin": 27,
+            "provider_request_success": 26,
+            "chat_json_success": 15,
+            "blueprint_contract_modules_reused": 1,
+            "blueprint_attempt_success": 1,
+            "architecture_selection_success": 1,
+            "ai_visual_prompt_begin": 1,
+            "ai_visual_prompt_success": 1,
+            "provider_image_request_begin": 1,
+            "provider_image_request_success": 1,
+            "ai_frontend_provider_config": 1,
+            "ai_frontend_reference_contract_ready": 1,
+            "ai_frontend_quality_repair": 4,
+            "ai_frontend_circuit_open": 2,
+            "provider_request_error": 1,
+            "ai_frontend_bounded_queue_stopped": 1
+          },
+          "errors": [
+            {
+              "event": "provider_request_error",
+              "label": "page_spec:transitions_and_speed",
+              "status_code": null,
+              "attempt": 1,
+              "elapsed_seconds": 20.621,
+              "error": "文本请求已取消"
+            }
+          ],
+          "tiny_responses": []
+        },
+        "output_dir": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\real-api-20261110\\run-192936\\sample-1\\output\\聚合剪辑软件-real-run-192936-1",
+        "zip_path": "",
+        "ready_for_delivery": false,
+        "checks": {
+          "ui_domain_profile_key": "general_business",
+          "ui_domain_profile_confidence": 0.6,
+          "ui_domain_profile_source": "generic-fallback",
+          "ui_domain_profile_evidence": "",
+          "ui_domain_profile_weak_evidence": "",
+          "ui_domain_profile_excluded_evidence": "",
+          "ui_domain_gate_keys": "",
+          "ui_domain_gate_reasons": "未启用交通线路拓扑门禁：当前领域不要求干线、支线接驳和服务时窗证据。",
+          "ui_transport_related": false,
+          "ui_route_topology_required": false,
+          "ui_visual_prompt_ready": true,
+          "ui_visual_reference_ready": true,
+          "ui_visual_reference_mode": "style_reference",
+          "ui_visual_reference_source": "gpt-style-reference-prompt+image2",
+          "ui_visual_reference_count": 1,
+          "ui_visual_reference_target_count": 1,
+          "ui_visual_reference_page_count": 27,
+          "ui_visual_reference_applies_to_page_count": 27,
+          "ui_visual_style_reference_ready": true,
+          "ui_visual_reference_image_model": "gpt-image-2",
+          "ui_visual_reference_retry_count": 3,
+          "ui_visual_reference_failed_page": "",
+          "ui_visual_reference_error": "",
+          "ui_visual_reference_directory": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\real-api-20261110\\run-192936\\sample-1\\output\\聚合剪辑软件-real-run-192936-1\\generated_source\\ui-prototype\\visual-references"
+        },
+        "warnings": [
+          "timeline_editing 前端模型请求失败，已停止剩余页面，避免长时间重复等待：PageSpec JSON 无法解析：Expecting ',' delimiter"
+        ],
+        "passed": false
+      },
+      "resume": {
+        "exit_code": 1,
+        "elapsed_seconds": 27.6,
+        "timed_out": false,
+        "message": "timeline_editing 前端模型请求失败，已停止剩余页面，避免长时间重复等待：PageSpec JSON 无法解析：Expecting ',' delimiter",
+        "trace": {
+          "event_counts": {
+            "ai_visual_reference_reused": 1,
+            "ai_frontend_provider_config": 1,
+            "ai_frontend_reference_contract_ready": 1,
+            "provider_request_begin": 3,
+            "provider_request_success": 2,
+            "ai_frontend_quality_repair": 1,
+            "ai_frontend_circuit_open": 2,
+            "provider_request_error": 1,
+            "ai_frontend_bounded_queue_stopped": 1
+          },
+          "errors": [
+            {
+              "event": "provider_request_error",
+              "label": "page_spec:transitions_and_speed",
+              "status_code": null,
+              "attempt": 1,
+              "elapsed_seconds": 26.0,
+              "error": "文本请求已取消"
+            }
+          ],
+          "tiny_responses": []
+        },
+        "output_dir": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\real-api-20261110\\run-192936\\sample-1\\output\\聚合剪辑软件-real-run-192936-1",
+        "zip_path": "",
+        "ready_for_delivery": false,
+        "checks": {
+          "ui_domain_profile_key": "general_business",
+          "ui_domain_profile_confidence": 0.6,
+          "ui_domain_profile_source": "generic-fallback",
+          "ui_domain_profile_evidence": "",
+          "ui_domain_profile_weak_evidence": "",
+          "ui_domain_profile_excluded_evidence": "",
+          "ui_domain_gate_keys": "",
+          "ui_domain_gate_reasons": "未启用交通线路拓扑门禁：当前领域不要求干线、支线接驳和服务时窗证据。",
+          "ui_transport_related": false,
+          "ui_route_topology_required": false,
+          "ui_visual_prompt_ready": true,
+          "ui_visual_reference_ready": true,
+          "ui_visual_reference_mode": "style_reference",
+          "ui_visual_reference_source": "gpt-style-reference-prompt+image2",
+          "ui_visual_reference_count": 1,
+          "ui_visual_reference_target_count": 1,
+          "ui_visual_reference_page_count": 27,
+          "ui_visual_reference_applies_to_page_count": 27,
+          "ui_visual_style_reference_ready": true,
+          "ui_visual_reference_image_model": "gpt-image-2",
+          "ui_visual_reference_retry_count": 3,
+          "ui_visual_reference_failed_page": "",
+          "ui_visual_reference_error": "",
+          "ui_visual_reference_directory": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\real-api-20261110\\run-192936\\sample-1\\output\\聚合剪辑软件-real-run-192936-1\\generated_source\\ui-prototype\\visual-references"
+        },
+        "warnings": [
+          "timeline_editing 前端模型请求失败，已停止剩余页面，避免长时间重复等待：PageSpec JSON 无法解析：Expecting ',' delimiter"
+        ],
+        "passed": false
+      },
+      "observed": {
+        "outline": {
+          "counts": {
+            "feature_hint_inference_begin": 1,
+            "provider_request_begin": 2,
+            "provider_request_success": 2,
+            "feature_hint_inference_success": 1
+          },
+          "issues": [],
+          "page_request_count": 0,
+          "json_repair_count": 0,
+          "blueprint_scores": []
+        },
+        "initial": {
+          "counts": {
+            "blueprint_attempt_begin": 1,
+            "chat_json_begin": 15,
+            "provider_request_begin": 27,
+            "provider_request_success": 26,
+            "chat_json_success": 15,
+            "blueprint_contract_modules_reused": 1,
+            "blueprint_attempt_success": 1,
+            "architecture_selection_success": 1,
+            "ai_visual_prompt_begin": 1,
+            "ai_visual_prompt_success": 1,
+            "provider_image_request_begin": 1,
+            "provider_image_request_success": 1,
+            "ai_frontend_provider_config": 1,
+            "ai_frontend_reference_contract_ready": 1,
+            "ai_frontend_quality_repair": 4,
+            "ai_frontend_circuit_open": 2,
+            "provider_request_error": 1,
+            "ai_frontend_bounded_queue_stopped": 1
+          },
+          "issues": [
+            {
+              "event": "ai_frontend_quality_repair",
+              "page_key": "dashboard",
+              "error_category": "format_error"
+            },
+            {
+              "event": "ai_frontend_quality_repair",
+              "page_key": "login",
+              "error_category": "quality_error"
+            },
+            {
+              "event": "ai_frontend_quality_repair",
+              "page_key": "media_import",
+              "error_category": "format_error"
+            },
+            {
+              "event": "ai_frontend_quality_repair",
+              "page_key": "timeline_editing",
+              "error_category": "format_error"
+            },
+            {
+              "event": "ai_frontend_circuit_open",
+              "page_key": "timeline_editing",
+              "error": "PageSpec JSON 无法解析：Expecting ',' delimiter"
+            },
+            {
+              "event": "provider_request_error",
+              "label": "page_spec:transitions_and_speed",
+              "error_category": "cancelled",
+              "status_code": null,
+              "error": "文本请求已取消",
+              "elapsed_seconds": 20.621,
+              "will_retry": false,
+              "stop_reason": "cancelled"
+            },
+            {
+              "event": "ai_frontend_circuit_open",
+              "page_key": "transitions_and_speed",
+              "error": "LLM 请求失败：文本请求已取消（错误类别 cancelled，已请求 1 次，重试预算 2，停止原因 cancelled）"
+            }
+          ],
+          "page_request_count": 11,
+          "json_repair_count": 4,
+          "blueprint_scores": [
+            100
+          ]
+        },
+        "resume": {
+          "counts": {
+            "ai_visual_reference_reused": 1,
+            "ai_frontend_provider_config": 1,
+            "ai_frontend_reference_contract_ready": 1,
+            "provider_request_begin": 3,
+            "provider_request_success": 2,
+            "ai_frontend_quality_repair": 1,
+            "ai_frontend_circuit_open": 2,
+            "provider_request_error": 1,
+            "ai_frontend_bounded_queue_stopped": 1
+          },
+          "issues": [
+            {
+              "event": "ai_frontend_quality_repair",
+              "page_key": "timeline_editing",
+              "error_category": "format_error"
+            },
+            {
+              "event": "ai_frontend_circuit_open",
+              "page_key": "timeline_editing",
+              "error": "PageSpec JSON 无法解析：Expecting ',' delimiter"
+            },
+            {
+              "event": "provider_request_error",
+              "label": "page_spec:transitions_and_speed",
+              "error_category": "cancelled",
+              "status_code": null,
+              "error": "文本请求已取消",
+              "elapsed_seconds": 26.0,
+              "will_retry": false,
+              "stop_reason": "cancelled"
+            },
+            {
+              "event": "ai_frontend_circuit_open",
+              "page_key": "transitions_and_speed",
+              "error": "LLM 请求失败：文本请求已取消（错误类别 cancelled，已请求 1 次，重试预算 2，停止原因 cancelled）"
+            }
+          ],
+          "page_request_count": 3,
+          "json_repair_count": 1,
+          "blueprint_scores": []
+        }
+      },
+      "artifacts": {
+        "page_spec_count": 5,
+        "docx_count": 0,
+        "pdf_count": 0,
+        "zip_count": 0
+      }
+    },
+    {
+      "id": 2,
+      "name": "校园作业批改与学情分析软件",
+      "product_type": "教育软件",
+      "status": "complete",
+      "outline": {
+        "exit_code": 0,
+        "elapsed_seconds": 47.5,
+        "timed_out": false,
+        "message": "",
+        "trace": {
+          "event_counts": {
+            "feature_hint_inference_begin": 1,
+            "provider_request_begin": 2,
+            "provider_request_success": 2,
+            "feature_hint_inference_success": 1
+          },
+          "errors": [],
+          "tiny_responses": []
+        },
+        "module_count": 10,
+        "passed": true
+      },
+      "initial": {
+        "exit_code": 1,
+        "elapsed_seconds": 522.6,
+        "timed_out": false,
+        "message": "class_course 前端模型请求失败，已停止剩余页面，避免长时间重复等待：PageSpec JSON 无法解析：Expecting ',' delimiter",
+        "trace": {
+          "event_counts": {
+            "blueprint_attempt_begin": 1,
+            "chat_json_begin": 15,
+            "provider_request_begin": 21,
+            "provider_request_success": 20,
+            "chat_json_success": 15,
+            "blueprint_contract_modules_reused": 1,
+            "blueprint_attempt_success": 1,
+            "architecture_selection_success": 1,
+            "ai_visual_prompt_begin": 1,
+            "ai_visual_prompt_success": 1,
+            "provider_image_request_begin": 1,
+            "provider_image_request_success": 1,
+            "ai_frontend_provider_config": 1,
+            "ai_frontend_reference_contract_ready": 1,
+            "ai_frontend_quality_repair": 2,
+            "ai_frontend_circuit_open": 2,
+            "provider_request_error": 1,
+            "ai_frontend_bounded_queue_stopped": 1
+          },
+          "errors": [
+            {
+              "event": "provider_request_error",
+              "label": "page_spec:dashboard",
+              "status_code": null,
+              "attempt": 1,
+              "elapsed_seconds": 24.624,
+              "error": "文本请求已取消"
+            }
+          ],
+          "tiny_responses": []
+        },
+        "output_dir": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\real-api-20261110\\run-192936\\sample-2\\output\\校园作业批改与学情分析软件-real-run-192936-2",
+        "zip_path": "",
+        "ready_for_delivery": false,
+        "checks": {
+          "ui_domain_profile_key": "general_business",
+          "ui_domain_profile_confidence": 0.6,
+          "ui_domain_profile_source": "generic-fallback",
+          "ui_domain_profile_evidence": "",
+          "ui_domain_profile_weak_evidence": "",
+          "ui_domain_profile_excluded_evidence": "",
+          "ui_domain_gate_keys": "",
+          "ui_domain_gate_reasons": "未启用交通线路拓扑门禁：当前领域不要求干线、支线接驳和服务时窗证据。",
+          "ui_transport_related": false,
+          "ui_route_topology_required": false,
+          "ui_visual_prompt_ready": true,
+          "ui_visual_reference_ready": true,
+          "ui_visual_reference_mode": "style_reference",
+          "ui_visual_reference_source": "gpt-style-reference-prompt+image2",
+          "ui_visual_reference_count": 1,
+          "ui_visual_reference_target_count": 1,
+          "ui_visual_reference_page_count": 35,
+          "ui_visual_reference_applies_to_page_count": 35,
+          "ui_visual_style_reference_ready": true,
+          "ui_visual_reference_image_model": "gpt-image-2",
+          "ui_visual_reference_retry_count": 3,
+          "ui_visual_reference_failed_page": "",
+          "ui_visual_reference_error": "",
+          "ui_visual_reference_directory": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\real-api-20261110\\run-192936\\sample-2\\output\\校园作业批改与学情分析软件-real-run-192936-2\\generated_source\\ui-prototype\\visual-references"
+        },
+        "warnings": [
+          "class_course 前端模型请求失败，已停止剩余页面，避免长时间重复等待：PageSpec JSON 无法解析：Expecting ',' delimiter"
+        ],
+        "passed": false
+      },
+      "resume": {
+        "exit_code": 1,
+        "elapsed_seconds": 65.8,
+        "timed_out": false,
+        "message": "class_course 前端模型请求失败，已停止剩余页面，避免长时间重复等待：PageSpec JSON 无法解析：Expecting ',' delimiter",
+        "trace": {
+          "event_counts": {
+            "ai_visual_reference_reused": 1,
+            "ai_frontend_provider_config": 1,
+            "ai_frontend_reference_contract_ready": 1,
+            "provider_request_begin": 4,
+            "provider_request_success": 3,
+            "ai_frontend_quality_repair": 2,
+            "ai_frontend_circuit_open": 2,
+            "provider_request_error": 1,
+            "ai_frontend_bounded_queue_stopped": 1
+          },
+          "errors": [
+            {
+              "event": "provider_request_error",
+              "label": "page_spec:dashboard",
+              "status_code": null,
+              "attempt": 1,
+              "elapsed_seconds": 8.854,
+              "error": "文本请求已取消"
+            }
+          ],
+          "tiny_responses": []
+        },
+        "output_dir": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\real-api-20261110\\run-192936\\sample-2\\output\\校园作业批改与学情分析软件-real-run-192936-2",
+        "zip_path": "",
+        "ready_for_delivery": false,
+        "checks": {
+          "ui_domain_profile_key": "general_business",
+          "ui_domain_profile_confidence": 0.6,
+          "ui_domain_profile_source": "generic-fallback",
+          "ui_domain_profile_evidence": "",
+          "ui_domain_profile_weak_evidence": "",
+          "ui_domain_profile_excluded_evidence": "",
+          "ui_domain_gate_keys": "",
+          "ui_domain_gate_reasons": "未启用交通线路拓扑门禁：当前领域不要求干线、支线接驳和服务时窗证据。",
+          "ui_transport_related": false,
+          "ui_route_topology_required": false,
+          "ui_visual_prompt_ready": true,
+          "ui_visual_reference_ready": true,
+          "ui_visual_reference_mode": "style_reference",
+          "ui_visual_reference_source": "gpt-style-reference-prompt+image2",
+          "ui_visual_reference_count": 1,
+          "ui_visual_reference_target_count": 1,
+          "ui_visual_reference_page_count": 35,
+          "ui_visual_reference_applies_to_page_count": 35,
+          "ui_visual_style_reference_ready": true,
+          "ui_visual_reference_image_model": "gpt-image-2",
+          "ui_visual_reference_retry_count": 3,
+          "ui_visual_reference_failed_page": "",
+          "ui_visual_reference_error": "",
+          "ui_visual_reference_directory": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\real-api-20261110\\run-192936\\sample-2\\output\\校园作业批改与学情分析软件-real-run-192936-2\\generated_source\\ui-prototype\\visual-references"
+        },
+        "warnings": [
+          "class_course 前端模型请求失败，已停止剩余页面，避免长时间重复等待：PageSpec JSON 无法解析：Expecting ',' delimiter"
+        ],
+        "passed": false
+      },
+      "observed": {
+        "outline": {
+          "counts": {
+            "feature_hint_inference_begin": 1,
+            "provider_request_begin": 2,
+            "provider_request_success": 2,
+            "feature_hint_inference_success": 1
+          },
+          "issues": [],
+          "page_request_count": 0,
+          "json_repair_count": 0,
+          "blueprint_scores": []
+        },
+        "initial": {
+          "counts": {
+            "blueprint_attempt_begin": 1,
+            "chat_json_begin": 15,
+            "provider_request_begin": 21,
+            "provider_request_success": 20,
+            "chat_json_success": 15,
+            "blueprint_contract_modules_reused": 1,
+            "blueprint_attempt_success": 1,
+            "architecture_selection_success": 1,
+            "ai_visual_prompt_begin": 1,
+            "ai_visual_prompt_success": 1,
+            "provider_image_request_begin": 1,
+            "provider_image_request_success": 1,
+            "ai_frontend_provider_config": 1,
+            "ai_frontend_reference_contract_ready": 1,
+            "ai_frontend_quality_repair": 2,
+            "ai_frontend_circuit_open": 2,
+            "provider_request_error": 1,
+            "ai_frontend_bounded_queue_stopped": 1
+          },
+          "issues": [
+            {
+              "event": "ai_frontend_quality_repair",
+              "page_key": "dashboard",
+              "error_category": "quality_error"
+            },
+            {
+              "event": "ai_frontend_quality_repair",
+              "page_key": "class_course",
+              "error_category": "quality_error"
+            },
+            {
+              "event": "ai_frontend_circuit_open",
+              "page_key": "class_course",
+              "error": "PageSpec JSON 无法解析：Expecting ',' delimiter"
+            },
+            {
+              "event": "provider_request_error",
+              "label": "page_spec:dashboard",
+              "error_category": "cancelled",
+              "status_code": null,
+              "error": "文本请求已取消",
+              "elapsed_seconds": 24.624,
+              "will_retry": false,
+              "stop_reason": "cancelled"
+            },
+            {
+              "event": "ai_frontend_circuit_open",
+              "page_key": "dashboard",
+              "error": "LLM 请求失败：文本请求已取消（错误类别 cancelled，已请求 1 次，重试预算 2，停止原因 cancelled）"
+            }
+          ],
+          "page_request_count": 5,
+          "json_repair_count": 2,
+          "blueprint_scores": [
+            100
+          ]
+        },
+        "resume": {
+          "counts": {
+            "ai_visual_reference_reused": 1,
+            "ai_frontend_provider_config": 1,
+            "ai_frontend_reference_contract_ready": 1,
+            "provider_request_begin": 4,
+            "provider_request_success": 3,
+            "ai_frontend_quality_repair": 2,
+            "ai_frontend_circuit_open": 2,
+            "provider_request_error": 1,
+            "ai_frontend_bounded_queue_stopped": 1
+          },
+          "issues": [
+            {
+              "event": "ai_frontend_quality_repair",
+              "page_key": "class_course",
+              "error_category": "quality_error"
+            },
+            {
+              "event": "ai_frontend_quality_repair",
+              "page_key": "dashboard",
+              "error_category": "quality_error"
+            },
+            {
+              "event": "ai_frontend_circuit_open",
+              "page_key": "class_course",
+              "error": "PageSpec JSON 无法解析：Expecting ',' delimiter"
+            },
+            {
+              "event": "provider_request_error",
+              "label": "page_spec:dashboard",
+              "error_category": "cancelled",
+              "status_code": null,
+              "error": "文本请求已取消",
+              "elapsed_seconds": 8.854,
+              "will_retry": false,
+              "stop_reason": "cancelled"
+            },
+            {
+              "event": "ai_frontend_circuit_open",
+              "page_key": "dashboard",
+              "error": "LLM 请求失败：文本请求已取消（错误类别 cancelled，已请求 1 次，重试预算 2，停止原因 cancelled）"
+            }
+          ],
+          "page_request_count": 4,
+          "json_repair_count": 2,
+          "blueprint_scores": []
+        }
+      },
+      "artifacts": {
+        "page_spec_count": 1,
+        "docx_count": 0,
+        "pdf_count": 0,
+        "zip_count": 0
+      }
+    },
+    {
+      "id": 3,
+      "name": "社区患者随访管理软件",
+      "product_type": "医疗软件",
+      "status": "complete",
+      "outline": {
+        "exit_code": 0,
+        "elapsed_seconds": 48.0,
+        "timed_out": false,
+        "message": "",
+        "trace": {
+          "event_counts": {
+            "feature_hint_inference_begin": 1,
+            "provider_request_begin": 2,
+            "provider_request_success": 2,
+            "feature_hint_inference_success": 1
+          },
+          "errors": [],
+          "tiny_responses": []
+        },
+        "module_count": 10,
+        "passed": true
+      },
+      "initial": {
+        "exit_code": 1,
+        "elapsed_seconds": 62.1,
+        "timed_out": false,
+        "message": "GPT 产品蓝图生成失败：产品身份定位请求失败：Expecting ',' delimiter: line 62 column 6 (char 2430)",
+        "trace": {
+          "event_counts": {
+            "blueprint_attempt_begin": 1,
+            "chat_json_begin": 2,
+            "provider_request_begin": 2,
+            "provider_request_success": 2,
+            "chat_json_error": 2,
+            "blueprint_attempt_error": 1
+          },
+          "errors": [
+            {
+              "event": "chat_json_error",
+              "label": "产品身份定位",
+              "attempt": 1,
+              "elapsed_seconds": 34.18,
+              "error": "Expecting ',' delimiter: line 64 column 6 (char 2564)"
+            },
+            {
+              "event": "chat_json_error",
+              "label": "产品身份定位",
+              "attempt": 2,
+              "elapsed_seconds": 27.508,
+              "error": "Expecting ',' delimiter: line 62 column 6 (char 2430)"
+            },
+            {
+              "event": "blueprint_attempt_error",
+              "attempt": 1,
+              "elapsed_seconds": 61.692,
+              "error": "产品身份定位请求失败：Expecting ',' delimiter: line 62 column 6 (char 2430)"
+            }
+          ],
+          "tiny_responses": []
+        },
+        "output_dir": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\real-api-20261110\\run-192936\\sample-3\\output\\社区患者随访管理软件-real-run-192936-3",
+        "zip_path": "",
+        "ready_for_delivery": false,
+        "checks": {
+          "ui_domain_profile_key": "medical",
+          "ui_domain_profile_confidence": 0.9,
+          "ui_domain_profile_source": "medical-evidence",
+          "ui_domain_profile_evidence": "医疗、患者",
+          "ui_domain_profile_weak_evidence": "",
+          "ui_domain_profile_excluded_evidence": "医疗语境",
+          "ui_domain_gate_keys": "",
+          "ui_domain_gate_reasons": "未启用交通线路拓扑门禁：医疗语境",
+          "ui_transport_related": false,
+          "ui_route_topology_required": false
+        },
+        "warnings": [
+          "GPT 产品蓝图生成失败：产品身份定位请求失败：Expecting ',' delimiter: line 62 column 6 (char 2430)"
+        ],
+        "passed": false
+      },
+      "resume": {
+        "exit_code": 1,
+        "elapsed_seconds": 69.1,
+        "timed_out": false,
+        "message": "GPT 产品蓝图生成失败：产品身份定位请求失败：Expecting ',' delimiter: line 64 column 6 (char 2423)",
+        "trace": {
+          "event_counts": {
+            "blueprint_attempt_begin": 1,
+            "chat_json_begin": 2,
+            "provider_request_begin": 2,
+            "provider_request_success": 2,
+            "chat_json_error": 2,
+            "blueprint_attempt_error": 1
+          },
+          "errors": [
+            {
+              "event": "chat_json_error",
+              "label": "产品身份定位",
+              "attempt": 1,
+              "elapsed_seconds": 42.776,
+              "error": "Expecting ',' delimiter: line 91 column 4 (char 3595)"
+            },
+            {
+              "event": "chat_json_error",
+              "label": "产品身份定位",
+              "attempt": 2,
+              "elapsed_seconds": 25.879,
+              "error": "Expecting ',' delimiter: line 64 column 6 (char 2423)"
+            },
+            {
+              "event": "blueprint_attempt_error",
+              "attempt": 1,
+              "elapsed_seconds": 68.66,
+              "error": "产品身份定位请求失败：Expecting ',' delimiter: line 64 column 6 (char 2423)"
+            }
+          ],
+          "tiny_responses": []
+        },
+        "output_dir": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\real-api-20261110\\run-192936\\sample-3\\output\\社区患者随访管理软件-real-run-192936-3",
+        "zip_path": "",
+        "ready_for_delivery": false,
+        "checks": {
+          "ui_domain_profile_key": "medical",
+          "ui_domain_profile_confidence": 0.9,
+          "ui_domain_profile_source": "medical-evidence",
+          "ui_domain_profile_evidence": "医疗、患者",
+          "ui_domain_profile_weak_evidence": "",
+          "ui_domain_profile_excluded_evidence": "医疗语境",
+          "ui_domain_gate_keys": "",
+          "ui_domain_gate_reasons": "未启用交通线路拓扑门禁：医疗语境",
+          "ui_transport_related": false,
+          "ui_route_topology_required": false
+        },
+        "warnings": [
+          "GPT 产品蓝图生成失败：产品身份定位请求失败：Expecting ',' delimiter: line 64 column 6 (char 2423)"
+        ],
+        "passed": false
+      },
+      "observed": {
+        "outline": {
+          "counts": {
+            "feature_hint_inference_begin": 1,
+            "provider_request_begin": 2,
+            "provider_request_success": 2,
+            "feature_hint_inference_success": 1
+          },
+          "issues": [],
+          "page_request_count": 0,
+          "json_repair_count": 0,
+          "blueprint_scores": []
+        },
+        "initial": {
+          "counts": {
+            "blueprint_attempt_begin": 1,
+            "chat_json_begin": 2,
+            "provider_request_begin": 2,
+            "provider_request_success": 2,
+            "chat_json_error": 2,
+            "blueprint_attempt_error": 1
+          },
+          "issues": [
+            {
+              "event": "chat_json_error",
+              "label": "产品身份定位",
+              "error": "Expecting ',' delimiter: line 64 column 6 (char 2564)",
+              "elapsed_seconds": 34.18
+            },
+            {
+              "event": "chat_json_error",
+              "label": "产品身份定位",
+              "error": "Expecting ',' delimiter: line 62 column 6 (char 2430)",
+              "elapsed_seconds": 27.508
+            }
+          ],
+          "page_request_count": 0,
+          "json_repair_count": 0,
+          "blueprint_scores": []
+        },
+        "resume": {
+          "counts": {
+            "blueprint_attempt_begin": 1,
+            "chat_json_begin": 2,
+            "provider_request_begin": 2,
+            "provider_request_success": 2,
+            "chat_json_error": 2,
+            "blueprint_attempt_error": 1
+          },
+          "issues": [
+            {
+              "event": "chat_json_error",
+              "label": "产品身份定位",
+              "error": "Expecting ',' delimiter: line 91 column 4 (char 3595)",
+              "elapsed_seconds": 42.776
+            },
+            {
+              "event": "chat_json_error",
+              "label": "产品身份定位",
+              "error": "Expecting ',' delimiter: line 64 column 6 (char 2423)",
+              "elapsed_seconds": 25.879
+            }
+          ],
+          "page_request_count": 0,
+          "json_repair_count": 0,
+          "blueprint_scores": []
+        }
+      },
+      "artifacts": {
+        "page_spec_count": 0,
+        "docx_count": 0,
+        "pdf_count": 0,
+        "zip_count": 0
+      }
+    }
+  ],
+  "finished_at": "2026-11-10T19:53:50.196358+08:00",
+  "rates": {
+    "sample_count": 3,
+    "outline_success": 3,
+    "initial_full_success": 0,
+    "after_one_resume_success": 0
+  },
+  "request_totals": {
+    "events": {
+      "feature_hint_inference_begin": 3,
+      "provider_request_begin": 65,
+      "provider_request_success": 61,
+      "feature_hint_inference_success": 3,
+      "blueprint_attempt_begin": 4,
+      "chat_json_begin": 34,
+      "chat_json_success": 30,
+      "blueprint_contract_modules_reused": 2,
+      "blueprint_attempt_success": 2,
+      "architecture_selection_success": 2,
+      "ai_visual_prompt_begin": 2,
+      "ai_visual_prompt_success": 2,
+      "provider_image_request_begin": 2,
+      "provider_image_request_success": 2,
+      "ai_frontend_provider_config": 4,
+      "ai_frontend_reference_contract_ready": 4,
+      "ai_frontend_quality_repair": 9,
+      "ai_frontend_circuit_open": 8,
+      "provider_request_error": 4,
+      "ai_frontend_bounded_queue_stopped": 4,
+      "ai_visual_reference_reused": 2,
+      "chat_json_error": 4,
+      "blueprint_attempt_error": 2
+    },
+    "models": {
+      "gpt-6-sol": 65,
+      "gpt-image-2": 2
+    },
+    "cancelled_requests": 4,
+    "noncancelled_text_errors": 0
+  }
+}

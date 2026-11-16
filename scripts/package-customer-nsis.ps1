@@ -26,6 +26,11 @@ Push-Location $root
 try {
   New-Item -ItemType Directory -Force -Path $customerBuildDir | Out-Null
 
+  npm run verify:release
+  if ($LASTEXITCODE -ne 0) {
+    throw "npm run verify:release failed with exit code $LASTEXITCODE"
+  }
+
   $customerConfig = Get-Content -LiteralPath $sourceConfigPath -Encoding UTF8 -Raw | ConvertFrom-Json
   if (-not $customerConfig.SOFT_MODEL_GPT_BASE_URL) {
     throw "SOFT_MODEL_GPT_BASE_URL is required in $sourceConfigPath"
@@ -56,16 +61,29 @@ try {
   $resources += [pscustomobject]@{
     from = "libreoffice"
     to = "libreoffice"
+    filter = @("**/*", "!help/**")
   }
   $buildConfig.extraResources = $resources
   ConvertTo-JsonUtf8File $buildConfig $builderConfigPath
 
   npm run prepare:runtime
+  if ($LASTEXITCODE -ne 0) {
+    throw "npm run prepare:runtime failed with exit code $LASTEXITCODE"
+  }
   npm run prepare:libreoffice
+  if ($LASTEXITCODE -ne 0) {
+    throw "npm run prepare:libreoffice failed with exit code $LASTEXITCODE"
+  }
   npm run build
+  if ($LASTEXITCODE -ne 0) {
+    throw "npm run build failed with exit code $LASTEXITCODE"
+  }
   $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"
   $env:ELECTRON_BUILDER_BINARIES_MIRROR = "https://npmmirror.com/mirrors/electron-builder-binaries/"
   npx electron-builder --win nsis --config $builderConfigPath
+  if ($LASTEXITCODE -ne 0) {
+    throw "electron-builder failed with exit code $LASTEXITCODE"
+  }
 
   Write-Host "Customer NSIS installer created under: $outputPath"
 }

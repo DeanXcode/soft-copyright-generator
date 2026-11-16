@@ -71,7 +71,7 @@ def sample_task(sample: dict, output_root: Path) -> dict:
         product_type=sample["product_type"],
         feature_hint=sample["feature_hint"],
         model_provider="custom",
-        model_name=os.environ.get("SOFT_MODEL_GPT_NAME", "gpt-4o-mini"),
+        model_name=os.environ.get("SOFT_MODEL_GPT_NAME", "gpt-5.5"),
         randomness="高差异",
         output_root=output_root,
     )
