@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from .design_dna import build_design_dna
+from .domain_profile import has_transport_domain_signal as _has_transport_domain_signal
 from .models import GenerationTask
 from .module_keys import is_placeholder_module_key, semantic_module_key
 
@@ -30,6 +31,10 @@ class IndustrySubtype:
 
 INDUSTRY_SUBTYPES: dict[str, tuple[IndustrySubtype, ...]] = {
     "APP": (
+        IndustrySubtype("design_viewer", "设计文件浏览与评审工作台", "设计文件浏览、预览与协作评审", "设计文件接入、资源导航、页面画板预览、图层组件检查、原型演示、评论评审和版本追踪", "面向设计师、产品经理和评审参与者的桌面设计资源工作区", ("UI/UX设计师", "产品经理", "设计评审参与者"), ("设计文件", "项目资源", "页面画板", "图层组件", "原型流程", "评审评论", "设计版本", "浏览收藏"), ("可访问文件数", "最近浏览数", "收藏文件数", "待处理评论数", "原型流程数", "版本更新数"), ("matrix", "command", "workflow"), ("side_menu", "top_tabs"), ("桌面设计资源工作台", "画布预览与图层检查界面", "评审协作与版本追踪台"), ("资源树+画布预览", "画板导航+图层属性", "评审评论+版本时间线"), ("设计文件详情", "画板预览", "评论定位"), ("接入", "浏览", "定位", "预览", "检查", "演示", "收藏", "追踪")),
+        IndustrySubtype("download_manager", "移动文件下载管理APP", "移动文件下载与传输任务管理", "下载链接解析、下载任务创建、队列调序、后台传输、进度跟踪、断点续传、文件交付和历史复建", "面向需要单个、批量或持续下载文件用户的移动下载工具", ("移动端用户", "批量下载用户"), ("下载链接", "下载任务", "下载队列", "后台下载", "下载进度", "断点续传", "已下载文件", "下载记录"), ("下载任务数", "当前下载速度", "今日传输量", "下载完成率", "续传成功率", "失败任务数"), ("workflow", "kanban", "matrix"), ("phone_tabs", "top_tabs"), ("紧凑移动下载界面", "任务队列与实时进度界面", "文件交付与历史记录界面"), ("下载队列+实时速度", "任务状态+剩余时间", "失败恢复+文件清单"), ("移动下载任务列表", "传输进度详情", "文件操作面板"), ("解析", "创建", "下载", "暂停", "续传", "重试", "打开", "移动")),
+        IndustrySubtype("agency_accounting", "企业代理记账工作台", "企业代理记账与财税服务", "客户建档、账套核算、票据凭证、银行对账、月末结账、税务申报、财务报表和交付归档", "面向代账会计、复核会计、税务专员和财务主管的企业财税业务工作台", ("代账会计", "复核会计", "税务专员", "财务主管", "客户对接人员"), ("企业客户", "核算账套", "票据凭证", "银行对账", "月末结账", "税务申报", "财务报表", "交付归档"), ("服务客户数", "待制凭证数", "对账差异数", "本期关账率", "申报完成率", "报表交付率"), ("workflow", "ledger_split", "matrix"), ("side_menu", "top_tabs"), ("企业财税工作台", "代理记账核算界面", "税务申报运营台"), ("客户账套+期间任务", "凭证核算+对账差异", "申报进度+报表交付"), ("客户账套详情", "凭证复核", "申报任务"), ("查询", "编制", "复核", "对账", "结账", "申报", "导出")),
+        IndustrySubtype("workforce_attendance", "移动考勤与打卡APP", "企业人力资源与移动考勤", "员工排班、上下班打卡、补卡请假和出勤统计", "面向员工、班组负责人和人事人员的移动考勤协同工具", ("员工", "班组负责人", "人事专员", "考勤管理员"), ("班次排班", "上下班打卡", "补卡申请", "请假申请", "异常考勤", "出勤统计"), ("今日出勤人数", "正常打卡率", "迟到人数", "早退人数", "请假人数", "补卡完成率"), ("workflow", "kanban", "matrix"), ("phone_tabs", "top_tabs"), ("轻量移动考勤界面", "班次打卡工作台", "出勤统计看板"), ("今日班次+打卡入口", "出勤指标+异常提醒", "请假补卡+处理进度"), ("移动打卡列表", "班次日历", "申请详情"), ("打卡", "查询", "申请", "统计", "详情")),
         IndustrySubtype("community_service", "社区生活服务APP", "移动互联网生活服务", "社区服务预约、订单履约、消息触达和用户留存运营", "面向社区用户、商户和平台运营人员的移动服务协同平台", ("平台运营", "客服专员", "商户管理员", "移动端用户"), ("服务预约", "门店核销", "会员权益", "消息推送", "售后工单", "活动入口", "订单支付"), ("日活用户", "预约转化率", "核销订单数", "推送到达率", "售后响应时长", "用户留存率"), ("workflow", "command", "kanban"), ("top_tabs", "side_menu", "rail"), ("移动运营工作台", "高密度服务调度台", "轻量化订单运营界面"), ("指标总览+服务队列", "运营漏斗+订单提醒", "活动看板+客服待办"), ("主从订单列表", "工单看板", "用户画像侧栏"), ("查询", "审核", "导出", "详情", "配置")),
         IndustrySubtype("commerce_app", "移动电商运营APP", "移动电商与会员运营", "商品推荐、购物车、订单支付、优惠券和售后处理", "面向移动端交易链路的商品、订单和会员运营平台", ("运营管理员", "商品专员", "客服人员", "会员用户"), ("商品上架", "购物车", "支付订单", "优惠券", "会员等级", "售后退款", "推荐位"), ("GMV", "订单转化率", "退款率", "优惠券核销率", "会员复购率", "客诉处理量"), ("command", "workflow", "matrix"), ("top_tabs", "side_menu"), ("电商运营指挥台", "营销活动配置台", "订单履约管理台"), ("销售漏斗+履约提醒", "营销指标+异常订单", "会员分层+活动转化"), ("订单主从详情", "营销配置表单", "售后审批流"), ("查询", "导入", "导出", "审核", "详情")),
         IndustrySubtype("field_service", "外勤服务APP", "移动外勤与任务协同", "工单派发、位置签到、现场照片、服务回访和结算统计", "面向外勤人员和调度中心的移动任务闭环系统", ("调度管理员", "外勤人员", "质检人员", "客户经理"), ("派工任务", "现场签到", "服务照片", "客户回访", "费用结算", "轨迹记录"), ("准时到达率", "工单完成率", "回访满意度", "异常退单数", "外勤在线率", "平均服务时长"), ("map", "kanban", "workflow"), ("side_menu", "top_tabs"), ("外勤调度台", "现场服务闭环界面", "地图化任务运营台"), ("地图派工+工单队列", "人员轨迹+异常提醒", "服务指标+质检任务"), ("地图详情抽屉", "工单流转看板", "回访表单"), ("定位", "审核", "查询", "详情", "统计")),
@@ -158,17 +163,6 @@ def _strong_product_type_signal(product_type: str, text: str) -> bool:
     return bool(product_type and product_type in text)
 
 
-def _has_transport_domain_signal(text: str) -> bool:
-    value = str(text or "")
-    # “路径、线路、班次、调度”等词也广泛存在于制造、医疗和工作流软件中，
-    # 不能凭单个弱词把整个产品改写成交通领域。至少要求一个明确的交通业务词。
-    explicit_terms = r"交通|运输|公交|客运|干线|支线|接驳|换乘|站点|车次|发车|运力|客流"
-    if not re.search(explicit_terms, value):
-        return False
-    medical_terms = r"医疗|医院|诊疗|护理|患者|病区|床位|住院|生命体征|医嘱|护士|医生|病历"
-    return not re.search(medical_terms, value)
-
-
 def _has_rail_construction_quality_signal(text: str) -> bool:
     value = str(text or "")
     rail_signal = bool(re.search(r"轨道交通|地铁|铁路|轨道工程|隧道工程|车站工程", value))
@@ -217,6 +211,14 @@ def _task_input_text(task: GenerationTask) -> str:
 
 
 def _explicit_subtype_keywords(subtype: IndustrySubtype) -> tuple[str, ...]:
+    if subtype.key == "design_viewer":
+        return ("Figma", "设计文件", "设计资源", "页面画板", "画布预览", "图层组件", "原型演示", "设计评审", "设计版本")
+    if subtype.key == "download_manager":
+        return ("下载链接", "下载任务", "下载队列", "后台下载", "下载进度", "断点续传", "已下载文件", "下载记录")
+    if subtype.key == "agency_accounting":
+        return ("代理记账", "代账", "财税代办", "核算账套", "记账凭证", "银行对账", "月末结账", "税务申报")
+    if subtype.key == "workforce_attendance":
+        return ("考勤", "打卡", "签到", "签退", "补卡", "请假", "出勤", "迟到", "早退", "班次排班")
     if subtype.key == "community_service":
         return ("社区预约", "社区服务", "预约服务", "场地预约", "活动预约", "上门预约", "门店预约", "社区生活")
     if subtype.key == "rail_construction_quality":
@@ -239,10 +241,11 @@ def subtype_module_specs(subtype: IndustrySubtype, fallback_specs: list[tuple[st
     used_keys: set[str] = set()
     for index, term in enumerate(subtype.domain_terms[:7], start=1):
         title = _module_title(term)
+        raw_key = _subtype_module_raw_key(subtype.key, term)
         key = semantic_module_key(
             title,
             index,
-            raw_key="",
+            raw_key=raw_key,
             used=used_keys,
             context_terms=[term, subtype.title, subtype.scenario, subtype.positioning],
         )
@@ -253,6 +256,19 @@ def subtype_module_specs(subtype: IndustrySubtype, fallback_specs: list[tuple[st
         entities = [f"{_ascii_prefix(subtype.key)}Record{index}", f"{_ascii_prefix(subtype.key)}Flow{index}"]
         specs.append((key, title, desc, entities))
     return specs or fallback_specs
+
+
+def _subtype_module_raw_key(subtype_key: str, term: str) -> str:
+    if subtype_key == "workforce_attendance":
+        return {
+            "班次排班": "shift_schedule",
+            "上下班打卡": "clock_in_out",
+            "补卡申请": "missed_punch_request",
+            "请假申请": "leave_request",
+            "异常考勤": "attendance_exception",
+            "出勤统计": "attendance_statistics",
+        }.get(str(term or ""), "")
+    return ""
 
 
 def build_ui_design_brief(task: GenerationTask, blueprint: Any | None = None) -> dict[str, Any]:

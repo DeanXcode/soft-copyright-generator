@@ -392,6 +392,15 @@ def _infer_experience_shape(category: str, product_type: str, text: str, subtype
     if _match(text, r"Windows客户端|桌面客户端|C/S|CS架构|WinForm|WPF|本地客户端|传统客户端"):
         return _shape("legacy_windows", evidence, "命中传统桌面客户端信号")
 
+    subtype_shape = {
+        "design_viewer": "desktop_web",
+        "agency_accounting": "desktop_web",
+        "download_manager": "mobile_app",
+        "workforce_attendance": "mobile_app",
+    }.get(subtype_key)
+    if subtype_shape and _task_confirms_terminal_subtype(task_text=user_text, subtype_key=subtype_key, task_context=text):
+        return _shape(subtype_shape, evidence, f"明确行业子类型={subtype_key}")
+
     if product_type == "小程序" or _match(user_text or text, r"小程序|微信授权|订阅消息"):
         if mobile_backend_context:
             return _shape("desktop_web", evidence, "产品小类=小程序且用户输入明确为后台/控制台")
@@ -511,6 +520,22 @@ def _has_mobile_backend_context(text: str) -> bool:
         text,
         r"后台|管理后台|运营后台|控制台|工作台|运营台|管理端|商家端|门店端|平台端|PC端|Web端|报表中心|数据看板|审核台|客服|客户服务|工单|派单|投诉|协同处理|协同平台|安装验收|验收系统|服务回访|SLA",
     )
+
+
+def _task_confirms_terminal_subtype(*, task_text: str, subtype_key: str, task_context: str) -> bool:
+    task_value = str(task_text or "")
+    context_value = str(task_context or "")
+    signals = {
+        "design_viewer": ("Figma", "设计文件", "页面画板", "图层组件", "原型演示", "设计评审"),
+        "agency_accounting": ("代理记账", "代账", "财税代办", "核算账套", "税务申报", "记账凭证"),
+        "download_manager": ("下载链接", "下载任务", "下载队列", "后台下载", "下载进度", "断点续传", "已下载文件", "下载记录"),
+        "workforce_attendance": ("考勤", "打卡", "补卡", "请假", "出勤", "班次排班"),
+    }.get(str(subtype_key or ""), ())
+    required = 1 if subtype_key in {"design_viewer", "agency_accounting", "workforce_attendance"} else 2
+    if sum(term in task_value for term in signals) >= required:
+        return True
+    profile_marker = f'"profile": "{subtype_key}"'
+    return profile_marker in context_value or f"profile={subtype_key}" in context_value
 
 
 def _has_explicit_game_terms(text: str) -> bool:

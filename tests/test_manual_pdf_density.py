@@ -3,6 +3,7 @@ import unittest
 from backend.softcopyright.blueprint import FeatureModule, ProductBlueprint
 from backend.softcopyright.docgen import (
     _extend_faq_paragraphs,
+    _extend_security_paragraphs,
     _manual_architecture_name,
     _manual_content_for_renderer,
     _manual_deployment_topology,
@@ -10,11 +11,42 @@ from backend.softcopyright.docgen import (
     _manual_pdf_text_density_page_result,
     _manual_product_type,
     _manual_runtime_environment_value,
+    _expand_paragraphs,
+    _figure_note_templates,
+    _manual_generic_sentence_count,
+    _manual_semantic_anchor_count,
+    _manual_template_risk_level,
     _start_manual_closing_section,
+    _start_manual_security_section,
 )
 
 
 class ManualPdfDensityTests(unittest.TestCase):
+    def test_manual_sentence_variants_are_stable_and_contextual(self):
+        first = _figure_note_templates("质量策划", "质量策划界面")
+        second = _figure_note_templates("质量策划", "质量策划界面")
+
+        self.assertEqual(first, second)
+        self.assertTrue(any("质量策划" in item for item in first))
+        self.assertNotEqual(first, _figure_note_templates("质量策划", "质量策划导出界面"))
+
+    def test_template_risk_metrics_distinguish_generic_and_business_text(self):
+        generic = ["页面展示当前内容和处理入口。"] * 8
+        business = ["用户填写设备编号后点击查询，系统更新处理状态并记录结果。"] * 8
+
+        self.assertGreater(_manual_generic_sentence_count(generic), _manual_generic_sentence_count(business))
+        self.assertLess(_manual_semantic_anchor_count(generic), _manual_semantic_anchor_count(business))
+        self.assertEqual(_manual_template_risk_level(8, 0.8, 0, 10, 0.2), "high")
+        self.assertEqual(_manual_template_risk_level(0, 0, 0, 10, 1.0), "low")
+
+    def test_expanded_paragraphs_use_stable_context_variant(self):
+        first = _expand_paragraphs([], min_count=2, context="质量策划")
+        second = _expand_paragraphs([], min_count=2, context="质量策划")
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 2)
+        self.assertTrue(any("状态" in item or "记录" in item for item in first))
+
     def test_operation_manual_cover_is_not_treated_as_body_density_page(self):
         lines = ["客户安装版弹窗主题零令牌验收系统 V1.0 1", "客户安装版弹窗主题零令牌验收系统", "操作手册"]
 
@@ -169,6 +201,30 @@ class ManualPdfDensityTests(unittest.TestCase):
         self.assertEqual(paragraphs[-1].text, "七、常见问题处理")
         page_breaks = paragraphs[-2]._p.findall(".//" + qn("w:br"))
         self.assertTrue(any(item.get(qn("w:type")) == "page" for item in page_breaks))
+
+    def test_security_section_starts_on_a_new_page(self):
+        from docx import Document
+        from docx.oxml.ns import qn
+
+        document = Document()
+        _start_manual_security_section(document, "六、权限与安全")
+
+        paragraphs = document.paragraphs
+        self.assertEqual(paragraphs[-1].text, "六、权限与安全")
+        page_breaks = paragraphs[-2]._p.findall(".//" + qn("w:br"))
+        self.assertTrue(any(item.get(qn("w:type")) == "page" for item in page_breaks))
+
+    def test_security_section_is_extended_with_substantive_local_controls(self):
+        blueprint = self._desktop_blueprint()
+        blueprint.roles = ["质量主管", "巡检员"]
+        blueprint.quality_rules = ["质量问题关闭前必须完成复核"]
+        blueprint.data_relations = ["质量问题与整改记录关联", "整改记录与审计日志关联"]
+
+        paragraphs = _extend_security_paragraphs(blueprint, ["系统按角色控制页面权限。"])
+
+        self.assertEqual(len(paragraphs), 6)
+        self.assertGreater(sum(len(item) for item in paragraphs), 450)
+        self.assertTrue(any("审计" in item for item in paragraphs))
 
     def test_desktop_manual_filters_mobile_only_paragraphs_globally(self):
         manual_content = {

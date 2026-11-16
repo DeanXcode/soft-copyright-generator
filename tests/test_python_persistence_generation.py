@@ -9,10 +9,75 @@ import unittest
 
 from backend.softcopyright.blueprint import FeatureModule
 from backend.softcopyright.models import GenerationTask
-from backend.softcopyright.sourcegen import _generate_python_project, repair_generated_business_record_labels
+from backend.softcopyright.sourcegen import (
+    _generate_python_project,
+    _javascript_seed_records,
+    repair_generated_business_record_labels,
+    repair_generated_domain_sample_leaks,
+)
 
 
 class PythonPersistenceGenerationTests(unittest.TestCase):
+    def test_non_transport_javascript_seeds_do_not_contain_transport_route_samples(self) -> None:
+        module = FeatureModule(
+            "access",
+            "门禁通行授权",
+            "维护社区住户的门禁范围和通行时段",
+            ["AccessAuthorization"],
+            operations=["筛选授权", "配置授权草案", "复核授权范围"],
+            data_fields=["授权编号", "授权范围", "授权状态"],
+        )
+
+        records = _javascript_seed_records(module, "access")
+        encoded = str(records)
+
+        self.assertNotIn("沪杭枢纽", encoded)
+        self.assertNotIn("浦东东区至临港片区", encoded)
+        self.assertEqual(records[0]["serviceScope"], "门禁通行授权服务区域1")
+        self.assertIn("筛选授权", records[0]["nodeSequence"])
+        self.assertEqual(records[0]["direction"], "受理方向")
+
+    def test_resume_domain_sample_migration_repairs_cached_non_transport_service(self) -> None:
+        module = FeatureModule(
+            "access",
+            "门禁通行授权",
+            "维护社区住户的门禁范围和通行时段",
+            ["AccessAuthorization"],
+            operations=["筛选授权", "配置授权草案", "复核授权范围"],
+            data_fields=["授权编号", "授权范围", "授权状态"],
+        )
+        blueprint = SimpleNamespace(
+            industry="社区及楼宇门禁通行管理",
+            summary="管理住户、访客、凭证和门禁点",
+            scenario="社区门禁",
+            positioning="物业门禁工作台",
+            business_objects=["住户", "门禁凭证"],
+            industry_subtype_key="",
+            modules=[module],
+        )
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service_dir = root / "src" / "services"
+            service_dir.mkdir(parents=True)
+            source = service_dir / "accessService.js"
+            source.write_text(
+                '"nodeSequence": "沪杭枢纽-浦东东区-临港接驳点",\n'
+                '"direction": "北向",\n'
+                '"serviceScope": "浦东东区至临港片区",\n'
+                'description: payload.description || "门禁通行授权-筛选授权-浦东东区至临港片区-建档",',
+                encoding="utf-8",
+            )
+
+            changed = repair_generated_domain_sample_leaks(root, blueprint)
+            migrated = source.read_text(encoding="utf-8")
+
+        self.assertEqual(changed, 4)
+        self.assertNotIn("沪杭枢纽", migrated)
+        self.assertNotIn("北向", migrated)
+        self.assertNotIn("浦东东区至临港片区", migrated)
+        self.assertIn("筛选授权-配置授权草案-复核授权范围", migrated)
+        self.assertIn("门禁通行授权服务区域1", migrated)
+
     def test_resume_label_migration_replaces_generic_seed_names_only(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -61,7 +126,9 @@ class PythonPersistenceGenerationTests(unittest.TestCase):
             service = (root / "app/services/equipment_registry_service.py").read_text(encoding="utf-8")
             self.assertIn("INSERT INTO equipment_registry_record", repository)
             self.assertIn("EquipmentRegistryRepository", service)
-            self.assertTrue((root / "migrations/001_initial.sql").exists())
+            migration = (root / "migrations/001_initial.sql").read_text(encoding="utf-8")
+            self.assertIn("INSERT OR IGNORE INTO equipment_registry_record", migration)
+            self.assertIn("设备资产建档待办", migration)
 
             python_files = [str(path) for path in root.rglob("*.py")]
             compiled = subprocess.run(
@@ -73,7 +140,7 @@ class PythonPersistenceGenerationTests(unittest.TestCase):
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
 
             tested = subprocess.run(
-                [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+                [sys.executable, "-I", "-m", "unittest", "discover", "-s", "tests", "-v"],
                 cwd=root,
                 capture_output=True,
                 text=True,

@@ -148,6 +148,45 @@ def save_cached_manual_content(context: dict[str, Any], manual_content: dict[str
     _write_stage(context, "manual_content.json", payload)
 
 
+def load_partial_manual_content(context: dict[str, Any], blueprint: ProductBlueprint) -> dict[str, Any]:
+    data = _read_stage(context, "manual_content.partial.json") or {}
+    if data.get("blueprint_digest") != _manual_blueprint_digest(blueprint):
+        return {"modules": {}}
+    from .llm_manual import _module_content_from_data, _section_paragraphs_from_data, _section_specs
+
+    result: dict[str, Any] = {"modules": {}}
+    content = data.get("content")
+    if not isinstance(content, dict):
+        return result
+    for key, _title, _hint, min_count, _budget, limit in _section_specs():
+        paragraphs = _section_paragraphs_from_data(content, key, min_count, limit)
+        if paragraphs:
+            result[key] = paragraphs
+    for module in blueprint.modules:
+        raw_module = (content.get("modules") or {}).get(module.key) if isinstance(content.get("modules"), dict) else None
+        if not isinstance(raw_module, dict) or str(raw_module.get("title") or "") != module.title:
+            continue
+        module_content = _module_content_from_data(content, module)
+        if module_content:
+            result["modules"][module.key] = module_content
+    return result
+
+
+def save_partial_manual_content(
+    context: dict[str, Any], blueprint: ProductBlueprint, manual_content: dict[str, Any]
+) -> None:
+    payload = {key: value for key, value in manual_content.items() if key != "_warnings"}
+    _write_stage(context, "manual_content.partial.json", {
+        "blueprint_digest": _manual_blueprint_digest(blueprint),
+        "content": payload,
+    })
+
+
+def _manual_blueprint_digest(blueprint: ProductBlueprint) -> str:
+    serialized = json.dumps(blueprint.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def load_cached_ui_blueprint(context: dict[str, Any], blueprint: ProductBlueprint | None = None) -> UiBlueprint | None:
     data = _read_stage(context, "ui_blueprint.json")
     if not _ui_blueprint_ready(data):

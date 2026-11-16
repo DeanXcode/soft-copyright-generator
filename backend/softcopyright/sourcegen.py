@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from .blueprint import ProductBlueprint, FeatureModule
+from .domain_profile import build_domain_profile
 from .models import GenerationTask
 
 
@@ -53,6 +54,41 @@ def repair_generated_business_record_labels(source_dir: Path) -> int:
     return changed
 
 
+def repair_generated_domain_sample_leaks(source_dir: Path, blueprint: ProductBlueprint) -> int:
+    """Replace transport-only seed values in cached non-transport JS services."""
+    if build_domain_profile(blueprint=blueprint).requires_route_topology:
+        return 0
+    modules_by_token = {_snake(module.key): module for module in (getattr(blueprint, "modules", []) or [])}
+    changed = 0
+    for path in source_dir.rglob("*Service.js"):
+        if not path.is_file():
+            continue
+        token = path.stem[:-7] if path.stem.endswith("Service") else ""
+        module = modules_by_token.get(token)
+        if module is None or _is_transport_module(module):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        updated = text
+        regions = _business_record_regions(module, [str(item) for item in (module.data_fields or [])])
+        for index in range(1, 5):
+            replacements = {
+                _transport_node_sequence(index): _business_process_sequence(module, index),
+                ["北向", "南向", "双向", "东向"][index - 1]: _business_direction(index),
+                _transport_service_scope(index): regions[(index - 1) % len(regions)],
+            }
+            for old, new in replacements.items():
+                occurrence_count = updated.count(old)
+                if occurrence_count:
+                    updated = updated.replace(old, new)
+                    changed += occurrence_count
+        if updated != text:
+            path.write_text(updated, encoding="utf-8")
+    return changed
+
+
 def generate_source_project(
     task: GenerationTask,
     blueprint: ProductBlueprint,
@@ -70,6 +106,7 @@ def generate_source_project(
         files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
     elif source_strategy == "csharp_web_api":
         files.extend(_generate_csharp_project(task, blueprint, source_dir))
+        files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
     elif source_strategy == "javascript_with_java_api":
         files.extend(_generate_javascript_project(task, blueprint, source_dir))
         files.extend(_generate_java_project(task, blueprint, source_dir / "api-service", include_readme=False))
@@ -81,12 +118,16 @@ def generate_source_project(
         files.extend(_generate_javascript_project(task, blueprint, source_dir / "gateway-service", include_readme=False))
     elif source_strategy == "embedded_mixed":
         files.extend(_generate_embedded_mixed_project(task, blueprint, source_dir))
+        files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
     elif source_strategy == "system_service_mixed":
         files.extend(_generate_system_service_project(task, blueprint, source_dir))
+        files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
     elif task.language == "Java":
         files.extend(_generate_java_project(task, blueprint, source_dir))
+        files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
     elif task.language == "C#":
         files.extend(_generate_csharp_project(task, blueprint, source_dir))
+        files.extend(_generate_javascript_project(task, blueprint, source_dir / "web-console", include_readme=False))
     elif task.language == "Python":
         files.extend(_generate_python_project(task, blueprint, source_dir))
     elif task.language == "JavaScript":
@@ -1390,8 +1431,31 @@ def initialize_database(database: Database | None = None) -> Database:
 
 def _python_schema_sql(blueprint: ProductBlueprint) -> str:
     blocks: list[str] = []
-    for module in blueprint.modules:
+    owner_candidates = list(getattr(blueprint, "roles", []) or getattr(blueprint, "target_users", []) or ["业务操作员"])
+    owner_role = str(owner_candidates[0] or "业务操作员")
+
+    def sql_text(value: object) -> str:
+        return str(value or "").replace("'", "''")
+
+    for module_index, module in enumerate(blueprint.modules, start=1):
         table = f"{_snake(module.key)}_record"
+        token = _snake(module.key)
+        code_prefix = re.sub(r"[^A-Za-z0-9]", "", token).upper()[:4] or f"M{module_index}"
+        operation_labels = [str(value).strip() for value in (module.operations or []) if str(value).strip()]
+        status_cycle = ["ENABLED", "PENDING", "PROCESSING"]
+        seed_rows = []
+        for row_index in range(1, 4):
+            operation = operation_labels[(row_index - 1) % len(operation_labels)] if operation_labels else "业务处理"
+            code = f"{code_prefix}-{module_index:02d}{row_index:02d}"
+            name = f"{module.title}{'待办' if row_index == 1 else '记录' if row_index == 2 else '任务'}"
+            description = f"{module.title}：{operation}，用于运行界面数据加载与状态核验。"
+            timestamp = f"2026-06-{20 + row_index:02d}T{8 + row_index:02d}:1{row_index}:00"
+            seed_rows.append(
+                "INSERT OR IGNORE INTO "
+                f"{table} (code, name, status, owner_role, description, created_at, updated_at) VALUES "
+                f"('{sql_text(code)}', '{sql_text(name)}', '{status_cycle[row_index - 1]}', "
+                f"'{sql_text(owner_role)}', '{sql_text(description)}', '{timestamp}', '{timestamp}');"
+            )
         blocks.append(
             f'''CREATE TABLE IF NOT EXISTS {table} (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1405,6 +1469,7 @@ def _python_schema_sql(blueprint: ProductBlueprint) -> str:
 );
 CREATE INDEX IF NOT EXISTS idx_{table}_status ON {table}(status);
 CREATE INDEX IF NOT EXISTS idx_{table}_updated_at ON {table}(updated_at);
+{chr(10).join(seed_rows)}
 '''
         )
     return "\n".join(blocks)
@@ -1531,7 +1596,11 @@ def _python_persistence_test(blueprint: ProductBlueprint) -> str:
     class_name = _pascal(token)
     return f'''from pathlib import Path
 from tempfile import TemporaryDirectory
+import sys
 import unittest
+
+# Support discovery with an isolated/embedded Python interpreter as well.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.database import Database
 from app.repositories.{token}_repository import {class_name}Repository
@@ -2217,6 +2286,7 @@ def _javascript_seed_records(module: FeatureModule, token: str) -> list[dict[str
     prefix = _business_code_prefix(module, token)
     names = _business_record_names(module)
     regions = _business_record_regions(module, fields)
+    transport = _is_transport_module(module)
     records: list[dict[str, object]] = []
     for index in range(1, 5):
         code = f"{prefix}-{1000 + index}"
@@ -2236,9 +2306,9 @@ def _javascript_seed_records(module: FeatureModule, token: str) -> list[dict[str
             "result": operation,
             "createdAt": f"2026-06-{20 + index:02d}T09:{10 + index:02d}:00",
             "updatedAt": f"2026-06-{24 + index:02d}T15:{20 + index:02d}:00",
-            "nodeSequence": _transport_node_sequence(index),
-            "direction": ["北向", "南向", "双向", "东向"][(index - 1) % 4],
-            "serviceScope": _transport_service_scope(index),
+            "nodeSequence": _transport_node_sequence(index) if transport else _business_process_sequence(module, index),
+            "direction": ["北向", "南向", "双向", "东向"][(index - 1) % 4] if transport else _business_direction(index),
+            "serviceScope": _transport_service_scope(index) if transport else region,
             "fieldValues": {},
         }
         field_values: dict[str, object] = {}
@@ -2261,7 +2331,16 @@ def _business_record_description(
     title = str(getattr(module, "title", "") or "业务模块")
     operations = [str(item) for item in (getattr(module, "operations", []) or []) if str(item).strip()]
     operation_text = operation or (operations[(index - 1) % len(operations)] if operations else "业务处理")
-    region_text = region or _transport_service_scope(index)
+    if region:
+        region_text = region
+    elif _is_transport_module(module):
+        region_text = _transport_service_scope(index)
+    else:
+        regions = _business_record_regions(
+            module,
+            [str(item) for item in (getattr(module, "data_fields", []) or []) if str(item).strip()],
+        )
+        region_text = regions[(index - 1) % len(regions)] if regions else f"{title}服务区域{index}"
     phase = ["建档", "复核", "匹配", "归档"][(index - 1) % 4]
     return f"{title}-{operation_text}-{region_text}-{phase}"
 
@@ -2308,6 +2387,18 @@ def _transport_service_scope(index: int) -> str:
     return scopes[(index - 1) % len(scopes)]
 
 
+def _business_process_sequence(module: FeatureModule, index: int) -> str:
+    operations = [str(item).strip() for item in (getattr(module, "operations", []) or []) if str(item).strip()]
+    if not operations:
+        return "业务受理-规则校验-状态更新"
+    rotated = operations[(index - 1) % len(operations) :] + operations[: (index - 1) % len(operations)]
+    return "-".join(rotated[:3])
+
+
+def _business_direction(index: int) -> str:
+    return ["受理方向", "复核方向", "协同方向", "归档方向"][(index - 1) % 4]
+
+
 def _javascript_owner_role(module: FeatureModule) -> str:
     roles = [str(item) for item in (getattr(module, "roles", []) or []) if str(item).strip()]
     return roles[0] if roles else "业务操作员"
@@ -2321,7 +2412,7 @@ def _is_transport_module(module: FeatureModule) -> bool:
             " ".join(str(item) for item in (getattr(module, "data_fields", []) or [])),
         ]
     )
-    return bool(re.search(r"交通|运输|线路|干线|支线|接驳|换乘|站点|车站|枢纽|班次|运力", text))
+    return build_domain_profile(context_text=text).requires_route_topology
 
 
 def _business_code_prefix(module: FeatureModule, fallback_token: str) -> str:

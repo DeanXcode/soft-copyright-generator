@@ -25,9 +25,11 @@ from .frontend_codegen.page_spec import (
     PageSpecValidationError,
     page_spec_cache_key,
     page_spec_manifest,
+    repair_cached_page_spec_columns,
 )
 from .frontend_codegen.page_spec_renderer import render_page_spec
 from .frontend_codegen.page_spec_request import request_page_spec
+from .frontend_codegen.reference_style import REFERENCE_STYLE_VERSION, component_style_css, resolve_reference_style
 from .frontend_codegen.vite_build import (
     build_react_vite_bundle as _build_react_vite_bundle,
     frontend_node_module_root as _frontend_node_module_root,
@@ -44,9 +46,23 @@ from .llm.provider import (
     _inspect_generated_image,
 )
 from .llm.trace import trace_event
+from .llm.json_response import parse_json_object
 from .models import GenerationTask
+from .navigation_contract import (
+    NAVIGATION_CONTRACT_VERSION,
+    build_navigation_contracts,
+    navigation_page_catalog,
+    navigation_contract_summary,
+)
 from .packager import write_json
 from .ui_blueprint import UiBlueprint
+
+
+MODEL_GENERATED_REACT_VERSION = "model-generated-react-v1"
+
+
+def _model_generated_react_cache_key(creative_key: str) -> str:
+    return sha256(f"{creative_key}|{MODEL_GENERATED_REACT_VERSION}".encode("utf-8")).hexdigest()
 
 
 def generate_ai_frontend_pages(
@@ -208,6 +224,15 @@ def _use_react_framework(renderer: str) -> bool:
     return mode not in {"llm-html", "freeform-html", "legacy", "stable-component-shell", "stable-shell", "component-shell"}
 
 
+def _uses_model_generated_react(design_brief: dict[str, Any] | None) -> bool:
+    brief = design_brief if isinstance(design_brief, dict) else {}
+    return str(brief.get("industry_subtype_key") or "").strip() == "design_viewer"
+
+
+def _requires_direct_react(renderer: str, screenshot: Any, design_brief: dict[str, Any] | None) -> bool:
+    return _uses_model_generated_react(design_brief) or requires_legacy_fallback(renderer, screenshot)
+
+
 def _generate_react_frontend_pages(
     *,
     task: GenerationTask,
@@ -225,11 +250,29 @@ def _generate_react_frontend_pages(
     react_dir = prototype_dir / "react-app"
     screens_dir = react_dir / "src" / "screens"
     screens_dir.mkdir(parents=True, exist_ok=True)
-    write_json(react_dir / ".frontend-engine.json", page_spec_manifest())
     design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
+    model_generated_react = _uses_model_generated_react(design_brief)
+    write_json(
+        react_dir / ".frontend-engine.json",
+        {
+            "frontend_engine_version": FRONTEND_ENGINE_VERSION,
+            "frontend_generation_mode": "model-generated-react",
+            "react_engine_version": MODEL_GENERATED_REACT_VERSION,
+            "page_spec_schema_version": "",
+            "component_library_version": "",
+        }
+        if model_generated_react
+        else page_spec_manifest(),
+    )
     context = _codegen_context(task, blueprint, ui_blueprint)
     total = len(screenshots)
     visual_style_contract = _visual_reference_style_contract(style_reference)
+    if not model_generated_react:
+        _emit(emit, codegen_progress_start, "提取参考图共享组件样式（可复用，失败时沿用现有样式）")
+        visual_style_contract = resolve_reference_style(
+            provider=provider, reference=style_reference, base_contract=visual_style_contract,
+            cache_path=react_dir / "reference-component-style.json", image_data_url=_image_data_url,
+        )
     trace_event(
         "ai_frontend_reference_contract_ready",
         image_width=int(visual_style_contract.get("image_width") or 0),
@@ -238,6 +281,8 @@ def _generate_react_frontend_pages(
     )
     stop_event = threading.Event()
     worker_mode, initial_workers = _react_codegen_worker_setting(total)
+    if model_generated_react:
+        worker_mode, initial_workers = "direct-react-serial", 1
     runtime_lock = threading.Lock()
     runtime_state: dict[str, Any] = {
         "configured_workers": initial_workers,
@@ -245,6 +290,8 @@ def _generate_react_frontend_pages(
         "max_inflight": 0,
         "degraded": False,
         "degrade_reason": "",
+        "clean_successes": 0,
+        "concurrency_recoveries": 0,
         "logical_requests": 0,
         "request_attempts": 0,
         "provider_retries": 0,
@@ -267,6 +314,7 @@ def _generate_react_frontend_pages(
     ) -> None:
         category_value = category.value if isinstance(category, TextErrorCategory) else str(category)
         with runtime_lock:
+            runtime_state["clean_successes"] = 0
             categories = runtime_state["error_categories"]
             categories[category_value] = int(categories.get(category_value, 0)) + 1
             if will_retry:
@@ -276,8 +324,8 @@ def _generate_react_frontend_pages(
                 stops[str(stop_reason)] = int(stops.get(str(stop_reason), 0)) + 1
             should_degrade = (
                 worker_mode == "auto"
-                and category in {TextErrorCategory.RATE_LIMIT, TextErrorCategory.GATEWAY, TextErrorCategory.CONNECTION}
-                and not runtime_state["degraded"]
+                and category in {TextErrorCategory.RATE_LIMIT, TextErrorCategory.GATEWAY, TextErrorCategory.CONNECTION, TextErrorCategory.TIMEOUT}
+                and runtime_state["active_limit"] > 1
             )
             if should_degrade:
                 runtime_state["active_limit"] = 1
@@ -295,7 +343,20 @@ def _generate_react_frontend_pages(
             _emit(emit, codegen_progress_start, f"检测到 {category_value}，当前任务界面并发已降为 1")
 
     def record_success(attempt: int, retry_budget: int) -> None:
-        return None
+        with runtime_lock:
+            runtime_state["clean_successes"] = runtime_state["clean_successes"] + 1 if attempt == 1 else 0
+            recover = (
+                worker_mode == "auto"
+                and runtime_state["active_limit"] < initial_workers
+                and runtime_state["clean_successes"] >= 4
+            )
+            if recover:
+                runtime_state["active_limit"] = initial_workers
+                runtime_state["clean_successes"] = 0
+                runtime_state["concurrency_recoveries"] += 1
+        if recover:
+            trace_event("ai_frontend_concurrency_recovered", to_workers=initial_workers, clean_requests=4)
+            _emit(emit, codegen_progress_start, f"连续请求稳定，界面并发恢复为 {initial_workers}")
 
     def page_retry_policy() -> TextRetryPolicy:
         return TextRetryPolicy(
@@ -306,24 +367,92 @@ def _generate_react_frontend_pages(
         )
 
     renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
+    identity = design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {}
+    if not isinstance(identity, dict):
+        identity = {}
+    nav_model = str(identity.get("nav_model") or design_brief.get("nav_model") or "top_tabs")
+    if renderer in {"mobile_app", "game"}:
+        nav_model = "phone_tabs"
+    navigation_pages = {
+        str(page.get("key") or ""): page
+        for page in navigation_page_catalog(blueprint, renderer=renderer)
+        if str(page.get("key") or "")
+    }
+    navigation_pages.update(
+        {
+            str(page.get("key") or ""): page
+            for page in [_page_spec_screen_payload(item, task=task, design_brief=design_brief) for item in screenshots]
+            if str(page.get("key") or "")
+        }
+    )
+    all_navigation_contracts = build_navigation_contracts(
+        task,
+        blueprint,
+        list(navigation_pages.values()),
+        renderer=renderer,
+        nav_model=nav_model,
+    )
+    navigation_contracts = {
+        str(getattr(item, "key", "") or ""): all_navigation_contracts.get(str(getattr(item, "key", "") or ""), {})
+        for item in screenshots
+    }
+    late_resume = bool(
+        getattr(task, "resume_existing_output", False)
+        and str(getattr(task, "resume_stage", "") or "") in {
+            "manual",
+            "manual_docx",
+            "source_doc",
+            "source_docx",
+            "pdf",
+            "info",
+            "package",
+            "validate",
+            "done",
+        }
+    )
     pending_indexes: list[int] = []
+    renderer_migration_count = 0
     for pending_index, pending_item in enumerate(screenshots, start=1):
         pending_key = str(getattr(pending_item, "key", "") or f"page_{pending_index}")
         pending_token = _react_component_token(pending_key, pending_index)
         pending_creative_key = _page_creative_key(task, design_brief, pending_item)
-        if not _frontend_page_cache_ready(
+        react_engine = MODEL_GENERATED_REACT_VERSION if model_generated_react else LEGACY_FALLBACK_VERSION
+        cache_ready = _frontend_page_cache_ready(
             component_path=screens_dir / f"{pending_token}.jsx",
             css_path=screens_dir / f"{pending_token}.css",
             spec_path=screens_dir / f"{pending_token}.page-spec.json",
             meta_path=screens_dir / f"{pending_token}.meta.json",
             creative_key=pending_creative_key,
-            legacy=requires_legacy_fallback(renderer, pending_item),
-        ):
+            legacy=_requires_direct_react(renderer, pending_item, design_brief),
+            react_engine=react_engine,
+        )
+        renderer_migration_ready = (
+            not cache_ready
+            and not _requires_direct_react(renderer, pending_item, design_brief)
+            and _page_spec_renderer_migration_ready(
+                spec_path=screens_dir / f"{pending_token}.page-spec.json",
+                meta_path=screens_dir / f"{pending_token}.meta.json",
+                creative_key=pending_creative_key,
+            )
+        )
+        if renderer_migration_ready:
+            renderer_migration_count += 1
+        if not cache_ready and not renderer_migration_ready and not (late_resume and _late_resume_page_cache_ready(
+            component_path=screens_dir / f"{pending_token}.jsx",
+            css_path=screens_dir / f"{pending_token}.css",
+            spec_path=screens_dir / f"{pending_token}.page-spec.json",
+            meta_path=screens_dir / f"{pending_token}.meta.json",
+            legacy=_requires_direct_react(renderer, pending_item, design_brief),
+            react_engine=react_engine,
+        )):
             pending_indexes.append(pending_index)
     if pending_indexes and pending_indexes[0] > 1:
         _emit(emit, codegen_progress_start, f"从未完成页面继续 {pending_indexes[0]}/{total}")
     elif not pending_indexes:
-        _emit(emit, codegen_progress_start, f"复用全部 PageSpec/React 页面缓存 {total}/{total}")
+        if renderer_migration_count:
+            _emit(emit, codegen_progress_start, f"本地升级 PageSpec 页面渲染缓存 {renderer_migration_count}/{total}，无需模型请求")
+        else:
+            _emit(emit, codegen_progress_start, f"复用全部 PageSpec/React 页面缓存 {total}/{total}")
 
     def build_page(index: int, item: Any) -> dict[str, Any]:
         page_started_at = time.perf_counter()
@@ -339,7 +468,8 @@ def _generate_react_frontend_pages(
         css_scope = _react_css_scope(page_key, index)
         creative_key = _page_creative_key(task, design_brief, item)
         progress = codegen_progress_start + min(4, int(index / max(total, 1) * 4))
-        legacy = requires_legacy_fallback(renderer, item)
+        legacy = _requires_direct_react(renderer, item, design_brief)
+        react_engine = MODEL_GENERATED_REACT_VERSION if model_generated_react else LEGACY_FALLBACK_VERSION
         reused = _frontend_page_cache_ready(
             component_path=component_path,
             css_path=css_path,
@@ -347,13 +477,39 @@ def _generate_react_frontend_pages(
             meta_path=meta_path,
             creative_key=creative_key,
             legacy=legacy,
+            react_engine=react_engine,
         )
+        renderer_migrated = (
+            not reused
+            and not legacy
+            and _page_spec_renderer_migration_ready(
+                spec_path=spec_path,
+                meta_path=meta_path,
+                creative_key=creative_key,
+            )
+        )
+        if late_resume and not reused and not renderer_migrated:
+            reused = _late_resume_page_cache_ready(
+                component_path=component_path,
+                css_path=css_path,
+                spec_path=spec_path,
+                meta_path=meta_path,
+                legacy=legacy,
+                react_engine=react_engine,
+            )
         module = module_by_key.get(str(getattr(item, "module_key", "") or ""))
-        screen_payload = _page_spec_screen_payload(item)
-        engine = LEGACY_FALLBACK_VERSION if legacy else PAGE_SPEC_SCHEMA_VERSION
-        data: dict[str, str] | None = None
-        if reused and not legacy:
+        screen_payload = _page_spec_screen_payload(item, task=task, design_brief=design_brief)
+        engine = react_engine if legacy else PAGE_SPEC_SCHEMA_VERSION
+        data: dict[str, Any] | None = None
+        composition_contract = {}
+        if reused:
+            cached_meta = _read_json_dict(meta_path)
+            if isinstance(cached_meta.get("composition_contract"), dict):
+                composition_contract = dict(cached_meta["composition_contract"])
+        if (reused or renderer_migrated) and not legacy:
             cached_spec = _read_json_dict(spec_path)
+            if repair_cached_page_spec_columns(cached_spec):
+                write_json(spec_path, cached_spec)
             data = render_page_spec(
                 cached_spec,
                 css_scope=css_scope,
@@ -364,8 +520,9 @@ def _generate_react_frontend_pages(
                 visual_identity=design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {},
                 color_contract=visual_style_contract,
             )
-        if not reused:
-            _emit(emit, progress, f"生成 {'legacy React' if legacy else 'PageSpec'} 页面 {index}/{total}")
+        if not reused and not renderer_migrated:
+            generation_label = "模型 React" if model_generated_react else "legacy React" if legacy else "PageSpec"
+            _emit(emit, progress, f"生成 {generation_label} 页面 {index}/{total}")
             last_error: Exception | None = None
             try:
                 for quality_attempt in range(2):
@@ -389,6 +546,7 @@ def _generate_react_frontend_pages(
                                 component_name=component_name,
                                 css_scope=css_scope,
                                 creative_key=creative_key,
+                                navigation_contract=navigation_contracts.get(page_key, {}),
                                 validation_feedback=sanitize_error_message(last_error, limit=240) if last_error else "",
                                 retry_policy=page_retry_policy(),
                                 cancel_event=stop_event,
@@ -417,7 +575,9 @@ def _generate_react_frontend_pages(
                             )
                             write_json(spec_path, page_spec)
                         break
-                    except (PageSpecValidationError, ValueError) as exc:
+                    except (PageSpecValidationError, ValueError, TextProviderError) as exc:
+                        if isinstance(exc, TextProviderError) and exc.category != TextErrorCategory.FORMAT:
+                            raise
                         last_error = exc
                         category = classify_text_error(exc)
                         if category in {
@@ -457,21 +617,27 @@ def _generate_react_frontend_pages(
                     f"{page_key} 前端模型请求失败，已停止剩余页面，避免长时间重复等待：{sanitize_error_message(exc)}"
                 ) from exc
         if data is not None:
+            composition_contract = dict(data.get("composition_contract") or {})
             component_path.write_text(
                 f'import React from "react";\nimport "./{token}.css";\n\n'
                 f"export default function {component_name}() {{\n  return (\n{data['jsx']}\n  );\n}}\n",
                 encoding="utf-8",
             )
             css_path.write_text(data["css"], encoding="utf-8")
-        if not reused:
+        if not reused or renderer_migrated:
             write_json(
                 meta_path,
                 {
                     "creative_key": creative_key,
-                    "cache_key": legacy_cache_key(creative_key) if legacy else page_spec_cache_key(creative_key),
+                    "cache_key": (
+                        _model_generated_react_cache_key(creative_key)
+                        if model_generated_react
+                        else legacy_cache_key(creative_key) if legacy else page_spec_cache_key(creative_key)
+                    ),
                     "page_key": page_key,
                     "framework": "react-vite",
                     "engine": engine,
+                    "composition_contract": composition_contract,
                     **({} if legacy else page_spec_manifest()),
                 },
             )
@@ -499,17 +665,23 @@ def _generate_react_frontend_pages(
                 "interaction_pre_state": str(getattr(item, "interaction_pre_state", "") or ""),
                 "interaction_post_state": str(getattr(item, "interaction_post_state", "") or ""),
                 "interaction_result_evidence": str(getattr(item, "interaction_result_evidence", "") or ""),
-                "source": "legacy-react-fallback" if legacy else "page-spec-v1",
+                "source": (
+                    "model-generated-react"
+                    if model_generated_react
+                    else "legacy-react-fallback" if legacy else "page-spec-v1"
+                ),
                 "engine": engine,
                 "page_spec": str(spec_path) if not legacy else "",
                 "page_spec_schema_version": "" if legacy else PAGE_SPEC_SCHEMA_VERSION,
                 "component_library_version": "" if legacy else COMPONENT_LIBRARY_VERSION,
+                "composition_contract": composition_contract,
                 "component": str(component_path),
                 "creative_key": creative_key,
                 "visual_reference": _report_reference_summary(style_reference),
             },
             "elapsed_seconds": round(time.perf_counter() - page_started_at, 3),
-            "reused": reused,
+            "reused": reused or renderer_migrated,
+            "renderer_migrated": renderer_migrated,
         }
 
     results: list[dict[str, Any]] = []
@@ -573,8 +745,12 @@ def _generate_react_frontend_pages(
     imports = [str(item["import"]) for item in results]
     registrations = [str(item["registration"]) for item in results]
     pages = [dict(item["page"]) for item in results]
+    for page in pages:
+        page["navigation_contract"] = navigation_contracts.get(str(page.get("key") or ""), {})
+    navigation_summary = navigation_contract_summary(navigation_contracts)
     page_spec_count = sum(1 for page in pages if page.get("source") == "page-spec-v1")
     legacy_react_page_count = sum(1 for page in pages if page.get("source") == "legacy-react-fallback")
+    model_generated_react_page_count = sum(1 for page in pages if page.get("source") == "model-generated-react")
     shared_confirmation_page_count = sum(1 for page in pages if bool(page.get("requires_confirmation")))
     request_timings = [
         float(item.get("elapsed_seconds") or 0.0)
@@ -587,14 +763,18 @@ def _generate_react_frontend_pages(
         prototype_dir / "page-spec-manifest.json",
         {
             **page_spec_manifest(),
+            **navigation_summary,
             "page_spec_count": page_spec_count,
             "legacy_react_page_count": legacy_react_page_count,
+            "model_generated_react_page_count": model_generated_react_page_count,
             "page_count": len(pages),
             "pages": [
                 {
                     "page_key": str(page.get("key") or ""),
                     "engine": str(page.get("engine") or ""),
                     "source": str(page.get("source") or ""),
+                    "navigation_level": str((page.get("navigation_contract") or {}).get("level") or ""),
+                    "navigation_signature": str((page.get("navigation_contract") or {}).get("hierarchy_signature") or ""),
                 }
                 for page in pages
             ],
@@ -609,6 +789,7 @@ def _generate_react_frontend_pages(
         registrations=registrations,
         pages=pages,
         default_key=str(getattr(screenshots[0], "key", "") or "page_1"),
+        visual_style_contract=visual_style_contract,
     )
     _emit(emit, codegen_progress_start + 5, "构建 React + Vite 运行工程")
     _build_react_vite_bundle(react_dir)
@@ -621,7 +802,11 @@ def _generate_react_frontend_pages(
     return {
         "enabled": True,
         "ready": len(pages) == total,
-        "source": "gpt-style-reference-image2-to-pagespec-react-vite",
+        "source": (
+            "gpt-image2-to-model-generated-react-vite"
+            if model_generated_react
+            else "gpt-style-reference-image2-to-pagespec-react-vite"
+        ),
         "framework": "react",
         "build_tool": "vite",
         "frontend_engine_version": FRONTEND_ENGINE_VERSION,
@@ -631,11 +816,23 @@ def _generate_react_frontend_pages(
         "page_count": len(pages),
         "page_spec_count": page_spec_count,
         "legacy_react_page_count": legacy_react_page_count,
+        "model_generated_react_page_count": model_generated_react_page_count,
+        "frontend_generation_mode": "model-generated-react" if model_generated_react else "pagespec-hybrid",
         "shared_confirmation_contract": "shared-confirm-dialog-v1",
         "shared_confirmation_page_count": shared_confirmation_page_count,
         "shared_confirmation_ready": (react_dir / "src" / "SharedConfirmDialog.jsx").is_file(),
+        "navigation_contract_version": NAVIGATION_CONTRACT_VERSION,
+        **navigation_summary,
         "source_dir": str(react_dir),
         "visual_references": visual_reference_report,
+        "reference_component_style": {
+            "schema_version": REFERENCE_STYLE_VERSION,
+            "status": visual_style_contract.get("component_style_status", "direct-react"),
+            "reused": bool(visual_style_contract.get("component_style_reused")),
+            "image_sha256": visual_style_contract.get("component_style_image_sha256", ""),
+            "applied": bool(visual_style_contract.get("component_style")),
+            "request_seconds": float(visual_style_contract.get("component_style_request_seconds") or 0),
+        },
         **runtime_summary,
         "frontend_page_request_timing": _frontend_timing_summary(request_timings),
         "pages": pages,
@@ -663,6 +860,8 @@ def _frontend_runtime_summary(state: dict[str, Any], *, cancelled_page_count: in
         "frontend_effective_workers": int(state.get("max_inflight") or 1),
         "frontend_concurrency_degraded": bool(state.get("degraded")),
         "frontend_concurrency_degrade_reason": str(state.get("degrade_reason") or ""),
+        "frontend_final_worker_limit": int(state.get("active_limit") or 1),
+        "frontend_concurrency_recoveries": int(state.get("concurrency_recoveries") or 0),
         "frontend_cancelled_page_count": int(cancelled_page_count),
         "provider_retry_summary": {
             "logical_requests": int(state.get("logical_requests") or 0),
@@ -736,7 +935,7 @@ def _operation_prompt_rule(screenshot: Any) -> str:
     fields = [str(item) for item in (getattr(screenshot, "interaction_input_fields", None) or []) if str(item).strip()]
     pre_state = str(getattr(screenshot, "interaction_pre_state", "") or "当前状态")
     post_state = str(getattr(screenshot, "interaction_post_state", "") or "处理后状态")
-    evidence = str(getattr(screenshot, "interaction_result_evidence", "") or "可见状态和操作日志")
+    evidence = str(getattr(screenshot, "interaction_result_evidence", "") or "可见状态和结果记录")
     contract = (
         f"执行角色：{role}；触发条件：{trigger}；输入字段：{'、'.join(fields) or '按模块业务字段'}；"
         f"状态变化：{pre_state} -> {post_state}；结果证据：{evidence}。"
@@ -803,10 +1002,11 @@ def _generate_react_component(
     component_name: str,
     css_scope: str,
     creative_key: str,
+    navigation_contract: dict[str, Any] | None = None,
     validation_feedback: str = "",
     retry_policy: TextRetryPolicy | None = None,
     cancel_event: Any | None = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
     terminal_rule = (
         "这是 720x1280 竖屏手机 App 页面：根节点及主要手机内容壳必须使用完整 720px 逻辑宽度并铺满画布，"
@@ -815,6 +1015,13 @@ def _generate_react_component(
         if renderer in {"mobile_app", "game"}
         else "这是 1280x720 横屏桌面软件页面：利用横向空间形成真实业务工作区，禁止模拟手机卡片流。"
     )
+    design_viewer = _uses_model_generated_react(design_brief)
+    if design_viewer:
+        terminal_rule = (
+            "这是 1280x720 横屏桌面设计文件浏览器。你必须直接在本组件内生成完整可见应用结构，包括紧凑标签/文档栏、"
+            "导航与资源路径/搜索工具、左侧团队项目和文件树、中间文件缩略图或设计画布、右侧设计/原型/检查属性面板及底部缩放状态。"
+            "禁止手机底部导航、通用后台卡片墙、编号区域和大段功能说明。"
+        )
     payload = {
         "creative_seed": str(getattr(task, "seed", "") or ""),
         "page_structure_seed": creative_key,
@@ -842,6 +1049,7 @@ def _generate_react_component(
         "product_experience": design_brief.get("product_experience_spec") if isinstance(design_brief, dict) else {},
         "reference": _prompt_reference_payload(visual_reference),
         "reference_style_contract": visual_style_contract,
+        "navigation_contract": navigation_contract or {},
     }
     operation_rule = _operation_prompt_rule(screenshot)
     retry_rule = (
@@ -857,19 +1065,22 @@ def _generate_react_component(
 要求：
 - {terminal_rule}
 - {operation_rule or "按当前 page_kind 构建对应层级的真实软件页面。"}
-- 只返回 JSON：{{"jsx":"单个根节点的 JSX","css":"完整 CSS"}}；不要返回 import、export、函数声明、Markdown 或外部依赖。
+ - 只返回 JSON：{{"jsx":"单个根节点的 JSX","css":"完整 CSS","composition_family":"实际构图族英文短标识","composition_variant":"实际构图变体英文短标识"}}；不要返回 import、export、函数声明、Markdown 或外部依赖。
  - JSX 与 CSS 合计控制在 4500-7500 个字符，其中 CSS 控制在 1800-3200 个字符；用 CSS 类复用样式，不要为每个数据行重复冗长结构，也不要输出解释性注释。
 - JSX 必须完全自包含：不要引用未声明变量、数组 map、自定义组件或图标组件；业务样例直接写成 JSX 节点，保证无需额外上下文即可渲染。
 - JSX 根节点必须包含 className="screen-root {css_scope}" 和 data-page-structure="{creative_key}"。
-- 系统会按 visual_identity_spec 在组件外层渲染本软件专属的共享外壳；外壳可能是侧栏、顶部页签或紧凑导航轨道，并使用真实模块名。本组件只生成页面内容区，禁止再次生成全局 header、品牌名称、主导航或重复的系统标题。
-- 按随消息附带的 image2 全局参考图继承色彩、控件质感和视觉节奏，但当前页面结构必须由 page_structure_seed 和业务用途独立决定。
-- 页面保持简洁，围绕当前功能设置一个主要工作区和不超过两个辅助区域；指标卡不超过 4 个、主要操作按钮不超过 6 个、示例表格不超过 5 行。
+ - {"本组件必须直接生成完整可见软件界面，外层只负责 React 挂载与公共确认交互，不会替你生成浏览器或页面结构。" if design_viewer else "系统会按 visual_identity_spec 在组件外层渲染本软件专属的共享外壳；外壳可能是侧栏、顶部页签或紧凑导航轨道，并使用真实模块名。本组件只生成页面内容区，禁止再次生成全局 header、品牌名称、主导航或重复的系统标题。"}
+- {"navigation_contract 只规定当前路由的导航语义，不规定布局。请把其中 primary_items、secondary_items、breadcrumb 和 back_target 设计成页面中自然可见的标签、文件树入口或路径控件，并分别逐项添加 data-navigation-primary-item、data-navigation-secondary-item、data-navigation-breadcrumb-item、data-navigation-back-target；可跳转项同时添加 data-navigation-page-key。禁止为满足属性而输出隐藏导航。" if design_viewer else "共享外壳会根据 navigation_contract 渲染导航，不要在内容区重复生成这些导航节点。"}
+- 按随消息附带的 image2 全局参考图继承真实布局关系、色彩、控件质感、信息密度和视觉节奏；不要只提取颜色。当前业务信息和路由状态仍以 payload 为准。
+- 页面保持简洁，围绕当前功能设置一个主要工作区和不超过两个辅助区域；指标卡不超过 4 个、主要操作按钮不超过 6 个、示例表格不超过 5 行；禁止用 kicker、eyebrow、subtitle、caption、helper text、说明段落或装饰性副标题填充页面，标题只保留一个主标题，区域标题只保留必要业务语义。
+- 操作按钮必须是短动作词（优先 2-6 个字，如“筛选”“保存”“创建任务”“确认”），不得把完整业务描述或流程解释写进按钮；所有按钮使用统一的图标化视觉结构，图标可用纯 CSS 或单字符图标，不得混用图片按钮和长文字按钮。
+- 页面必须按真实流程组织：入口/筛选 -> 核心字段或结果 -> 下一步操作；不要为了“丰富”堆叠重复指标、无关卡片、装饰说明或虚构流程。
 - 同一软件的相邻页面保持共享外壳一致，但不得假设外壳是通用深蓝顶部导航；内容区必须继续服从当前软件的视觉身份和页面结构种子。
 - 登录、仪表盘、模块工作区、操作页和统计页要像同一产品中的不同真实路由，而不是同一模板换文字。
 - 操作页必须严格服从 interaction_action、interaction_surface 和 requires_confirmation；即时操作不得擅自增加确认弹窗、登记表单或“确认登记”按钮。
 - requires_confirmation=true 时只提供 data-shared-confirm-source 隐藏语义源，不得输出另一套可见弹窗；可见确认框统一由系统公共组件渲染。
 - 使用真实中文业务数据、按钮、状态、表单、表格、图表、流程、时间线、任务板或地图工作区；按当前业务选择，不要求每类控件都出现。JSX 可见文字中的小于号必须写成 &lt;，例如“P 值 &lt; 0.05”，不能直接写裸字符“<”。
-- CSS 必须以 .{css_scope} 为作用域，不引用 CDN、图片、字体、SVG 或网络资源；首屏铺满且文字不能溢出。
+- CSS 必须以 .{css_scope} 为作用域，不引用 CDN、图片、字体、SVG 或网络资源；首屏铺满且文字不能溢出。长标题、字段值、状态和按钮标签必须换行或允许区域滚动，禁止对主要业务文本大面积使用 `white-space: nowrap`、`overflow: hidden` 或省略号裁切；不得让文字被容器边界截断。
 - CSS 中严禁出现 @import、url(...)、@font-face、http://、https:// 或 data:image；图标和装饰只能使用文字、纯 CSS、渐变、边框与伪元素。
 - 所有样式都写入 css 字段，JSX 中严禁出现 style=、style={{...}} 或 style 字符串；进度条宽度、颜色和定位也必须改用 CSS 类。
 - 保留可供运行数据覆盖的 .table-frame、.runtime-record-panel、.map-pin、.operation-result 中至少一个适合本页的区域。
@@ -877,14 +1088,25 @@ def _generate_react_component(
 - 禁止使用“待填写、待补充、待完善、示例内容、业务记录、记录01”等未完成占位文案；缺省值也要写成自然业务状态，例如“无异常”“未发现冲突”或“正常流转”。
 {retry_rule}
 """.strip()
-    # The same large image on every page disables streaming on compatible gateways and
-    # can hit their idle timeout. The contract above is extracted from the actual image.
-    user_message = {"role": "user", "content": prompt}
+    image_path = Path(str((visual_reference or {}).get("image_path") or ""))
+    if design_viewer and not image_path.is_file():
+        raise RuntimeError("设计文件浏览器的直接 React 生成缺少可读取的 image2 参考图")
+    if design_viewer and image_path.is_file():
+        user_message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": _image_data_url(image_path)}},
+            ],
+        }
+    else:
+        # Non-design pages use the extracted contract to keep streaming and reduce timeout risk.
+        user_message = {"role": "user", "content": prompt}
     content = provider.chat(
         [
             {
                 "role": "system",
-                "content": "你是资深 React 产品工程师。根据真实业务和视觉参考生成可编译 JSX 与 CSS，只返回 JSON，不使用模板化后台骨架。",
+                "content": "你是资深 React 产品工程师。根据真实业务和随消息提供的视觉参考直接编写可编译 JSX 与 CSS，只返回 JSON，不使用 PageSpec、固定模板或通用后台骨架。",
             },
             user_message,
         ],
@@ -942,7 +1164,76 @@ def _generate_react_component(
         required_markers = ("data-shared-confirm-source", "data-confirm-title", "data-confirm-action")
         if not all(marker in jsx for marker in required_markers):
             raise ValueError("确认操作页缺少 SharedConfirmDialog 语义源")
-    return {"jsx": jsx, "css": css}
+    composition_contract = _model_react_composition_contract(
+        data,
+        screenshot=screenshot,
+        creative_key=creative_key,
+    )
+    jsx = _inject_model_react_composition_attributes(jsx, composition_contract)
+    if design_viewer:
+        _validate_model_navigation_markup(jsx, navigation_contract or {})
+    return {"jsx": jsx, "css": css, "composition_contract": composition_contract}
+
+
+def _model_react_composition_contract(
+    data: dict[str, Any],
+    *,
+    screenshot: Any,
+    creative_key: str,
+) -> dict[str, str]:
+    page_kind = _composition_token(getattr(screenshot, "page_kind", "")) or "general"
+    surface = _composition_token(getattr(screenshot, "interaction_surface", ""))
+    mode = _composition_token(getattr(screenshot, "interaction_mode", ""))
+    family = _composition_token(data.get("composition_family")) or page_kind
+    variant = _composition_token(data.get("composition_variant"))
+    if not variant:
+        variant = "-".join(token for token in (page_kind, surface, mode) if token) or "workspace"
+    signature = sha256(f"{creative_key}|{family}|{variant}".encode("utf-8")).hexdigest()[:20]
+    return {
+        "version": "model-react-composition-v1",
+        "family": family,
+        "variant": variant,
+        "workspace_mode": "model-generated",
+        "signature": signature,
+    }
+
+
+def _composition_token(value: Any) -> str:
+    token = re.sub(r"[^a-z0-9_-]+", "-", str(value or "").strip().lower()).strip("-_")
+    return token[:48]
+
+
+def _inject_model_react_composition_attributes(jsx: str, contract: dict[str, str]) -> str:
+    if "data-composition-signature=" in jsx:
+        return jsx
+    marker = re.search(r'data-page-structure="[^"]+"', jsx)
+    if not marker:
+        return jsx
+    attributes = (
+        f' data-page-composition-version="{contract["version"]}"'
+        f' data-page-composition="{contract["variant"]}"'
+        f' data-composition-family="{contract["family"]}"'
+        f' data-composition-signature="{contract["signature"]}"'
+    )
+    return jsx[: marker.end()] + attributes + jsx[marker.end() :]
+
+
+def _validate_model_navigation_markup(jsx: str, contract: dict[str, Any]) -> None:
+    requirements = (
+        ("primary_items", "data-navigation-primary-item="),
+        ("secondary_items", "data-navigation-secondary-item="),
+        ("breadcrumb", "data-navigation-breadcrumb-item="),
+    )
+    missing: list[str] = []
+    for key, marker in requirements:
+        expected = len(contract.get(key) or [])
+        if expected and jsx.count(marker) < expected:
+            missing.append(f"{key} {jsx.count(marker)}/{expected}")
+    back_target = contract.get("back_target") if isinstance(contract.get("back_target"), dict) else {}
+    if back_target.get("page_key") and "data-navigation-back-target=" not in jsx:
+        missing.append("back_target 0/1")
+    if missing:
+        raise ValueError("模型直出页面缺少可见导航契约节点：" + "，".join(missing))
 
 
 def _sanitize_react_visible_terms(value: str) -> str:
@@ -1260,14 +1551,20 @@ def _frontend_page_cache_ready(
     meta_path: Path,
     creative_key: str,
     legacy: bool,
+    react_engine: str = LEGACY_FALLBACK_VERSION,
 ) -> bool:
     meta = _read_json_dict(meta_path)
     if not meta or str(meta.get("creative_key") or "") != creative_key:
         return False
     if legacy:
+        expected_cache_key = (
+            _model_generated_react_cache_key(creative_key)
+            if react_engine == MODEL_GENERATED_REACT_VERSION
+            else legacy_cache_key(creative_key)
+        )
         return bool(
-            str(meta.get("engine") or "") == LEGACY_FALLBACK_VERSION
-            and str(meta.get("cache_key") or "") == legacy_cache_key(creative_key)
+            str(meta.get("engine") or "") == react_engine
+            and str(meta.get("cache_key") or "") == expected_cache_key
             and component_path.is_file()
             and css_path.is_file()
             and component_path.stat().st_size > 900
@@ -1284,6 +1581,50 @@ def _frontend_page_cache_ready(
     )
 
 
+def _page_spec_renderer_migration_ready(
+    *,
+    spec_path: Path,
+    meta_path: Path,
+    creative_key: str,
+) -> bool:
+    """Allow a renderer-only upgrade without issuing another model request."""
+    meta = _read_json_dict(meta_path)
+    spec = _read_json_dict(spec_path)
+    return bool(
+        str(meta.get("creative_key") or "") == creative_key
+        and str(meta.get("engine") or "") == PAGE_SPEC_SCHEMA_VERSION
+        and str(spec.get("schema_version") or "") == PAGE_SPEC_SCHEMA_VERSION
+        and str(spec.get("page_key") or "")
+        and str(spec.get("page_key") or "") == str(meta.get("page_key") or "")
+    )
+
+
+def _late_resume_page_cache_ready(
+    *,
+    component_path: Path,
+    css_path: Path,
+    spec_path: Path,
+    meta_path: Path,
+    legacy: bool,
+    react_engine: str = LEGACY_FALLBACK_VERSION,
+) -> bool:
+    """Keep completed UI source immutable when resuming after screenshots.
+
+    A late-stage retry must not reinterpret a previously accepted UI blueprint
+    just because a newer product-type rule would choose a different renderer.
+    The screenshot checkpoint and published frontend are the source of truth.
+    """
+    if not all(path.is_file() for path in (component_path, css_path, meta_path)):
+        return False
+    if component_path.stat().st_size <= 900 or css_path.stat().st_size <= 500:
+        return False
+    if legacy:
+        meta = _read_json_dict(meta_path)
+        return str(meta.get("engine") or "") == react_engine
+    spec = _read_json_dict(spec_path)
+    return str(spec.get("schema_version") or "") == PAGE_SPEC_SCHEMA_VERSION
+
+
 def _read_json_dict(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1292,7 +1633,13 @@ def _read_json_dict(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _page_spec_screen_payload(item: Any) -> dict[str, Any]:
+def _page_spec_screen_payload(
+    item: Any,
+    *,
+    task: GenerationTask | None = None,
+    design_brief: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    brief = design_brief if isinstance(design_brief, dict) else {}
     return {
         "key": str(getattr(item, "key", "") or ""),
         "title": str(getattr(item, "title", "") or ""),
@@ -1303,6 +1650,8 @@ def _page_spec_screen_payload(item: Any) -> dict[str, Any]:
         "interaction_mode": str(getattr(item, "interaction_mode", "") or "browse"),
         "interaction_surface": str(getattr(item, "interaction_surface", "") or "workspace"),
         "requires_confirmation": bool(getattr(item, "requires_confirmation", False)),
+        "software_name": str(getattr(task, "software_name", "") or "") if task is not None else "",
+        "industry_subtype_key": str(brief.get("industry_subtype_key") or ""),
         "interaction_action_key": str(getattr(item, "interaction_action_key", "") or ""),
         "interaction_role": str(getattr(item, "interaction_role", "") or ""),
         "interaction_trigger": str(getattr(item, "interaction_trigger", "") or ""),
@@ -1323,6 +1672,7 @@ def _write_react_app_files(
     registrations: list[str],
     pages: list[dict[str, Any]],
     default_key: str,
+    visual_style_contract: dict[str, Any] | None = None,
 ) -> None:
     src_dir = react_dir / "src"
     src_dir.mkdir(parents=True, exist_ok=True)
@@ -1383,6 +1733,7 @@ def _write_react_app_files(
             "interaction_pre_state": str(page.get("interaction_pre_state") or ""),
             "interaction_post_state": str(page.get("interaction_post_state") or ""),
             "interaction_result_evidence": str(page.get("interaction_result_evidence") or ""),
+            "navigation_contract": dict(page.get("navigation_contract") or {}),
         }
         for page in pages
         if str(page.get("key") or "")
@@ -1426,7 +1777,17 @@ def _write_react_app_files(
             "sidebar": str(palette.get("sidebar") or design_brief.get("sidebar") or "#123c40"),
             "canvas": str(palette.get("canvas") or design_brief.get("canvas") or "#f4fbf8"),
         },
+        "industry_subtype_key": str(design_brief.get("industry_subtype_key") or ""),
+        "page_files": {
+            str(page.get("key") or ""): str(page.get("file") or "")
+            for page in pages
+            if str(page.get("key") or "") and str(page.get("file") or "")
+        },
     }
+    if visual_style_contract and visual_style_contract.get("component_style"):
+        colors = visual_style_contract["component_style"]["colors"]
+        shell_config["palette"].update(accent=colors["accent"], sidebar=colors["text"], canvas=colors["canvas"])
+        shell_config["palette"]["accent_soft"] = f"color-mix(in srgb,{colors['accent']} 10%,#fff)"
     (src_dir / "SharedAppShell.jsx").write_text(_shared_app_shell_source(), encoding="utf-8")
     (src_dir / "SharedConfirmDialog.jsx").write_text(_shared_confirm_dialog_source(), encoding="utf-8")
     app_source = "\n".join(imports) + '\nimport SharedAppShell from "./SharedAppShell.jsx";\nimport SharedConfirmDialog from "./SharedConfirmDialog.jsx";\n\nconst screens = {\n' + "\n".join(registrations) + "\n};\n" + f'''\nconst screenMeta = {json.dumps(screen_meta, ensure_ascii=False, indent=2)};
@@ -1446,7 +1807,10 @@ export default function App() {{
 '''
     (src_dir / "App.jsx").write_text(app_source, encoding="utf-8")
     mobile_css = "max-width:720px;margin:0 auto;" if renderer in {"mobile_app", "game"} else "width:100%;"
-    (src_dir / "theme.css").write_text(_shared_app_shell_css(mobile_css) + _shared_confirm_dialog_css(), encoding="utf-8")
+    (src_dir / "theme.css").write_text(
+        _shared_app_shell_css(mobile_css) + _shared_confirm_dialog_css()
+        + component_style_css(visual_style_contract or {}, scope=".generated-product", shell=True), encoding="utf-8",
+    )
 
 
 def _shared_shell_section(page: dict[str, Any]) -> str:
@@ -1474,23 +1838,48 @@ def _shared_app_shell_source() -> str:
 
 export default function SharedAppShell({ renderer, screenKey, screenMeta, config, children }) {
   if (screenMeta?.section === "login" || screenKey === "login") return children;
-  const navModel = config?.nav_model || "top_tabs";
-  const activeSection = screenMeta?.module_key || screenMeta?.section || "dashboard";
+  const contract = screenMeta?.navigation_contract || {};
+  const navModel = contract?.nav_model || config?.nav_model || "top_tabs";
+  const primaryItems = contract?.primary_items || config?.navigation || [];
+  const secondaryItems = contract?.secondary_items || [];
+  const breadcrumb = contract?.breadcrumb || [];
+  const activePrimary = contract?.active_primary_key || screenMeta?.module_key || screenMeta?.section || "dashboard";
+  const activeSecondary = contract?.active_secondary_key || "";
+  const backTarget = contract?.back_target || {};
+  const mobile = renderer === "mobile_app" || renderer === "game";
   const mark = String(config?.software_name || "软").trim().slice(0, 1) || "软";
+  const navigateToPage = (pageKey) => {
+    const target = config?.page_files?.[pageKey];
+    if (!target || pageKey === screenKey) return;
+    window.location.assign(target);
+  };
   const shellStyle = {
     "--shell-accent": config?.palette?.accent || "#0f766e",
     "--shell-accent-soft": config?.palette?.accent_soft || "#ecfdf5",
     "--shell-sidebar": config?.palette?.sidebar || "#123c40",
     "--shell-canvas": config?.palette?.canvas || "#f4fbf8",
   };
-  const brand = <div className="shared-app-brand"><span className="shared-app-mark">{mark}</span><div><strong>{config?.software_name}</strong><small>{config?.version} · {config?.industry}</small></div></div>;
-  const navigation = <nav className="shared-app-nav" aria-label="主导航">
-    {(config?.navigation || []).map((item) => <span key={item.key} className={item.key === activeSection ? "active" : ""}>{item.label}</span>)}
+  if (config?.industry_subtype_key === "design_viewer") return <div className="model-react-contract" data-navigation-contract={contract?.schema_version || ""} data-navigation-ready={contract?.ready ? "true" : "false"} data-navigation-level={contract?.level || ""} data-navigation-signature={contract?.hierarchy_signature || ""} data-navigation-active-primary={activePrimary} data-navigation-active-secondary={activeSecondary} data-navigation-back-target={backTarget?.page_key || ""} onClick={(event) => {
+    const target = event.target.closest("[data-navigation-page-key],[data-navigation-back-target]");
+    if (!target) return;
+    navigateToPage(target.getAttribute("data-navigation-page-key") || target.getAttribute("data-navigation-back-target") || "");
+  }}>{children}</div>;
+  const brand = <div className="shared-app-brand"><span className="shared-app-mark">{mark}</span><div><strong>{config?.software_name}</strong></div></div>;
+  const navigation = <nav className="shared-app-nav" aria-label="一级导航">
+    {primaryItems.map((item) => <span key={item.key} data-navigation-primary-item={item.key || ""} data-navigation-page-key={item.page_key || ""} onClick={() => navigateToPage(item.page_key)} className={item.key === activePrimary ? "active" : ""}>{item.label}</span>)}
   </nav>;
-  const context = <div className="shared-app-context"><span>{screenMeta?.title || "功能界面"}</span><strong>{config?.role}</strong><em>{config?.industry}</em></div>;
-  return <div className={`shared-app-shell shared-app-shell-${renderer || "admin"}`} data-nav-model={navModel} data-layout-variant={config?.layout_variant || "classic"} data-identity-signature={config?.identity_signature || ""} style={shellStyle}>
-    {navModel === "side_menu" ? <aside className="shared-app-sidebar">{brand}{navigation}{context}</aside> : <header className="shared-app-header">{brand}{navigation}{context}</header>}
-    <main className="shared-app-main">{children}</main>
+  const context = <div className="shared-app-context">{config?.role && <strong title={config.role}>{config.role}</strong>}</div>;
+  const hierarchy = <div className="shared-app-hierarchy">
+    <div className="shared-app-hierarchy-main">
+      {backTarget?.page_key && <span className="shared-app-back" data-navigation-back-target={backTarget.page_key} onClick={() => navigateToPage(backTarget.page_key)}>← {backTarget.label || "返回上级"}</span>}
+      <div className="shared-app-breadcrumb" aria-label="面包屑">{breadcrumb.map((item, index) => <React.Fragment key={`${item.key}-${index}`}><span data-navigation-breadcrumb-item={item.key || ""} data-navigation-page-key={item.page_key || ""} onClick={() => navigateToPage(item.page_key)}>{item.label}</span>{index < breadcrumb.length - 1 && <i>/</i>}</React.Fragment>)}</div>
+    </div>
+    {secondaryItems.length > 0 && <nav className={`shared-app-secondary shared-app-secondary-${contract?.secondary_style || "tabs"}`} aria-label="二级导航">{secondaryItems.map((item) => <span key={item.key} data-navigation-secondary-item={item.key || ""} data-navigation-page-key={item.page_key || ""} onClick={() => navigateToPage(item.page_key)} className={item.key === activeSecondary ? "active" : ""}>{item.label}</span>)}</nav>}
+  </div>;
+  return <div className={`shared-app-shell shared-app-shell-${renderer || "admin"}`} data-nav-model={navModel} data-layout-variant={config?.layout_variant || "classic"} data-identity-signature={config?.identity_signature || ""} data-navigation-contract={contract?.schema_version || ""} data-navigation-ready={contract?.ready ? "true" : "false"} data-navigation-level={contract?.level || ""} data-navigation-signature={contract?.hierarchy_signature || ""} data-navigation-active-primary={activePrimary} data-navigation-active-secondary={activeSecondary} data-navigation-back-target={backTarget?.page_key || ""} style={shellStyle}>
+    {mobile ? <header className="shared-app-header shared-app-mobile-header">{brand}{context}</header> : navModel === "side_menu" ? <aside className="shared-app-sidebar">{brand}{navigation}{context}</aside> : <header className="shared-app-header">{brand}{navigation}{context}</header>}
+    <div className="shared-app-workspace">{hierarchy}<main className="shared-app-main">{children}</main></div>
+    {mobile && <div className="shared-app-mobile-nav">{navigation}</div>}
   </div>;
 }
 '''
@@ -1609,10 +1998,15 @@ export default function SharedConfirmDialog({ screenKey, screenMeta }) {
 
 
 def _shared_app_shell_css(mobile_css: str) -> str:
-    base = f'''*{{box-sizing:border-box}}html,body,#root{{margin:0;width:100%;height:100%;overflow:hidden}}body{{font-family:'Microsoft YaHei','PingFang SC',Arial,sans-serif;background:#eef2f7;color:#172033}}button,input,select,textarea{{font:inherit}}.generated-product{{height:100%;{mobile_css}}}.shared-app-shell{{height:100%;display:grid;grid-template-rows:66px minmax(0,1fr);background:#081a31;overflow:hidden}}.shared-app-header{{display:grid;grid-template-columns:minmax(280px,360px) minmax(420px,1fr) minmax(210px,280px);align-items:center;gap:18px;padding:0 18px;background:linear-gradient(90deg,#0a1c35,#102b4d 58%,#0a203c);border-bottom:1px solid rgba(96,165,250,.28);color:#e8f3ff;box-shadow:0 8px 22px rgba(2,12,27,.24);z-index:20}}.shared-app-brand{{display:flex;align-items:center;gap:11px;min-width:0}}.shared-app-mark{{width:38px;height:38px;flex:0 0 38px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(135deg,#f59e0b,#2563eb);color:white;font-weight:900;box-shadow:0 4px 14px rgba(37,99,235,.35)}}.shared-app-brand div,.shared-app-context{{min-width:0}}.shared-app-brand strong,.shared-app-brand small{{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-brand strong{{font-size:15px}}.shared-app-brand small{{margin-top:4px;color:#93c5fd;font-size:11px}}.shared-app-nav{{display:flex;align-items:center;justify-content:center;gap:6px;min-width:0;overflow:hidden}}.shared-app-nav span{{height:34px;display:inline-flex;align-items:center;padding:0 13px;border:1px solid rgba(147,197,253,.2);border-radius:6px;background:rgba(9,30,57,.62);color:#bfd7f5;font-size:12px;white-space:nowrap}}.shared-app-nav span.active{{background:#2563eb;border-color:#60a5fa;color:white;box-shadow:inset 0 -3px 0 #f59e0b}}.shared-app-context{{display:grid;grid-template-columns:1fr auto;align-items:center;column-gap:9px;text-align:right}}.shared-app-context span{{grid-column:1/3;color:#93c5fd;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-context strong{{margin-top:3px;color:#fef3c7;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-context em{{margin-top:3px;color:#7dd3fc;font-size:10px;font-style:normal;white-space:nowrap}}.shared-app-main{{min-height:0;overflow:hidden;position:relative}}.shared-app-main .screen-root{{width:100%!important;height:100%!important;min-height:0!important;max-height:100%!important;overflow:hidden!important}}.shared-app-main .screen-root>header:first-child,.shared-app-main .screen-root>.topbar:first-child,.shared-app-main .screen-root>.mobile-header:first-child,.shared-app-main .screen-root>.app-header:first-child{{display:none!important}}.shared-app-main .screen-root:has(>.mobile-header:first-child){{grid-template-rows:minmax(0,1fr) 78px!important}}@media(max-width:980px){{.shared-app-header{{grid-template-columns:minmax(220px,1fr) auto;padding:0 14px}}.shared-app-nav{{justify-content:flex-end}}.shared-app-nav span{{padding:0 9px}}.shared-app-context{{display:none}}}}.shared-app-shell-mobile_app{{grid-template-rows:72px minmax(0,1fr)}}.shared-app-shell-mobile_app .shared-app-header{{grid-template-columns:minmax(210px,1fr) minmax(300px,1.4fr);gap:10px;padding:0 16px}}.shared-app-shell-mobile_app .shared-app-context{{display:none}}.shared-app-shell-mobile_app .shared-app-nav{{justify-content:flex-end;overflow:hidden}}.shared-app-shell-mobile_app .shared-app-nav span{{padding:0 9px;font-size:11px}}.screen-root{{width:100%;height:100%;overflow:hidden}}
+    base = f'''*{{box-sizing:border-box}}html,body,#root{{margin:0;width:100%;height:100%;overflow:hidden}}body{{font-family:'Microsoft YaHei','PingFang SC',Arial,sans-serif;background:#eef2f7;color:#172033}}button,input,select,textarea{{font:inherit}}.generated-product{{height:100%;{mobile_css}}}.model-react-contract{{width:100%;height:100%;min-width:0;min-height:0;overflow:hidden}}.model-react-contract>.screen-root{{width:100%;height:100%;min-width:0;min-height:0}}.shared-app-shell{{height:100%;display:grid;grid-template-rows:66px minmax(0,1fr);background:#081a31;overflow:hidden}}.shared-app-header{{display:grid;grid-template-columns:minmax(280px,360px) minmax(420px,1fr) minmax(210px,280px);align-items:center;gap:18px;padding:0 18px;background:linear-gradient(90deg,#0a1c35,#102b4d 58%,#0a203c);border-bottom:1px solid rgba(96,165,250,.28);color:#e8f3ff;box-shadow:0 8px 22px rgba(2,12,27,.24);z-index:20}}.shared-app-brand{{display:flex;align-items:center;gap:11px;min-width:0}}.shared-app-mark{{width:38px;height:38px;flex:0 0 38px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(135deg,#f59e0b,#2563eb);color:white;font-weight:900;box-shadow:0 4px 14px rgba(37,99,235,.35)}}.shared-app-brand div,.shared-app-context{{min-width:0}}.shared-app-brand strong,.shared-app-brand small{{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-brand strong{{font-size:15px}}.shared-app-brand small{{margin-top:4px;color:#93c5fd;font-size:11px}}.shared-app-nav{{display:flex;align-items:center;justify-content:center;gap:6px;min-width:0;overflow:hidden}}.shared-app-nav span{{height:34px;display:inline-flex;align-items:center;padding:0 13px;border:1px solid rgba(147,197,253,.2);border-radius:6px;background:rgba(9,30,57,.62);color:#bfd7f5;font-size:12px;white-space:nowrap}}.shared-app-nav span.active{{background:#2563eb;border-color:#60a5fa;color:white;box-shadow:inset 0 -3px 0 #f59e0b}}.shared-app-context{{display:grid;grid-template-columns:1fr auto;align-items:center;column-gap:9px;text-align:right}}.shared-app-context span{{grid-column:1/3;color:#93c5fd;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-context strong{{margin-top:3px;color:#fef3c7;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.shared-app-context em{{margin-top:3px;color:#7dd3fc;font-size:10px;font-style:normal;white-space:nowrap}}.shared-app-main{{min-height:0;overflow:hidden;position:relative}}.shared-app-main .screen-root{{width:100%!important;height:100%!important;min-height:0!important;max-height:100%!important;overflow:hidden!important}}.shared-app-main .screen-root>header:first-child,.shared-app-main .screen-root>.topbar:first-child,.shared-app-main .screen-root>.mobile-header:first-child,.shared-app-main .screen-root>.app-header:first-child{{display:none!important}}.shared-app-main .screen-root:has(>.mobile-header:first-child){{grid-template-rows:minmax(0,1fr) 78px!important}}@media(max-width:980px){{.shared-app-header{{grid-template-columns:minmax(220px,1fr) auto;padding:0 14px}}.shared-app-nav{{justify-content:flex-end}}.shared-app-nav span{{padding:0 9px}}.shared-app-context{{display:none}}}}.shared-app-shell-mobile_app{{grid-template-rows:72px minmax(0,1fr)}}.shared-app-shell-mobile_app .shared-app-header{{grid-template-columns:minmax(210px,1fr) minmax(300px,1.4fr);gap:10px;padding:0 16px}}.shared-app-shell-mobile_app .shared-app-context{{display:none}}.shared-app-shell-mobile_app .shared-app-nav{{justify-content:flex-end;overflow:hidden}}.shared-app-shell-mobile_app .shared-app-nav span{{padding:0 9px;font-size:11px}}.screen-root{{width:100%;height:100%;overflow:hidden}}
 '''
     return base + '''
 .shared-app-shell{background:var(--shell-canvas,#f4fbf8);}
+.shared-app-header{grid-template-columns:minmax(260px,340px) minmax(0,1fr) minmax(160px,220px);gap:14px;}
+.shared-app-context{width:100%;min-width:0;display:flex;align-items:center;justify-content:flex-end;overflow:visible;}
+.shared-app-context strong,.shared-app-context em{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-app-nav span[data-navigation-page-key]:not([data-navigation-page-key=""]),.shared-app-back,.shared-app-breadcrumb span[data-navigation-page-key]:not([data-navigation-page-key=""]),.shared-app-secondary span[data-navigation-page-key]:not([data-navigation-page-key=""]){cursor:pointer;}
+@media(max-width:1180px){.shared-app-header{grid-template-columns:minmax(230px,300px) minmax(0,1fr) minmax(130px,180px);gap:10px}.shared-app-context em{display:none}.shared-app-context span{grid-column:1/3}}
 .shared-app-header{background:var(--shell-sidebar,#123c40);border-bottom-color:color-mix(in srgb,var(--shell-accent,#0f766e) 58%,#fff);box-shadow:0 5px 16px rgba(15,23,42,.18);}
 .shared-app-mark{border-radius:6px;background:var(--shell-accent,#0f766e);box-shadow:none;}
 .shared-app-brand small,.shared-app-context span,.shared-app-context em{color:color-mix(in srgb,var(--shell-accent-soft,#ecfdf5) 78%,#fff);}
@@ -1636,7 +2030,38 @@ def _shared_app_shell_css(mobile_css: str) -> str:
 .shared-app-sidebar .shared-app-context{display:block;padding-top:12px;border-top:1px solid rgba(255,255,255,.16);text-align:left;}
 .shared-app-sidebar .shared-app-context span,.shared-app-sidebar .shared-app-context strong,.shared-app-sidebar .shared-app-context em{display:block;margin:0 0 5px;white-space:normal;line-height:1.35;}
 .shared-app-sidebar .shared-app-context em{display:none;}
-.shared-app-shell[data-nav-model="side_menu"]>.shared-app-main{grid-column:2;grid-row:1;}
+.shared-app-workspace{min-width:0;min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr);overflow:hidden;background:var(--shell-canvas,#f4fbf8);}
+.shared-app-shell[data-nav-model="side_menu"]>.shared-app-workspace{grid-column:2;grid-row:1;}
+.shared-app-hierarchy{min-height:72px;display:grid;grid-template-columns:minmax(240px,.9fr) minmax(360px,1.35fr);align-items:center;gap:18px;padding:9px 18px;border-bottom:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 14%,#fff);background:color-mix(in srgb,var(--shell-canvas,#f4fbf8) 46%,#fff);box-shadow:0 3px 10px rgba(15,23,42,.07);z-index:12;}
+.shared-app-hierarchy-main{min-width:0;display:grid;gap:7px;align-content:center;}
+.shared-app-back{width:max-content;max-width:100%;display:inline-flex;align-items:center;padding:3px 8px;border:1px solid color-mix(in srgb,var(--shell-accent,#0f766e) 28%,#fff);border-radius:4px;background:var(--shell-accent-soft,#ecfdf5);color:var(--shell-accent,#0f766e);font-size:10px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-app-breadcrumb{min-width:0;display:flex;align-items:center;gap:7px;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 72%,#64748b);font-size:11px;overflow:hidden;white-space:nowrap;}
+.shared-app-breadcrumb span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-app-breadcrumb span:last-of-type{color:color-mix(in srgb,var(--shell-sidebar,#123c40) 92%,#111827);font-weight:700;}
+.shared-app-breadcrumb i{color:color-mix(in srgb,var(--shell-sidebar,#123c40) 32%,#cbd5e1);font-style:normal;}
+.shared-app-secondary{min-width:0;display:flex;align-items:center;justify-content:flex-end;gap:5px;overflow:hidden;}
+.shared-app-secondary span{height:31px;min-width:0;display:inline-flex;align-items:center;padding:0 11px;border:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 16%,#fff);border-radius:5px;background:#fff;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 66%,#475569);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.shared-app-secondary span.active{border-color:var(--shell-accent,#0f766e);background:var(--shell-accent-soft,#ecfdf5);color:var(--shell-accent,#0f766e);font-weight:800;}
+.shared-app-secondary-rail{padding-left:10px;border-left:3px solid var(--shell-accent,#0f766e);}
+.shared-app-secondary-rail span{border-radius:2px;}
+.shared-app-secondary-segmented{gap:0;padding:3px;border-radius:7px;background:color-mix(in srgb,var(--shell-sidebar,#123c40) 8%,#fff);}
+.shared-app-secondary-segmented span{border:0;background:transparent;}
+.shared-app-secondary-segmented span.active{background:#fff;box-shadow:0 2px 7px rgba(15,23,42,.12);}
+.shared-app-mobile-nav{display:none;}
+.shared-app-shell-mobile_app,.shared-app-shell-game{grid-template-columns:minmax(0,1fr);grid-template-rows:72px minmax(0,1fr) 70px;}
+.shared-app-shell-mobile_app>.shared-app-workspace,.shared-app-shell-game>.shared-app-workspace{grid-column:1;grid-row:2;}
+.shared-app-mobile-header{grid-column:1;grid-row:1;grid-template-columns:minmax(0,1fr) minmax(150px,.7fr)!important;}
+.shared-app-mobile-header .shared-app-context{display:grid!important;}
+.shared-app-mobile-header .shared-app-context em{display:none;}
+.shared-app-mobile-nav{grid-column:1;grid-row:3;display:block;min-height:0;padding:8px 14px;background:#fff;border-top:1px solid color-mix(in srgb,var(--shell-sidebar,#123c40) 14%,#fff);box-shadow:0 -5px 16px rgba(15,23,42,.08);z-index:18;}
+.shared-app-mobile-nav .shared-app-nav{height:100%;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;overflow:visible;}
+.shared-app-mobile-nav .shared-app-nav span{height:46px;justify-content:center;padding:0 5px;border:0;border-radius:8px;background:transparent;color:color-mix(in srgb,var(--shell-sidebar,#123c40) 62%,#64748b);font-size:11px;}
+.shared-app-mobile-nav .shared-app-nav span.active{background:var(--shell-accent-soft,#ecfdf5);color:var(--shell-accent,#0f766e);box-shadow:inset 0 -3px 0 var(--shell-accent,#0f766e);font-weight:800;}
+.shared-app-shell-mobile_app .shared-app-hierarchy,.shared-app-shell-game .shared-app-hierarchy{min-height:86px;grid-template-columns:1fr;gap:6px;padding:8px 14px;}
+.shared-app-shell-mobile_app .shared-app-hierarchy-main,.shared-app-shell-game .shared-app-hierarchy-main{grid-template-columns:auto minmax(0,1fr);align-items:center;gap:9px;}
+.shared-app-shell-mobile_app .shared-app-secondary,.shared-app-shell-game .shared-app-secondary{justify-content:flex-start;}
+.shared-app-shell-mobile_app .shared-app-secondary span,.shared-app-shell-game .shared-app-secondary span{flex:1;justify-content:center;padding:0 6px;}
+@media(max-width:980px){.shared-app-hierarchy{grid-template-columns:minmax(200px,.8fr) minmax(300px,1.2fr);padding-left:12px;padding-right:12px}.shared-app-secondary span{padding:0 7px}}
 '''
 
 
@@ -1924,24 +2349,31 @@ def _stable_login_body(task: GenerationTask, blueprint: ProductBlueprint, shell_
 def _stable_dashboard_body(task: GenerationTask, blueprint: ProductBlueprint, shell_spec: dict[str, Any]) -> str:
     modules = (getattr(blueprint, "modules", []) or [])[:4]
     metrics = _metric_items(blueprint)
+    primary_module = modules[0] if modules else None
+    map_labels = _stable_map_labels(primary_module, modules)
+    quick_actions = [
+        _stable_actions(module)[0] if _stable_actions(module) else f"查看{_stable_subject(module)}"
+        for module in modules
+    ]
     return f"""
 <section class="stable-workspace rows-main">
   <div class="metric-row">{''.join(_metric_card(name, value) for name, value in metrics[:4])}</div>
   <div class="stable-grid cols-3">
-    <section class="stable-card"><div class="stable-card-h"><b>当前运行记录</b><span>实时接入</span></div>{_runtime_panel(modules[0] if modules else None)}</section>
-    <section class="stable-card"><div class="stable-card-h"><b>设备分布与风险态势</b><span>矿区地图</span></div><div class="stable-map"><span class="map-pin p1">主井提升</span><span class="map-pin p2">皮带运输</span><span class="map-pin p3">温升告警</span><span class="map-pin p4">巡检完成</span></div></section>
-    <section class="stable-card"><div class="stable-card-h"><b>处置快捷入口</b><span>待办</span></div><div class="stable-actions" style="padding:12px">{''.join(f'<button class="opbtn">{escape(_clip(module.title, 8))}</button>' for module in modules)}<button class="opbtn primary">生成工单</button><button class="opbtn">审计记录</button></div><div class="operation-result" style="margin:12px">处理结果：记录 KS-2026-1001 已进入“待复核”状态，系统同步写入操作日志并刷新统计口径。</div></section>
+    <section class="stable-card"><div class="stable-card-h"><b>当前{escape(_stable_subject(primary_module))}</b><span>实时更新</span></div>{_runtime_panel(primary_module)}</section>
+    <section class="stable-card"><div class="stable-card-h"><b>{escape(_stable_subject(primary_module))}分布与运行态势</b><span>当前范围</span></div><div class="stable-map">{''.join(f'<span class="map-pin p{index + 1}">{escape(_clip(label, 8))}</span>' for index, label in enumerate(map_labels[:4]))}</div></section>
+    <section class="stable-card"><div class="stable-card-h"><b>快捷操作</b><span>当前可用</span></div><div class="stable-actions" style="padding:12px">{''.join(f'<button class="opbtn{ " primary" if index == 0 else ""}">{escape(_clip(action, 8))}</button>' for index, action in enumerate(quick_actions))}</div><div class="operation-result" style="margin:12px">{escape(_stable_result_text(primary_module, quick_actions[0] if quick_actions else '查看'))}</div></section>
   </div>
   <section class="stable-card table-frame"><div class="stable-card-h"><b>核心模块运行明细</b><span>最近更新</span></div>{_stable_table(blueprint, modules, max_rows=3)}</section>
 </section>"""
 
 
 def _stable_module_body(task: GenerationTask, blueprint: ProductBlueprint, module: FeatureModule | None, title: str, shell_spec: dict[str, Any]) -> str:
+    labels = _stable_map_labels(module, [module] if module else [])
     return f"""
 <section class="stable-workspace">
   <div class="stable-grid cols-2" style="height:100%">
-    <section class="stable-card"><div class="stable-card-h"><b>{escape(title)}</b><span>档案与状态</span></div>{_runtime_panel(module)}<div class="operation-result" style="margin:10px">处理结果：记录 KS-2026-1001 已进入“监测中”状态，系统同步写入操作日志并刷新统计口径。</div></section>
-    <section class="stable-card"><div class="stable-card-h"><b>趋势与定位</b><span>设备拓扑</span></div><div class="stable-map"><span class="map-pin p1">采集网关</span><span class="map-pin p2">风险点</span><span class="map-pin p3">待维护</span></div></section>
+    <section class="stable-card"><div class="stable-card-h"><b>{escape(title)}</b><span>信息与状态</span></div>{_runtime_panel(module)}<div class="operation-result" style="margin:10px">{escape(_stable_result_text(module, '查看'))}</div></section>
+    <section class="stable-card"><div class="stable-card-h"><b>趋势与关联</b><span>{escape(_stable_subject(module))}视图</span></div><div class="stable-map">{''.join(f'<span class="map-pin p{index + 1}">{escape(_clip(label, 8))}</span>' for index, label in enumerate(labels[:4]))}</div></section>
     <section class="stable-card table-frame" style="grid-column:1 / 3"><div class="stable-card-h"><b>业务数据列表</b><span>查询结果</span></div>{_stable_table(blueprint, [module] if module else [], max_rows=4)}</section>
   </div>
 </section>"""
@@ -1958,7 +2390,7 @@ def _stable_operation_body(
 ) -> str:
     action = str(getattr(screenshot, "interaction_action", "") or "处理")
     mode = str(getattr(screenshot, "interaction_mode", "") or "workflow")
-    fields = list(getattr(module, "data_fields", []) or ["业务编号", "业务名称", "处理状态", "责任人员"])[:6]
+    fields = list(getattr(module, "data_fields", []) or [f"{_stable_subject(module)}编号", f"{_stable_subject(module)}名称", "处理状态", "责任人员"])[:6]
     if mode == "query":
         filters = "".join(
             f'<label>{escape(_clip(field, 12))}<input value="{escape(_sample_value(getattr(module, "title", ""), field, index))}" /></label>'
@@ -1978,7 +2410,7 @@ def _stable_operation_body(
 <section class="stable-workspace">
   <div class="stable-grid cols-2" style="height:100%">
     <section class="stable-card"><div class="stable-card-h"><b>{escape(title)}</b><span>字段维护</span></div><div class="stable-form">{form_fields}</div><div class="stable-actions" style="padding:0 12px 12px"><button class="opbtn primary">保存{escape(action)}</button><button class="opbtn">取消</button></div></section>
-    <section class="stable-card"><div class="stable-card-h"><b>校验与保存结果</b><span>即时检查</span></div>{_runtime_panel(module)}<div class="operation-result" style="margin:10px">保存结果：必填字段已通过校验，记录状态已更新并写入操作日志。</div></section>
+    <section class="stable-card"><div class="stable-card-h"><b>校验与保存结果</b><span>即时检查</span></div>{_runtime_panel(module)}<div class="operation-result" style="margin:10px">保存结果：必填字段已通过校验，{escape(_stable_subject(module))}状态与更新时间已同步保存。</div></section>
   </div>
 </section>"""
     if mode == "import":
@@ -2005,12 +2437,12 @@ def _stable_operation_body(
   <div class="stable-grid cols-2"><section class="stable-card"><div class="stable-card-h"><b>{escape(title)}</b><span>近 30 日</span></div><div class="chart-bars"><i style="height:48%"></i><i style="height:66%"></i><i style="height:58%"></i><i style="height:82%"></i><i style="height:72%"></i></div></section><section class="stable-card"><div class="stable-card-h"><b>分组结果</b><span>单位：条 / %</span></div>{_runtime_panel(module)}</section></div>
   <section class="stable-card table-frame"><div class="stable-card-h"><b>统计明细</b><span>当前范围</span></div>{_stable_table(blueprint, [module] if module else [], max_rows=3)}<div class="operation-result" style="margin:8px 12px">统计结果：指标和趋势已按当前范围刷新，可继续导出统计快照。</div></section>
 </section>"""
-    operations = list(getattr(module, "operations", []) or ["登记", "校验", "分析", "确认", "归档"])[:6]
+    operations = _stable_actions(module) or ["查看", "更新", "确认", "完成"]
     return f"""
 <section class="stable-workspace">
   <div class="stable-grid cols-2" style="height:100%">
-    <section class="stable-card"><div class="stable-card-h"><b>{escape(title)}</b><span>操作处理</span></div>{_runtime_panel(module)}<div class="stable-actions" style="padding:0 10px 10px">{''.join(f'<button class="opbtn{ " primary" if i == 0 else ""}">{escape(_clip(op, 8))}</button>' for i, op in enumerate(operations))}</div><div class="operation-result" style="margin:0 10px 10px">处理结果：记录 KS-2026-1001 已进入“待复核”状态，系统同步写入操作日志并刷新统计口径。</div></section>
-    <section class="stable-card"><div class="stable-card-h"><b>处理流程轨迹</b><span>审计留痕</span></div><div class="chart-bars"><i style="height:68%"></i><i style="height:82%"></i><i style="height:54%"></i><i style="height:76%"></i><i style="height:62%"></i></div>{_stable_table(blueprint, [module] if module else [], max_rows=3)}</section>
+    <section class="stable-card"><div class="stable-card-h"><b>{escape(title)}</b><span>操作处理</span></div>{_runtime_panel(module)}<div class="stable-actions" style="padding:0 10px 10px">{''.join(f'<button class="opbtn{ " primary" if i == 0 else ""}">{escape(_clip(op, 8))}</button>' for i, op in enumerate(operations[:6]))}</div><div class="operation-result" style="margin:0 10px 10px">{escape(_stable_result_text(module, action))}</div></section>
+    <section class="stable-card"><div class="stable-card-h"><b>处理流程轨迹</b><span>结果记录</span></div><div class="chart-bars"><i style="height:68%"></i><i style="height:82%"></i><i style="height:54%"></i><i style="height:76%"></i><i style="height:62%"></i></div>{_stable_table(blueprint, [module] if module else [], max_rows=3)}</section>
   </div>
 </section>"""
 
@@ -2029,12 +2461,108 @@ def _stable_statistics_body(task: GenerationTask, blueprint: ProductBlueprint, s
 
 
 def _runtime_panel(module: FeatureModule | None) -> str:
-    title = getattr(module, "title", "") or "运行监测"
-    fields = list(getattr(module, "data_fields", []) or ["设备编号", "设备名称", "运行状态", "维护人员"])[:4]
+    title = getattr(module, "title", "") or "当前事项"
+    subject = _stable_subject(module)
+    fields = list(getattr(module, "data_fields", []) or [f"{subject}编号", f"{subject}名称", "当前状态", "责任人员"])[:4]
     return "<div class=\"runtime-record-panel\">" + "".join(
-        f"<div><span>{escape(_clip(field, 12))}</span><b data-runtime-field=\"{escape(key)}\">{escape(_sample_value(title, field, index))}</b></div>"
+        f"<div><span>{escape(_clip(field, 12))}</span><b data-runtime-field=\"{escape(key)}\">{escape(_stable_sample_value(module, title, field, index))}</b></div>"
         for index, (field, key) in enumerate(zip(fields, ["code", "name", "scope", "status"]))
     ) + "</div>"
+
+
+def _stable_specs(module: FeatureModule | None, action: str = "") -> list[dict[str, Any]]:
+    specs = [spec for spec in (getattr(module, "operation_specs", []) or []) if isinstance(spec, dict)]
+    action_text = str(action or "").strip()
+    if not action_text:
+        return specs
+    matched = []
+    for spec in specs:
+        label = str(spec.get("label") or spec.get("action") or spec.get("name") or "").strip()
+        if label and (action_text in label or label in action_text):
+            matched.append(spec)
+    return matched or specs
+
+
+def _stable_subject(module: FeatureModule | None) -> str:
+    title = str(getattr(module, "title", "") or "").strip()
+    for suffix in ("智能管理平台", "管理平台", "管理系统", "信息系统", "工作台", "管理", "平台", "系统", "模块"):
+        if title.endswith(suffix) and len(title) > len(suffix) + 1:
+            title = title[: -len(suffix)].strip()
+            break
+    return _clip(title or "事项", 12)
+
+
+def _stable_actions(module: FeatureModule | None) -> list[str]:
+    actions: list[str] = []
+    for spec in _stable_specs(module):
+        value = str(spec.get("label") or spec.get("action") or spec.get("name") or "").strip()
+        if value and value not in actions:
+            actions.append(value)
+    for value in getattr(module, "operations", []) or []:
+        text = str(value or "").strip()
+        if text and not text.startswith("{") and text not in actions:
+            actions.append(text)
+    return actions[:6]
+
+
+def _stable_states(module: FeatureModule | None) -> list[str]:
+    states: list[str] = []
+    for spec in _stable_specs(module):
+        for key in ("pre_state", "preState", "post_state", "postState"):
+            value = str(spec.get(key) or "").strip()
+            if value and value not in states and len(value) <= 14:
+                states.append(value)
+    return states[:4] or ["待确认", "进行中", "已完成"]
+
+
+def _stable_result_text(module: FeatureModule | None, action: str) -> str:
+    states = _stable_states(module)
+    status = states[-1]
+    evidence = ""
+    for spec in _stable_specs(module, action):
+        evidence = str(spec.get("result_evidence") or spec.get("resultEvidence") or "").strip()
+        if evidence:
+            break
+    evidence = _clip(evidence or f"{_stable_subject(module)}状态和更新时间", 24)
+    return f"{action}结果：{_stable_code(module, 1)} 已进入“{status}”状态，{evidence}已保存。"
+
+
+def _stable_code(module: FeatureModule | None, index: int) -> str:
+    key = re.sub(r"[^A-Za-z0-9]", "", str(getattr(module, "key", "") or "").upper())[:4]
+    if len(key) < 2:
+        key = f"YW{sum(ord(char) for char in _stable_subject(module)) % 97:02d}"
+    return f"{key}-{1000 + index}"
+
+
+def _stable_sample_value(module: FeatureModule | None, title: str, field: str, index: int) -> str:
+    label = str(field or "")
+    if re.search(r"编号|编码|单号|代码|ID", label, re.I):
+        return _stable_code(module, index + 1)
+    if re.search(r"名称|标题|对象|事项", label):
+        return f"{_stable_subject(module)}{index + 1}"
+    if re.search(r"状态|进度", label):
+        states = _stable_states(module)
+        return states[index % len(states)]
+    if re.search(r"人员|角色|岗位|责任", label):
+        for spec in _stable_specs(module):
+            role = str(spec.get("role") or "").strip()
+            if role:
+                return role
+        return "责任人员"
+    if re.search(r"时间|日期|更新", label):
+        return "2026-07-10 10:30"
+    return _sample_value(title, field, index)
+
+
+def _stable_map_labels(module: FeatureModule | None, modules: list[FeatureModule | None]) -> list[str]:
+    values = [str(item) for item in (getattr(module, "entities", []) or []) if str(item).strip()]
+    values.extend(str(item) for item in (getattr(module, "data_fields", []) or []) if str(item).strip())
+    values.extend(str(getattr(item, "title", "") or "") for item in modules if getattr(item, "title", ""))
+    unique: list[str] = []
+    for value in values:
+        if value and value not in unique:
+            unique.append(value)
+    return unique[:4] or [f"{_stable_subject(module)}范围", "当前状态", "更新时间", "处理结果"]
 
 
 def _stable_table(blueprint: ProductBlueprint, modules: list[FeatureModule | None], *, max_rows: int = 5) -> str:
@@ -2042,16 +2570,20 @@ def _stable_table(blueprint: ProductBlueprint, modules: list[FeatureModule | Non
     source_modules = [module for module in modules if module] or list(getattr(blueprint, "modules", []) or [])[:5]
     for index, module in enumerate(source_modules[:max(1, max_rows)], start=1):
         status_class = ["green", "orange", "red"][index % 3]
-        status = ["正常", "待复核", "未开始"][index % 3]
+        states = _stable_states(module)
+        status = states[index % len(states)]
+        code = _stable_code(module, index)
+        action = (_stable_actions(module) or ["查看"])[0]
         rows.append(
-            f"<tr><td>KS-2026-{1000 + index}</td><td>{escape(_clip(module.title, 16))}</td><td>{escape(_clip((module.data_fields or ['运行状态'])[0], 12))}</td><td><span class=\"tag {status_class}\">{status}</span></td><td>2026-07-10</td><td><button class=\"opbtn\">查看</button></td></tr>"
+            f"<tr><td>{escape(code)}</td><td>{escape(_clip(module.title, 16))}</td><td>{escape(_clip((module.data_fields or ['当前状态'])[0], 12))}</td><td><span class=\"tag {status_class}\">{escape(status)}</span></td><td>2026-07-10</td><td><button class=\"opbtn\">{escape(_clip(action, 8))}</button></td></tr>"
         )
     return f"""<table class="stable-table"><thead><tr><th>编号</th><th>模块</th><th>监测项</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{''.join(rows)}</tbody></table>"""
 
 
 def _metric_items(blueprint: ProductBlueprint) -> list[tuple[str, str]]:
     metrics = list(getattr(blueprint, "report_metrics", []) or [])[:4]
-    defaults = ["在线设备", "异常告警", "维护完成率", "预测准确率"]
+    subject = _stable_subject((getattr(blueprint, "modules", []) or [None])[0])
+    defaults = [f"{subject}数量", f"{subject}进行中", f"{subject}完成率", f"{subject}更新时间"]
     names = (metrics + defaults)[:4]
     values = ["128", "6", "92.6%", "96.8%"]
     return list(zip(names, values))
@@ -2102,6 +2634,26 @@ def generate_style_reference_assets(
         return {"enabled": False, "ready": False, "source": "local-template", "pages": []}
     if not screenshots:
         raise RuntimeError("全局视觉风格参考图缺少页面清单。")
+    if getattr(task, "resume_existing_output", False) and str(getattr(task, "resume_stage", "") or "") in {
+        "manual",
+        "manual_docx",
+        "source_doc",
+        "source_docx",
+        "pdf",
+        "info",
+        "package",
+        "validate",
+        "done",
+    }:
+        recovered = _recover_late_resume_image2_reference(
+            task=task,
+            ui_blueprint=ui_blueprint,
+            screenshots=screenshots,
+            provider=provider,
+        )
+        if recovered:
+            _emit(emit, 43, "复用截图阶段保留的 gpt-image-2 视觉参考候选")
+            return recovered
     module_by_key = {module.key: module for module in blueprint.modules}
     design_brief = getattr(ui_blueprint, "design_brief", {}) or {}
     context = _codegen_context(task, blueprint, ui_blueprint)
@@ -2523,6 +3075,37 @@ gpt-image-2 全局视觉风格参考图：
 """.strip()
 
 
+def _load_reusable_visual_prompt(
+    prompt_path: Path, *, cache_key: str, reference_page_key: str, image_size: str,
+) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(prompt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(payload, dict) or not cache_key:
+        return None
+    if any(payload.get(key) != value for key, value in {
+        "cache_key": cache_key,
+        "mode": "style_reference",
+        "reference_page_key": reference_page_key,
+        "image_size": image_size,
+    }.items()):
+        return None
+    data = payload.get("prompt")
+    if not isinstance(data, dict) or not isinstance(data.get("visual_prompt"), str):
+        return None
+    if len(data["visual_prompt"].strip()) < 180:
+        return None
+    tokens = data.get("visual_tokens", [])
+    if not isinstance(tokens, list) or any(not isinstance(token, str) for token in tokens):
+        return None
+    try:
+        _validate_image_prompt_text(data["visual_prompt"])
+    except ValueError:
+        return None
+    return data
+
+
 def _generate_visual_reference_assets(
     *,
     task: GenerationTask,
@@ -2577,23 +3160,31 @@ def _generate_visual_reference_assets(
     item = _select_style_reference_screenshot(screenshots)
     page_key = "style_reference"
     reference_page_key = str(getattr(item, "key", "") or "page_1")
-    _emit(emit, 42, "生成全局视觉风格提示词")
     module = module_by_key.get(str(getattr(item, "module_key", "") or ""))
     image_path = visual_dir / "style_reference.png"
     prompt_path = visual_dir / "style_reference.prompt.json"
     try:
-        prompt_data = _generate_visual_prompt(
-            task=task,
-            blueprint=blueprint,
-            ui_blueprint=ui_blueprint,
-            provider=provider,
-            screenshot=item,
-            module=module,
-            context=context,
-            design_brief=design_brief,
-            index=1,
-            total=1,
+        prompt_data = _load_reusable_visual_prompt(
+            prompt_path, cache_key=cache_key,
+            reference_page_key=reference_page_key, image_size=image_size,
         )
+        if prompt_data is not None:
+            _emit(emit, 42, "复用已保存的全局视觉风格提示词")
+            trace_event("ai_visual_prompt_reused", page_key=reference_page_key, cache_key=cache_key)
+        else:
+            _emit(emit, 42, "生成全局视觉风格提示词")
+            prompt_data = _generate_visual_prompt(
+                task=task,
+                blueprint=blueprint,
+                ui_blueprint=ui_blueprint,
+                provider=provider,
+                screenshot=item,
+                module=module,
+                context=context,
+                design_brief=design_brief,
+                index=1,
+                total=1,
+            )
         prompt_text = _style_reference_prompt_text(
             prompt_data,
             task=task,
@@ -2646,6 +3237,8 @@ def _generate_visual_reference_assets(
             "image_model": image_meta.get("model", ""),
             "image_size": image_meta.get("size", image_size),
             "image_source": image_meta.get("source", ""),
+            "image_request_attempts": image_meta.get("attempts", 0),
+            "image_request_elapsed_seconds": image_meta.get("elapsed_seconds", 0),
             "image_quality": image_meta.get("image_quality", {}),
             "prompt_summary": _prompt_summary(prompt_data),
             "ready": image_path.exists() and image_path.stat().st_size > 1024,
@@ -2744,7 +3337,7 @@ def _visual_reference_cache_key(task: GenerationTask, ui_blueprint: UiBlueprint,
     identity = design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {}
     experience = design_brief.get("product_experience_spec") if isinstance(design_brief, dict) else {}
     payload = {
-        "cache_contract": "style-identity-v2",
+        "cache_contract": "style-identity-v3",
         "creative_seed": str(getattr(task, "seed", "") or ""),
         "software_name": str(getattr(task, "software_name", "") or ""),
         "product_type": str(getattr(task, "product_type", "") or ""),
@@ -2805,6 +3398,119 @@ def _write_visual_reference_manifest(visual_dir: Path, report: dict[str, Any]) -
     (visual_dir / "visual-reference-manifest.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
+    )
+
+
+def _recover_late_resume_image2_reference(
+    *,
+    task: GenerationTask,
+    ui_blueprint: UiBlueprint,
+    screenshots: list[Any],
+    provider: LLMProvider,
+) -> dict[str, Any] | None:
+    visual_dir = _visual_reference_dir(screenshots)
+    image_size = _visual_reference_size(str(getattr(ui_blueprint, "renderer", "") or "admin"))
+    renderer = str(getattr(ui_blueprint, "renderer", "") or "admin")
+    candidates = [visual_dir / "style_reference.rejected.png", visual_dir / "style_reference.png"]
+    selected: Path | None = None
+    image_meta: dict[str, Any] = {}
+    width = 0
+    height = 0
+    for candidate in candidates:
+        if not candidate.is_file() or candidate.stat().st_size <= 1024:
+            continue
+        width, height = _image_dimensions(candidate)
+        orientation_ready = width > height if renderer == "admin" else height > width
+        if not orientation_ready:
+            continue
+        try:
+            image_meta = _inspect_generated_image(candidate.read_bytes())
+        except Exception as exc:
+            if not _late_resume_screenshot_checkpoint_ready(visual_dir, len(screenshots)):
+                continue
+            image_meta = {
+                "image_quality": {
+                    "ready": True,
+                    "recovered_after_prior_quality_false_negative": True,
+                    "original_error": sanitize_error_message(exc, limit=240),
+                }
+            }
+        selected = candidate
+        break
+    if selected is None:
+        return None
+    visual_dir.mkdir(parents=True, exist_ok=True)
+    image_path = visual_dir / "style_reference.png"
+    if selected.resolve() != image_path.resolve():
+        shutil.copy2(selected, image_path)
+    prompt_path = visual_dir / "style_reference.recovered.json"
+    prompt_path.write_text(
+        json.dumps(
+            {
+                "mode": "late-resume-image2-recovery",
+                "software_name": str(getattr(task, "software_name", "") or ""),
+                "renderer": renderer,
+                "image_size": image_size,
+                "source_file": selected.name,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    page_report = {
+        "key": "style_reference",
+        "mode": "style_reference",
+        "reference_page_key": "dashboard",
+        "page_kind": "dashboard",
+        "module_key": "",
+        "applies_to_page_count": len(screenshots),
+        "prompt_path": str(prompt_path),
+        "image_path": str(image_path),
+        "image_sha256": _sha256_file(image_path),
+        "image_width": width,
+        "image_height": height,
+        "image_model": _configured_image_model(provider),
+        "image_size": image_size,
+        "image_source": "recovered_prior_image2_candidate",
+        "image_quality": image_meta.get("image_quality", {}),
+        "prompt_summary": {"recovered": True, "renderer": renderer},
+        "ready": True,
+        "recovered_from_prior_image2_candidate": True,
+    }
+    report = _visual_reference_report(
+        visual_dir=visual_dir,
+        pages=[page_report],
+        total=len(screenshots),
+        image_size=image_size,
+        cache_key=_visual_reference_cache_key(task, ui_blueprint, len(screenshots), image_size),
+        provider=provider,
+    )
+    report["recovered_from_prior_image2_candidate"] = True
+    _write_visual_reference_manifest(visual_dir, report)
+    trace_event(
+        "ai_visual_reference_late_resume_recovered",
+        renderer=renderer,
+        image_width=width,
+        image_height=height,
+        source_file=selected.name,
+    )
+    return report
+
+
+def _late_resume_screenshot_checkpoint_ready(visual_dir: Path, expected_count: int) -> bool:
+    try:
+        output_dir = visual_dir.parents[2]
+    except IndexError:
+        return False
+    checkpoint = _read_json_dict(output_dir / "ui_screenshots" / "screenshot-checkpoint.json")
+    pages = checkpoint.get("pages") if isinstance(checkpoint, dict) else None
+    if not isinstance(pages, dict) or len(pages) != int(expected_count or 0):
+        return False
+    return all(
+        (output_dir / "ui_screenshots" / f"{page_key}.png").is_file()
+        and (output_dir / "ui_screenshots" / f"{page_key}.png").stat().st_size > 1024
+        for page_key in pages
     )
 
 
@@ -2997,7 +3703,7 @@ def _image_prompt_text(
     if is_module_page:
         parts.append(
             "桌面软件骨架：顶部项目栏、左侧深色模块导航、筛选工具栏、主操作按钮、业务数据表格、指标卡片、流程或图表面板必须清晰可见。"
-            "地图、三维场景或遥感影像只能作为其中一个业务卡片内的视窗，周围必须有表格、按钮、状态标签和操作日志。"
+            "地图、三维场景或遥感影像只能作为其中一个业务卡片内的视窗，周围必须有表格、按钮、状态标签和操作结果。"
         )
     parts.append("画面要求：仅生成一张运行中的软件界面截图，首屏完整铺满画面，有真实控件边界、导航、表格/图表/表单/地图/面板、按钮、状态标签和业务数据。")
     parts.append("画面内容限定：只呈现该软件自身的业务菜单、字段、数值、流程状态、操作按钮和工作区内容。")
@@ -3030,7 +3736,15 @@ def _style_reference_prompt_text(
         if str(item).strip()
     )
     business_terms = _image_prompt_business_terms(blueprint=blueprint, module=module)
-    if renderer in {"mobile_app", "game"}:
+    subtype_key = str(design_brief.get("industry_subtype_key") or "") if isinstance(design_brief, dict) else ""
+    design_viewer = subtype_key == "design_viewer"
+    if design_viewer:
+        skeleton = (
+            "横向桌面设计文件浏览器必须占满画面，使用紧凑的文档标签栏、返回与刷新工具、应用内资源路径/搜索栏、"
+            "左侧团队项目和文件树、中间文件缩略图或设计画布、右侧属性评论版本检查器以及底部缩放状态；"
+            "界面要像真实可操作的设计资源浏览与评审软件，禁止手机底部导航、营销卡片墙和大段功能说明。"
+        )
+    elif renderer in {"mobile_app", "game"}:
         skeleton = (
             "手机软件界面必须占满画面，并根据业务自主选择沉浸式工作区、卡片流、分段列表、地图联动或任务面板；"
             "状态栏、导航与主操作的关系要像真实产品，但不要强制复用固定的顶部栏加底部标签骨架。"
@@ -3052,8 +3766,9 @@ def _style_reference_prompt_text(
         parts.append(f"视觉关键词：{tokens}")
     if visual_excerpt:
         parts.append(f"风格细节参考：{visual_excerpt}")
+    forbidden = "代码窗口或教程说明页" if design_viewer else "浏览器地址栏、代码窗口或教程说明页"
     parts.append(
-        "严格禁止生成海报、概念图、纯地图、纯三维场景、空白占位图、问号占位图、浏览器地址栏、代码窗口或教程说明页；"
+        f"严格禁止生成海报、概念图、纯地图、纯三维场景、空白占位图、问号占位图、{forbidden}；"
         "必须有大量横平竖直的软件控件边界。"
     )
     return _limit_image_prompt_text("\n".join(parts), default_limit=860)
@@ -3116,7 +3831,7 @@ def _image_prompt_business_terms(*, blueprint: ProductBlueprint, module: Feature
             continue
         seen.add(text)
         cleaned.append(text)
-    return "、".join(cleaned[:12]) or "业务台账、状态监测、处理记录、统计指标"
+    return "、".join(cleaned[:12]) or "业务清单、状态监测、处理结果、统计指标"
 
 
 def _sanitize_image_prompt_terms(value: str) -> str:
@@ -3461,6 +4176,9 @@ body[data-ai-frontend="true"][data-renderer="admin"] :is(.runtime-record-panel b
 body[data-ai-frontend="true"][data-renderer="admin"] :is(.operation-result){max-width:100%!important;overflow:hidden!important;text-overflow:ellipsis!important;line-height:1.28!important;}
 body[data-ai-frontend="true"][data-renderer="admin"] :is(.map-pin,.map-node,.relation-node,.flow-node) :is(b,strong,span,em){display:block!important;min-width:0!important;max-width:100%!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
 body[data-ai-frontend="true"][data-renderer="admin"][data-page-kind="login"] :is(.left-console,.login-hero,.login-brand) h1{max-width:none!important;font-size:31px!important;line-height:1.15!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
+body[data-ai-frontend="true"] .page-spec-root :is(button,th,td,.detail-item,.workflow-step,.timeline-item,.kanban-column,.mobile-list-item,.operation-result,.map-pin,.graph-node){overflow:visible!important;}
+body[data-ai-frontend="true"] .page-spec-root :is(button,th,td,.detail-item span,.detail-item strong,.workflow-step strong,.workflow-step small,.timeline-item strong,.timeline-item p,.kanban-column strong,.kanban-column article span,.mobile-list-item strong,.mobile-list-item span,.operation-result strong,.operation-result span,.map-pin b,.map-pin small,.graph-node span,.graph-node strong){white-space:normal!important;overflow-wrap:anywhere!important;word-break:break-word!important;text-overflow:clip!important;}
+body[data-ai-frontend="true"] .page-spec-root .page-spec-workspace{overflow:auto!important;}
 """.strip()
     return f"""
 <style id="soft-ai-runtime-guard">
@@ -3519,18 +4237,7 @@ def _reject_direct_image_embedding(html: str) -> None:
 
 
 def _parse_json(content: str) -> dict[str, Any]:
-    cleaned = str(content or "").strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.I).strip()
-        cleaned = re.sub(r"```$", "", cleaned).strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start >= 0 and end > start:
-        cleaned = cleaned[start : end + 1]
-    data = json.loads(cleaned)
-    if not isinstance(data, dict):
-        raise ValueError("AI 前端代码返回值不是 JSON 对象")
-    return data
+    return parse_json_object(content, label="frontend_codegen")
 
 
 def _emit(emit, progress: int, message: str, **extra) -> None:

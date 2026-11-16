@@ -116,6 +116,8 @@ def validate_materials(
         "ui_screenshot_render_mode": str(checks.get("ui_screenshot_render_mode") or ""),
         "ui_screenshot_base_url": str(checks.get("ui_screenshot_base_url") or ""),
         "ui_project_server_started": bool(checks.get("ui_project_server_started")),
+        "ui_project_runtime_route_mode": str(checks.get("ui_project_runtime_route_mode") or ""),
+        "ui_project_runtime_command": str(checks.get("ui_project_runtime_command") or ""),
         "ui_runtime_probe_ready": bool(checks.get("ui_runtime_probe_ready")),
         "ui_runtime_probe_count": int(checks.get("ui_runtime_probe_count") or 0),
         "ui_runtime_api_ready": bool(checks.get("ui_runtime_api_ready")),
@@ -131,8 +133,16 @@ def validate_materials(
         "ui_screenshot_tech_leak_hits": str(checks.get("ui_screenshot_tech_leak_hits") or ""),
         "ui_visible_text_clean": bool(checks.get("ui_visible_text_clean")),
         "ui_visible_text_placeholder_hits": str(checks.get("ui_visible_text_placeholder_hits") or ""),
+        "ui_visible_text_placeholder_details": str(checks.get("ui_visible_text_placeholder_details") or ""),
         "ui_visible_content_summary_ready": bool(checks.get("ui_visible_content_summary_ready")),
         "ui_visible_content_summary_count": int(checks.get("ui_visible_content_summary_count") or 0),
+        "ui_navigation_contract_ready": bool(checks.get("ui_navigation_contract_ready")),
+        "ui_navigation_contract_version": str(checks.get("ui_navigation_contract_version") or ""),
+        "ui_navigation_contract_count": int(checks.get("ui_navigation_contract_count") or 0),
+        "ui_navigation_level_count": int(checks.get("ui_navigation_level_count") or 0),
+        "ui_secondary_navigation_page_count": int(checks.get("ui_secondary_navigation_page_count") or 0),
+        "ui_back_navigation_page_count": int(checks.get("ui_back_navigation_page_count") or 0),
+        "ui_navigation_contract_issues": checks.get("ui_navigation_contract_issues") or [],
         "ui_operation_result_evidence_ready": bool(checks.get("ui_operation_result_evidence_ready")),
         "ui_operation_coverage_ready": bool(checks.get("ui_operation_coverage_ready")),
         "ui_operation_coverage_required_per_module": int(checks.get("ui_operation_coverage_required_per_module") or 0),
@@ -141,6 +151,15 @@ def validate_materials(
         "ui_operation_coverage_missing": checks.get("ui_operation_coverage_missing") or [],
         "ui_chart_context_ready": bool(checks.get("ui_chart_context_ready")),
         "ui_route_topology_ready": bool(checks.get("ui_route_topology_ready")),
+        "ui_route_topology_required": bool(checks.get("ui_route_topology_required")),
+        "ui_domain_profile_key": str(checks.get("ui_domain_profile_key") or ""),
+        "ui_domain_profile_confidence": float(checks.get("ui_domain_profile_confidence") or 0),
+        "ui_domain_profile_source": str(checks.get("ui_domain_profile_source") or ""),
+        "ui_domain_profile_evidence": str(checks.get("ui_domain_profile_evidence") or ""),
+        "ui_domain_profile_weak_evidence": str(checks.get("ui_domain_profile_weak_evidence") or ""),
+        "ui_domain_profile_excluded_evidence": str(checks.get("ui_domain_profile_excluded_evidence") or ""),
+        "ui_domain_gate_keys": str(checks.get("ui_domain_gate_keys") or ""),
+        "ui_domain_gate_reasons": str(checks.get("ui_domain_gate_reasons") or ""),
         "ui_realism_missing_evidence": str(checks.get("ui_realism_missing_evidence") or ""),
         "ui_visual_identity_signature": str(checks.get("ui_visual_identity_signature") or ""),
         "ui_similarity_gate_ready": bool(checks.get("ui_similarity_gate_ready")),
@@ -150,6 +169,16 @@ def validate_materials(
         "ui_package_page_max_similarity": float(checks.get("ui_package_page_max_similarity") or 0),
         "ui_similarity_nearest_hash": str(checks.get("ui_similarity_nearest_hash") or ""),
         "ui_similarity_reason": str(checks.get("ui_similarity_reason") or ""),
+        "ui_page_composition_version": str(checks.get("ui_page_composition_version") or ""),
+        "ui_page_composition_ready": bool(checks.get("ui_page_composition_ready")),
+        "ui_page_composition_count": int(checks.get("ui_page_composition_count") or 0),
+        "ui_page_composition_family_count": int(checks.get("ui_page_composition_family_count") or 0),
+        "ui_page_composition_variant_count": int(checks.get("ui_page_composition_variant_count") or 0),
+        "ui_page_composition_signature_count": int(checks.get("ui_page_composition_signature_count") or 0),
+        "ui_page_composition_diversity_score": float(checks.get("ui_page_composition_diversity_score") or 0),
+        "ui_page_composition_families": checks.get("ui_page_composition_families") or [],
+        "ui_page_composition_duplicate_groups": checks.get("ui_page_composition_duplicate_groups") or [],
+        "ui_page_composition_issues": checks.get("ui_page_composition_issues") or [],
         "ui_ai_frontend_enabled": bool(checks.get("ui_ai_frontend_enabled")),
         "ui_ai_frontend_ready": bool(checks.get("ui_ai_frontend_ready")),
         "ui_ai_frontend_source": str(checks.get("ui_ai_frontend_source") or ""),
@@ -206,6 +235,7 @@ def validate_materials(
         and bool(authenticity["ui_business_facing_screenshots"])
         and bool(authenticity["ui_visible_text_clean"])
         and bool(authenticity["ui_visible_content_summary_ready"])
+        and bool(authenticity["ui_navigation_contract_ready"])
         and bool(authenticity["ui_operation_result_evidence_ready"])
         and bool(authenticity["ui_operation_coverage_ready"])
         and bool(authenticity["ui_chart_context_ready"])
@@ -220,6 +250,7 @@ def validate_materials(
             task.model_provider.lower() in {"local", "local-template", "template", ""}
             or (
                 bool(authenticity["ui_ai_frontend_ready"])
+                and bool(authenticity["ui_page_composition_ready"])
                 and bool(authenticity["ui_shared_confirmation_ready"])
                 and bool(authenticity["ui_visual_prompt_ready"])
                 and bool(authenticity["ui_visual_reference_ready"])
@@ -299,6 +330,11 @@ def validate_materials(
         "manual_result_note_count": int(checks.get("manual_result_note_count") or 0),
         "manual_mechanical_label_count": int(checks.get("manual_mechanical_label_count") or 0),
         "manual_repeated_phrase_count": int(checks.get("manual_repeated_phrase_count") or 0),
+        "manual_generic_sentence_count": int(checks.get("manual_generic_sentence_count") or 0),
+        "manual_generic_sentence_ratio": float(checks.get("manual_generic_sentence_ratio") or 0),
+        "manual_semantic_anchor_count": int(checks.get("manual_semantic_anchor_count") or 0),
+        "manual_semantic_anchor_ratio": float(checks.get("manual_semantic_anchor_ratio") or 0),
+        "manual_template_risk_level": str(checks.get("manual_template_risk_level") or "unknown"),
         "manual_layout_profile": str(checks.get("manual_layout_profile") or ""),
         "manual_figure_paragraph_count": int(checks.get("manual_figure_paragraph_count") or 0),
         "manual_guarded_figure_count": int(checks.get("manual_guarded_figure_count") or 0),
@@ -399,18 +435,35 @@ def validation_checks(validation: dict) -> dict:
         "validation_zip_entries_match_deliverables": bool(normative.get("zip_entries_match_deliverables")),
         "validation_placeholder_hit_count": len(normative.get("placeholder_hits") or []),
         "validation_ui_project_server_started": bool(authenticity.get("ui_project_server_started")),
+        "validation_ui_project_runtime_route_mode": authenticity.get("ui_project_runtime_route_mode", ""),
+        "validation_ui_project_runtime_command": authenticity.get("ui_project_runtime_command", ""),
         "validation_ui_runtime_probe_ready": bool(authenticity.get("ui_runtime_probe_ready")),
         "validation_ui_source_evidence_ready": bool(authenticity.get("ui_source_evidence_ready")),
         "validation_ui_screenshot_render_mode": authenticity.get("ui_screenshot_render_mode", ""),
         "validation_ui_business_facing_screenshots": bool(authenticity.get("ui_business_facing_screenshots")),
         "validation_ui_visible_content_summary_ready": bool(authenticity.get("ui_visible_content_summary_ready")),
         "validation_ui_visible_content_summary_count": authenticity.get("ui_visible_content_summary_count", 0),
+        "validation_ui_navigation_contract_ready": bool(authenticity.get("ui_navigation_contract_ready")),
+        "validation_ui_navigation_contract_version": authenticity.get("ui_navigation_contract_version", ""),
+        "validation_ui_navigation_contract_count": authenticity.get("ui_navigation_contract_count", 0),
+        "validation_ui_navigation_level_count": authenticity.get("ui_navigation_level_count", 0),
+        "validation_ui_secondary_navigation_page_count": authenticity.get("ui_secondary_navigation_page_count", 0),
+        "validation_ui_back_navigation_page_count": authenticity.get("ui_back_navigation_page_count", 0),
         "validation_ui_operation_result_evidence_ready": bool(authenticity.get("ui_operation_result_evidence_ready")),
         "validation_ui_operation_coverage_ready": bool(authenticity.get("ui_operation_coverage_ready")),
         "validation_ui_operation_coverage_required_per_module": authenticity.get("ui_operation_coverage_required_per_module", 0),
         "validation_ui_operation_coverage_min_count": authenticity.get("ui_operation_coverage_min_count", 0),
         "validation_ui_chart_context_ready": bool(authenticity.get("ui_chart_context_ready")),
         "validation_ui_route_topology_ready": bool(authenticity.get("ui_route_topology_ready")),
+        "validation_ui_route_topology_required": bool(authenticity.get("ui_route_topology_required")),
+        "validation_ui_domain_profile_key": authenticity.get("ui_domain_profile_key", ""),
+        "validation_ui_domain_profile_confidence": authenticity.get("ui_domain_profile_confidence", 0),
+        "validation_ui_domain_profile_source": authenticity.get("ui_domain_profile_source", ""),
+        "validation_ui_domain_profile_evidence": authenticity.get("ui_domain_profile_evidence", ""),
+        "validation_ui_domain_profile_weak_evidence": authenticity.get("ui_domain_profile_weak_evidence", ""),
+        "validation_ui_domain_profile_excluded_evidence": authenticity.get("ui_domain_profile_excluded_evidence", ""),
+        "validation_ui_domain_gate_keys": authenticity.get("ui_domain_gate_keys", ""),
+        "validation_ui_domain_gate_reasons": authenticity.get("ui_domain_gate_reasons", ""),
         "validation_ui_realism_missing_evidence": authenticity.get("ui_realism_missing_evidence", ""),
         "validation_ui_visual_identity_signature": authenticity.get("ui_visual_identity_signature", ""),
         "validation_ui_similarity_gate_ready": bool(authenticity.get("ui_similarity_gate_ready")),
@@ -418,6 +471,13 @@ def validation_checks(validation: dict) -> dict:
         "validation_ui_similarity_attempts": authenticity.get("ui_similarity_attempts", 0),
         "validation_ui_layout_role_count": authenticity.get("ui_layout_role_count", 0),
         "validation_ui_similarity_nearest_hash": authenticity.get("ui_similarity_nearest_hash", ""),
+        "validation_ui_page_composition_version": authenticity.get("ui_page_composition_version", ""),
+        "validation_ui_page_composition_ready": bool(authenticity.get("ui_page_composition_ready")),
+        "validation_ui_page_composition_count": authenticity.get("ui_page_composition_count", 0),
+        "validation_ui_page_composition_family_count": authenticity.get("ui_page_composition_family_count", 0),
+        "validation_ui_page_composition_variant_count": authenticity.get("ui_page_composition_variant_count", 0),
+        "validation_ui_page_composition_signature_count": authenticity.get("ui_page_composition_signature_count", 0),
+        "validation_ui_page_composition_diversity_score": authenticity.get("ui_page_composition_diversity_score", 0),
         "validation_ui_shared_confirmation_contract": authenticity.get("ui_shared_confirmation_contract", ""),
         "validation_ui_shared_confirmation_page_count": authenticity.get("ui_shared_confirmation_page_count", 0),
         "validation_ui_shared_confirmation_ready": bool(authenticity.get("ui_shared_confirmation_ready")),
@@ -444,6 +504,11 @@ def validation_checks(validation: dict) -> dict:
         "manual_natural_style_ready": bool(normative.get("manual_natural_style_ready")),
         "manual_mechanical_label_count": normative.get("manual_mechanical_label_count", 0),
         "manual_repeated_phrase_count": normative.get("manual_repeated_phrase_count", 0),
+        "manual_generic_sentence_count": normative.get("manual_generic_sentence_count", 0),
+        "manual_generic_sentence_ratio": normative.get("manual_generic_sentence_ratio", 0),
+        "manual_semantic_anchor_count": normative.get("manual_semantic_anchor_count", 0),
+        "manual_semantic_anchor_ratio": normative.get("manual_semantic_anchor_ratio", 0),
+        "manual_template_risk_level": normative.get("manual_template_risk_level", "unknown"),
         "manual_layout_profile": normative.get("manual_layout_profile", ""),
         "manual_figure_paragraph_count": normative.get("manual_figure_paragraph_count", 0),
         "manual_guarded_figure_count": normative.get("manual_guarded_figure_count", 0),
@@ -665,6 +730,8 @@ def _ui_runtime_manifest(source_info: dict, validation: dict) -> dict:
         "render_mode": authenticity.get("ui_screenshot_render_mode") or source_info.get("ui_screenshot_render_mode", ""),
         "base_url": authenticity.get("ui_screenshot_base_url") or source_info.get("ui_screenshot_base_url", ""),
         "project_server_started": bool(authenticity.get("ui_project_server_started") or source_info.get("ui_project_server_started")),
+        "project_runtime_route_mode": authenticity.get("ui_project_runtime_route_mode") or source_info.get("ui_project_runtime_route_mode", ""),
+        "project_runtime_command": authenticity.get("ui_project_runtime_command") or source_info.get("ui_project_runtime_command", ""),
         "runtime_probe_ready": bool(authenticity.get("ui_runtime_probe_ready") or source_info.get("ui_runtime_probe_ready")),
         "runtime_probe_count": int(authenticity.get("ui_runtime_probe_count") or source_info.get("ui_runtime_probe_count") or 0),
         "runtime_probes": source_info.get("ui_runtime_probes") or evidence.get("runtime_probes") or [],
@@ -683,9 +750,19 @@ def _ui_runtime_manifest(source_info: dict, validation: dict) -> dict:
         "tech_leak_hits": authenticity.get("ui_screenshot_tech_leak_hits", ""),
         "visible_text_clean": bool(authenticity.get("ui_visible_text_clean")),
         "visible_text_placeholder_hits": authenticity.get("ui_visible_text_placeholder_hits", ""),
+        "visible_text_placeholder_details": authenticity.get("ui_visible_text_placeholder_details", ""),
         "operation_result_evidence_ready": bool(authenticity.get("ui_operation_result_evidence_ready")),
         "chart_context_ready": bool(authenticity.get("ui_chart_context_ready")),
         "route_topology_ready": bool(authenticity.get("ui_route_topology_ready")),
+        "route_topology_required": bool(authenticity.get("ui_route_topology_required")),
+        "domain_profile_key": authenticity.get("ui_domain_profile_key", ""),
+        "domain_profile_confidence": authenticity.get("ui_domain_profile_confidence", 0),
+        "domain_profile_source": authenticity.get("ui_domain_profile_source", ""),
+        "domain_profile_evidence": authenticity.get("ui_domain_profile_evidence", ""),
+        "domain_profile_weak_evidence": authenticity.get("ui_domain_profile_weak_evidence", ""),
+        "domain_profile_excluded_evidence": authenticity.get("ui_domain_profile_excluded_evidence", ""),
+        "domain_gate_keys": authenticity.get("ui_domain_gate_keys", ""),
+        "domain_gate_reasons": authenticity.get("ui_domain_gate_reasons", ""),
         "realism_missing_evidence": authenticity.get("ui_realism_missing_evidence", ""),
         "visual_identity_signature": authenticity.get("ui_visual_identity_signature", ""),
         "similarity_gate_ready": bool(authenticity.get("ui_similarity_gate_ready")),
@@ -999,8 +1076,10 @@ def _findings(auth: dict, norm: dict) -> list[dict]:
         findings.append({"level": "error", "code": "ui_screenshot_placeholder_text", "message": "界面截图可见区域存在乱码、占位模块名或泛化记录名，不适合作为真实项目截图。"})
     if not auth.get("ui_visible_content_summary_ready"):
         findings.append({"level": "error", "code": "ui_visible_content_summary_missing", "message": "界面截图缺少逐页可见内容摘要，无法保证手册功能说明与图片真实内容对应。"})
+    if not auth.get("ui_navigation_contract_ready"):
+        findings.append({"level": "error", "code": "ui_navigation_contract_not_ready", "message": "界面缺少统一页面层级、真实二级导航或操作页返回入口，用户无法确认当前功能位置。"})
     if not auth.get("ui_operation_result_evidence_ready"):
-        findings.append({"level": "error", "code": "ui_operation_result_evidence_missing", "message": "操作截图缺少处理结果、操作日志或状态刷新证据，真实业务操作痕迹不足。"})
+        findings.append({"level": "error", "code": "ui_operation_result_evidence_missing", "message": "操作截图缺少处理结果、状态变化或结果保存证据，真实业务操作痕迹不足。"})
     if not auth.get("ui_operation_coverage_ready"):
         findings.append({
             "level": "error",
@@ -1019,6 +1098,8 @@ def _findings(auth: dict, norm: dict) -> list[dict]:
             code = "ui_layout_role_count_low"
         elif reason == "ui_package_pages_too_similar":
             code = "ui_package_pages_too_similar"
+        elif reason == "ui_page_composition_diversity_low":
+            code = "ui_page_composition_diversity_low"
         else:
             code = "ui_similarity_too_high"
         message = (
@@ -1026,11 +1107,19 @@ def _findings(auth: dict, norm: dict) -> list[dict]:
             if code == "ui_layout_role_count_low"
             else "当前材料包内多个页面结构过于相似，需重新生成差异化页面。"
             if code == "ui_package_pages_too_similar"
+            else "PageSpec 页面主区、侧栏或内容顺序过于一致，空间构图差异不足。"
+            if code == "ui_page_composition_diversity_low"
             else "界面结构与同类型历史样本相似度过高，需重新生成视觉身份。"
         )
         findings.append({"level": "error", "code": code, "message": message})
     if auth.get("ui_ai_frontend_enabled") and not auth.get("ui_ai_frontend_ready"):
         findings.append({"level": "error", "code": "ui_ai_frontend_not_ready", "message": "AI 界面页面代码未完整生成，正式 GPT 流程不能使用模板截图兜底。"})
+    if (
+        auth.get("ui_ai_frontend_enabled")
+        and auth.get("ui_similarity_gate_ready")
+        and not auth.get("ui_page_composition_ready")
+    ):
+        findings.append({"level": "error", "code": "ui_page_composition_diversity_low", "message": "PageSpec 页面组合族、构图变体或构图签名不足，不能证明跨页面结构差异。"})
     if auth.get("ui_ai_frontend_enabled") and not auth.get("ui_shared_confirmation_ready"):
         findings.append({"level": "error", "code": "ui_shared_confirmation_not_ready", "message": "React 界面未接入统一确认弹窗契约，同一软件内可能混用不同弹窗结构，不能进入正式交付。"})
     if auth.get("ui_ai_frontend_enabled") and not auth.get("ui_visual_reference_ready"):
@@ -1098,10 +1187,12 @@ def _finding_suggestion(code: str) -> str:
         "ui_screenshot_tech_leak": "检查 generated_source/ui-prototype/*.html；用户可见界面应展示业务字段、状态和操作，不应展示 GET 路径、Service 类、router 文件或源码映射面板。",
         "ui_screenshot_placeholder_text": "检查 generated_source/ui-prototype/*.html 和截图可见区域；中文任务请使用 UTF-8 JSON 文件生成，并确保接口返回业务编号、名称、范围、状态等真实字段后再截图。",
         "ui_visible_content_summary_missing": "重新执行截图阶段；每张截图必须从浏览器 DOM 提取标题、指标、字段、状态、筛选项和按钮，并写入 generation_report.json 的 visible_content_summary。",
-        "ui_operation_result_evidence_missing": "检查操作类截图页面；弹窗内应显示当前记录、处理结果、状态刷新和操作日志写入说明，并由运行接口数据覆盖当前记录。",
+        "ui_navigation_contract_not_ready": "检查逐页 visible_content_summary.navigation；非登录页必须带 navigation-contract-v1，模块和操作页至少包含 2 个真实二级入口，操作页必须提供返回模块主页的目标。",
+        "ui_operation_result_evidence_missing": "检查操作类截图页面；弹窗内应显示当前业务对象、处理结果、状态变化和结果保存说明，并由运行接口数据覆盖当前对象。",
         "ui_chart_context_missing": "检查统计图和趋势图组件；应显示日期范围、统计单位、图例或业务指标名称，不应只展示无上下文柱形图。",
         "ui_route_topology_missing": "检查交通运输类地图/线路组件；应显示干线、支线接驳、节点编号、服务时窗等业务拓扑信息。",
         "ui_package_pages_too_similar": "检查 generated_source/ui-prototype 页面；同一本手册内模块页和操作页应使用不同工作区结构，不应只是相同页面换标题或相同背景加弹窗。",
+        "ui_page_composition_diversity_low": "检查 generation_report.json 的 ui_page_composition_* 指标和 React 页面 composition-* 类；重新生成时应改变主区/侧栏比例、左右关系、全宽区和移动端内容优先顺序，而不是只换标题或颜色。",
         "ui_ai_frontend_not_ready": "重新生成界面页面代码；正式 GPT 流程要求由模型生成可运行 HTML/CSS 页面，再从生成项目服务截图，不允许回退共享模板 renderer。",
         "ui_visual_reference_missing": "检查 generated_source/ui-prototype/visual-references/visual-reference-manifest.json；正式流程应先生成全局视觉风格提示词和 gpt-image-2 参考图，再生成 HTML 页面。",
         "ui_visual_reference_not_before_source": "检查 generation_report.json 的 ui_visual_reference_before_source_ready 和 generated_source/ui-visual-reference-contract.json；正式流程应先生成全局风格参考图，再生成业务工程源码。",

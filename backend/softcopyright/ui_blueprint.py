@@ -10,8 +10,10 @@ from typing import Any
 
 from .blueprint import ProductBlueprint
 from .industry_subtypes import build_ui_design_brief
+from .domain_profile import has_transport_domain_signal as _has_transport_domain_signal
 from .llm.provider import LLMProvider, LocalTemplateProvider, TextProviderError, TextRetryPolicy
 from .llm.trace import trace_event
+from .llm.json_response import parse_json_object
 from .models import GenerationTask
 from .product_experience import (
     ProductExperienceSpec,
@@ -719,9 +721,9 @@ def _chat_json(
                 content_chars=len(content or ""),
             )
             return data
-        except TextProviderError:
-            raise
         except Exception as exc:
+            if isinstance(exc, TextProviderError) and exc.category.value != "format_error":
+                raise
             last_error = exc
             trace_event(
                 "chat_json_error",
@@ -822,18 +824,7 @@ def _build_ui_prompt(task: GenerationTask, blueprint: ProductBlueprint, expected
 
 
 def _parse_json(content: str) -> dict[str, Any]:
-    cleaned = content.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
-        cleaned = re.sub(r"```$", "", cleaned).strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start >= 0 and end > start:
-        cleaned = cleaned[start : end + 1]
-    data = json.loads(cleaned)
-    if not isinstance(data, dict):
-        raise ValueError("界面蓝图不是 JSON 对象")
-    return data
+    return parse_json_object(content, label="ui_blueprint")
 
 
 def _ui_blueprint_from_data(
@@ -1198,15 +1189,6 @@ def _contains_off_domain_ui_terms(task: GenerationTask, blueprint: ProductBluepr
     return False
 
 
-def _has_transport_domain_signal(text: str) -> bool:
-    value = str(text or "")
-    explicit_terms = r"交通|运输|公交|客运|干线|支线|接驳|换乘|站点|车次|发车|运力|客流"
-    if not re.search(explicit_terms, value):
-        return False
-    medical_terms = r"医疗|医院|诊疗|护理|患者|病区|床位|住院|在院|生命体征|医嘱|护士|医生|病历|班次交接"
-    return not re.search(medical_terms, value)
-
-
 def _game_ui_blueprint(
     task: GenerationTask,
     blueprint: ProductBlueprint,
@@ -1264,21 +1246,37 @@ def _mobile_app_ui_blueprint(
     visual_identity_attempt: int = 0,
 ) -> UiBlueprint:
     design_brief = _ui_design_brief_with_contract(task, blueprint, "mobile_app", visual_identity_attempt)
+    attendance_app = str(getattr(blueprint, "industry_subtype_key", "") or "") == "workforce_attendance"
+    login_caption = (
+        "员工通过手机号和短信验证码登录应用，进入个人考勤与申请入口。"
+        if attendance_app
+        else "用户通过手机号和验证码进入应用，完成个人服务入口初始化。"
+    )
+    home_caption = (
+        "首页展示今日班次、上下班打卡入口、请假补卡进度和出勤概览。"
+        if attendance_app
+        else "首页根据软件名称和业务场景展示常用功能入口、搜索入口和个人使用进度。"
+    )
+    home_components = (
+        ["今日班次", "上班打卡", "下班打卡", "请假补卡", "出勤概览"]
+        if attendance_app
+        else ["顶部搜索", "常用功能", "快捷入口", "最近使用", "底部导航"]
+    )
     screens = [
         UiScreenBlueprint(
             key="login",
             title=f"{task.software_name}登录界面",
-            caption="用户通过手机号、验证码或第三方账号进入应用，完成个人服务入口初始化。",
+            caption=login_caption,
             view_type="mobile_login",
-            components=["应用标识", "手机号输入", "验证码登录", "隐私协议", "快速体验入口"],
+            components=["应用标识", "手机号输入", "验证码登录", "隐私协议"],
             sample_data={"登录方式": "手机号验证码", "状态": "可进入应用"},
         ),
         UiScreenBlueprint(
             key="dashboard",
             title=f"{task.software_name}首页",
-            caption="首页根据软件名称和业务场景展示推荐内容、常用功能入口、搜索入口和个人使用进度。",
+            caption=home_caption,
             view_type="mobile_home",
-            components=["顶部搜索", "推荐内容", "快捷入口", "最近使用", "底部导航"],
+            components=home_components,
             sample_data={"推荐": blueprint.modules[0].title if blueprint.modules else task.software_name, "入口": "首页"},
         ),
     ]
@@ -1295,14 +1293,29 @@ def _mobile_app_ui_blueprint(
                 sample_data=_mobile_sample_data(task, module, view_type),
             )
         )
+    profile_caption = (
+        "个人中心展示员工资料、考勤设置、打卡记录、请假补卡记录和应用设置。"
+        if attendance_app
+        else "个人中心展示用户资料、使用记录、消息设置、隐私安全和应用设置。"
+    )
+    profile_components = (
+        ["员工资料", "考勤设置", "打卡记录", "请假补卡记录", "应用设置"]
+        if attendance_app
+        else ["用户资料", "使用记录", "消息设置", "隐私与安全", "应用设置"]
+    )
+    profile_sample_data = (
+        {"员工": blueprint.roles[0] if blueprint.roles else "员工", "本月打卡": "已同步", "申请记录": "可查询"}
+        if attendance_app
+        else {"使用记录": "12次", "消息设置": "已开启", "隐私状态": "已保护"}
+    )
     screens.append(
         UiScreenBlueprint(
             key="statistics",
             title=f"{task.software_name}个人中心界面",
-            caption="个人中心展示用户资料、收藏记录、使用历史、会员权益和应用设置。",
+            caption=profile_caption,
             view_type="mobile_profile",
-            components=["用户资料", "收藏记录", "使用历史", "会员权益", "应用设置"],
-            sample_data={"收藏": "28项", "最近使用": "12次", "会员": "有效"},
+            components=profile_components,
+            sample_data=profile_sample_data,
         )
     )
     visual_style = str(design_brief.get("visual_mood") or "mobile-consumer-app")

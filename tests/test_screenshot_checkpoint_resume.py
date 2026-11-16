@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -13,6 +14,67 @@ from backend.softcopyright.screenshots import (
 
 
 class ScreenshotCheckpointResumeTests(unittest.TestCase):
+    def test_previous_v13_checkpoint_is_invalidated_for_navigation_contract_capture(self):
+        with TemporaryDirectory() as temporary_directory:
+            ui_dir = Path(temporary_directory)
+            (ui_dir / "screenshot-checkpoint.json").write_text(
+                json.dumps({"version": 13, "pages": {"dashboard": {"fingerprint": "old"}}}),
+                encoding="utf-8",
+            )
+            html_path = ui_dir / "dashboard.html"
+            html_path.write_text("<html><body>dashboard</body></html>", encoding="utf-8")
+            item = UiScreenshot("dashboard", "系统首页", "", str(html_path), page_kind="dashboard")
+
+            restored_checkpoint, restored_count = _restore_screenshot_checkpoint_prefix(
+                ui_dir,
+                [item],
+                "admin",
+                ADMIN_VIEWPORT,
+            )
+
+        self.assertEqual(SCREENSHOT_CHECKPOINT_VERSION, 14)
+        self.assertEqual(restored_count, 0)
+        self.assertEqual(restored_checkpoint["pages"], {})
+
+    def test_visible_content_summary_normalizes_navigation_contract(self):
+        item = UiScreenshot("attendance_clock_in", "上班打卡", "", "page.html", page_kind="operation", module_key="attendance")
+
+        summary = _normalize_visible_content_summary(
+            {
+                "visible_text": "员工考勤 上班打卡 已完成",
+                "headings": ["上班打卡"],
+                "actions": ["确认打卡"],
+                "navigation": {
+                    "schema_version": "navigation-contract-v1",
+                    "ready": True,
+                    "level": "action",
+                    "hierarchy_signature": "abcdef1234567890",
+                    "active_primary_key": "attendance",
+                    "active_secondary_key": "clock_in",
+                    "back_target": "attendance",
+                    "primary_items": [
+                        {"key": "dashboard", "label": "首页", "page_key": "dashboard"},
+                        {"key": "attendance", "label": "员工考勤", "page_key": "attendance"},
+                    ],
+                    "secondary_items": [
+                        {"key": "attendance__overview", "label": "概览", "page_key": "attendance"},
+                        {"key": "clock_in", "label": "上班打卡", "page_key": "attendance_clock_in"},
+                    ],
+                    "breadcrumb": [
+                        {"key": "software", "label": "员工考勤助手", "page_key": "dashboard"},
+                        {"key": "attendance", "label": "员工考勤", "page_key": "attendance"},
+                        {"key": "attendance_clock_in", "label": "上班打卡", "page_key": "attendance_clock_in"},
+                    ],
+                },
+            },
+            item,
+        )
+
+        self.assertTrue(summary["navigation"]["ready"])
+        self.assertEqual(summary["navigation"]["level"], "action")
+        self.assertEqual(summary["navigation"]["back_target"], "attendance")
+        self.assertEqual(len(summary["navigation"]["secondary_items"]), 2)
+
     def test_confirmation_summary_does_not_invent_contract_fields(self):
         item = UiScreenshot(
             "confirm",
@@ -213,6 +275,20 @@ class ScreenshotCheckpointResumeTests(unittest.TestCase):
 
         self.assertTrue(summary["ready"])
         self.assertIn(item.title, summary["headings"])
+
+    def test_visible_content_summary_drops_mobile_device_chrome_status(self):
+        summary = _normalize_visible_content_summary(
+            {
+                "visible_text": "9:41 5G 100% 员工编号 EMP-1001 上班打卡",
+                "headings": ["上下班打卡"],
+                "fields": ["员工编号", "打卡时间"],
+                "statuses": ["9:41 5G 100%", "已打卡"],
+                "actions": ["上班打卡"],
+            }
+        )
+
+        self.assertEqual(summary["statuses"], ["已打卡"])
+        self.assertNotIn("9:41 5G 100%", summary["semantic_terms"])
 
     def test_checkpoint_restore_repairs_long_title_summary(self):
         with TemporaryDirectory() as tmp:

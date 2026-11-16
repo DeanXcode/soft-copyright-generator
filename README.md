@@ -6,7 +6,7 @@
 
 - [当前进度与交付说明](docs/current-progress-and-delivery.md)
 
-当前开发版本：`0.2.0`。
+当前开发版本：`0.2.3`。
 
 ## 安装依赖
 
@@ -98,7 +98,7 @@ npm run pack:win:customer
 ```json
 {
   "SOFT_ACCOUNT_PROVIDER": "newapi",
-  "SOFT_MODEL_GPT_BASE_URL": "https://smoke2.learn-flow.cn/v1",
+  "SOFT_MODEL_GPT_BASE_URL": "https://api.example.com/v1",
   "SOFT_MODEL_GPT_API_KEY": "sk-你的NewAPI调用Token",
   "SOFT_MODEL_GPT_NAME": "gpt-5.5",
   "SOFT_MODEL_GPT_IMAGE_NAME": "gpt-image-2",
@@ -405,13 +405,13 @@ PDF 转换探测优先级：
 当前提供便携 zip 打包脚本：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\package-windows-portable.ps1 -Version 0.2.0
+powershell -ExecutionPolicy Bypass -File scripts\package-windows-portable.ps1 -Version 0.2.3
 ```
 
 输出：
 
 ```text
-release/soft-copyright-generator-0.2.0-portable.zip
+release/soft-copyright-generator-0.2.3-portable.zip
 ```
 
 包内包含：
@@ -437,7 +437,7 @@ npm run pack:win
 输出：
 
 ```text
-release/installer/Soft Copyright Generator Setup 0.2.0.exe
+release/installer/Soft Copyright Generator Setup 0.2.3.exe
 release/installer/win-unpacked/
 ```
 
@@ -452,7 +452,7 @@ npm run pack:win:customer
 输出：
 
 ```text
-release/customer-installer/Soft Copyright Generator Setup 0.2.0.exe
+release/customer-installer/Soft Copyright Generator Setup 0.2.3.exe
 release/customer-installer/win-unpacked/
 ```
 

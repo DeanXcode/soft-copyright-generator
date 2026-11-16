@@ -23,6 +23,17 @@ def _render_url(item: UiScreenshot, base_url: str) -> str:
     return Path(item.html_path).resolve().as_uri()
 
 
+def _navigate_for_screenshot(page, url: str, *, project_server: bool) -> None:
+    """Load a screenshot page without treating unrelated network quiet as readiness.
+
+    Project pages expose ``window.__runtimeApiReady`` and are validated separately by
+    ``_wait_for_page_runtime_api``. Waiting for Playwright's ``networkidle`` here can
+    stall on harmless 404 probes, redirects, or long-lived connections even though
+    the business API has already completed.
+    """
+    page.goto(url, wait_until="domcontentloaded" if project_server else "load")
+
+
 def _wait_for_page_runtime_api(page, item: UiScreenshot) -> None:
     try:
         page.wait_for_function(
@@ -72,6 +83,17 @@ def _normalize_visible_action_label(value: Any) -> str:
 def _normalize_visible_content_summary(payload: dict[str, Any] | None, item: UiScreenshot | None = None) -> dict[str, Any]:
     raw = payload if isinstance(payload, dict) else {}
 
+    def is_device_chrome(text: str) -> bool:
+        compact = re.sub(r"\s+", " ", str(text or "")).strip()
+        return bool(
+            re.fullmatch(
+                r"(?:\d{1,2}:\d{2}\s*)?(?:(?:4G|5G|LTE|Wi-?Fi)\s*)?(?:\d{1,3}%?)?",
+                compact,
+                flags=re.I,
+            )
+            and (":" in compact or re.search(r"(?:4G|5G|LTE|Wi-?Fi|%)", compact, flags=re.I))
+        )
+
     def clean(value: Any, *, max_length: int = 40) -> str:
         text = re.sub(r"\s+", " ", str(value or "")).strip(" ·|｜:：-—")
         if not text or len(text) > max_length or re.fullmatch(r"[\d\s.,%+\-/:]+", text):
@@ -86,6 +108,8 @@ def _normalize_visible_content_summary(payload: dict[str, Any] | None, item: UiS
             label = clean(value, max_length=max_length)
             if name in {"actions", "filter_actions"}:
                 label = _normalize_visible_action_label(label)
+            if name == "statuses" and is_device_chrome(label):
+                continue
             if not label:
                 continue
             if name == "filters" and not re.search(r"[\u4e00-\u9fff]", label):
@@ -122,6 +146,46 @@ def _normalize_visible_content_summary(payload: dict[str, Any] | None, item: UiS
                 actions.append(normalized)
             if len(actions) >= 12:
                 break
+    raw_navigation = raw.get("navigation") if isinstance(raw.get("navigation"), dict) else {}
+
+    def navigation_items(name: str, *, limit: int) -> list[dict[str, str]]:
+        result: list[dict[str, str]] = []
+        for value in raw_navigation.get(name) or []:
+            if not isinstance(value, dict):
+                continue
+            key = clean(value.get("key"), max_length=64)
+            label = clean(value.get("label"), max_length=40)
+            page_key = clean(value.get("page_key"), max_length=64)
+            if not key and not label:
+                continue
+            result.append({
+                "key": key,
+                "label": label,
+                "page_key": page_key,
+            })
+            if len(result) >= limit:
+                break
+        return result
+
+    navigation = {
+        "schema_version": clean(raw_navigation.get("schema_version"), max_length=48),
+        "ready": bool(raw_navigation.get("ready")),
+        "level": clean(raw_navigation.get("level"), max_length=24),
+        "hierarchy_signature": clean(raw_navigation.get("hierarchy_signature"), max_length=64),
+        "active_primary_key": clean(raw_navigation.get("active_primary_key"), max_length=64),
+        "active_secondary_key": clean(raw_navigation.get("active_secondary_key"), max_length=64),
+        "back_target": clean(raw_navigation.get("back_target"), max_length=64),
+        "primary_items": navigation_items("primary_items", limit=10),
+        "secondary_items": navigation_items("secondary_items", limit=8),
+        "breadcrumb": navigation_items("breadcrumb", limit=5),
+    }
+    navigation["ready"] = bool(
+        navigation["ready"]
+        and navigation["schema_version"]
+        and navigation["level"]
+        and len(navigation["primary_items"]) >= 2
+        and len(navigation["breadcrumb"]) >= 2
+    )
     summary = {
         "headings": values("headings", limit=10, max_length=72),
         "metrics": values("metrics", limit=10),
@@ -131,6 +195,7 @@ def _normalize_visible_content_summary(payload: dict[str, Any] | None, item: UiS
         "filter_actions": values("filter_actions", limit=10, max_length=24),
         "actions": actions,
         "visible_text": visible_text,
+        "navigation": navigation,
     }
     summary["semantic_terms"] = _unique_texts(
         value
@@ -178,8 +243,8 @@ def _capture_visible_content_summary(page, item: UiScreenshot) -> dict[str, Any]
             limit,
           );
           const headings = texts('h1,h2,h3,h4,[role="heading"],legend,[class*="panel-title"],[class*="card-title"],[class*="section-title"],[class*="block-title"],[class*="widget-title"]', 36);
-          const fields = texts('th,label,dt,[data-field-label],[class*="field-label"],[class*="form-label"],[class*="meta-label"],[class*="item-label"],[class*="table-head"],.shared-confirm-summary span,.shared-confirm-evidence>span,.shared-confirm-note strong', 48);
-          const statuses = texts('[class*="status"],[class*="badge"],[class*="tag"],[class*="pill"],[class*="chip"],[class*="state"]', 36);
+          const fields = texts('th,label,dt,[data-field-label],[class*="field-label"],[class*="form-label"],[class*="meta-label"],[class*="item-label"],[class*="table-head"],.mobile-detail-list span,.mobile-result-list small,.shared-confirm-summary span,.shared-confirm-evidence>span,.shared-confirm-note strong', 48);
+          const statuses = texts('[class*="status"]:not(.mobile-status),[class*="badge"],[class*="tag"],[class*="pill"],[class*="chip"],[class*="state"]', 36);
           const actions = unique(
             Array.from(root.querySelectorAll('button,a,[role="button"],input[type="button"],input[type="submit"],[onclick]'))
               .filter(visible)
@@ -206,6 +271,24 @@ def _capture_visible_content_summary(page, item: UiScreenshot) -> dict[str, Any]
             const label = clean((labelNode && labelNode.innerText) || (card.innerText || '').split(/\n/)[0]);
             if (label && label.length >= 2 && label.length <= 48) metrics.push(label);
           }
+          const navRoot = document.querySelector('[data-navigation-contract]');
+          const navigationItems = (selector, limit = 12) => navRoot ? Array.from(navRoot.querySelectorAll(selector)).slice(0, limit).map((element) => ({
+            key: clean(element.getAttribute(selector.includes('primary') ? 'data-navigation-primary-item' : selector.includes('secondary') ? 'data-navigation-secondary-item' : 'data-navigation-breadcrumb-item')),
+            label: clean(element.innerText || element.textContent || ''),
+            page_key: clean(element.getAttribute('data-navigation-page-key') || ''),
+          })) : [];
+          const navigation = navRoot ? {
+            schema_version: clean(navRoot.getAttribute('data-navigation-contract') || ''),
+            ready: navRoot.getAttribute('data-navigation-ready') === 'true',
+            level: clean(navRoot.getAttribute('data-navigation-level') || ''),
+            hierarchy_signature: clean(navRoot.getAttribute('data-navigation-signature') || ''),
+            active_primary_key: clean(navRoot.getAttribute('data-navigation-active-primary') || ''),
+            active_secondary_key: clean(navRoot.getAttribute('data-navigation-active-secondary') || ''),
+            back_target: clean(navRoot.getAttribute('data-navigation-back-target') || navRoot.querySelector('[data-navigation-back-target]')?.getAttribute('data-navigation-back-target') || ''),
+            primary_items: navigationItems('[data-navigation-primary-item]', 10),
+            secondary_items: navigationItems('[data-navigation-secondary-item]', 8),
+            breadcrumb: navigationItems('[data-navigation-breadcrumb-item]', 5),
+          } : {};
           return {
             visible_text: clean(root && root.innerText),
             headings: unique(headings, 36),
@@ -215,6 +298,7 @@ def _capture_visible_content_summary(page, item: UiScreenshot) -> dict[str, Any]
             filters: unique(filters, 36),
             filter_actions: unique(filterActions, 36),
             actions: unique(actions, 48),
+            navigation,
           };
         }
         """,

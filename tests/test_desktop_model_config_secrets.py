@@ -19,6 +19,18 @@ def read_renderer_source() -> str:
 
 
 class DesktopModelConfigSecretTests(unittest.TestCase):
+    def test_generation_report_task_snapshot_does_not_export_endpoint(self):
+        from backend.softcopyright.models import GenerationTask
+        endpoint = "https://private-gateway.invalid/v1"
+        task = GenerationTask(software_name="test", llm_base_url=endpoint,
+                              llm_api_key_configured=True)
+        snapshot = task.to_dict()
+        self.assertEqual(snapshot["llm_base_url"], "")
+        self.assertTrue(snapshot["llm_endpoint_configured"])
+        self.assertTrue(snapshot["llm_api_key_configured"])
+        self.assertNotIn(endpoint, str(snapshot))
+        self.assertEqual(task.llm_base_url, endpoint)
+
     def test_desktop_error_sanitizer_hides_connection_pool_host_and_model_path(self):
         source = MAIN_CJS.read_text(encoding="utf-8")
 
@@ -105,7 +117,7 @@ class DesktopModelConfigSecretTests(unittest.TestCase):
         main_source = MAIN_CJS.read_text(encoding="utf-8")
         renderer_source = read_renderer_source()
 
-        self.assertIn('const FRONTEND_ENGINE_VERSION = "pagespec-hybrid-v1";', main_source)
+        self.assertIn('const FRONTEND_ENGINE_VERSION = "pagespec-hybrid-v6";', main_source)
         self.assertIn('pageEngineUpgradeRequired', main_source)
         self.assertIn('页面生成引擎已升级，将复用蓝图和参考图并重新生成全部界面', renderer_source)
 

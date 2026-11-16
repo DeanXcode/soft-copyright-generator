@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 import shutil
 import time
@@ -25,11 +26,17 @@ from .docgen import (
 )
 from .architecture import ARCHITECTURE_CATALOG, normalize_technical_architecture_for_experience
 from .errors import sanitize_error_message
-from .feature_inference import harmonize_feature_hint
+from .domain_profile import DomainProfile, build_domain_profile, requires_transport_route_topology
+from .feature_inference import decisive_feature_contract, harmonize_feature_hint
 from .frontend_codegen.page_spec import FRONTEND_ENGINE_VERSION
 from .industry_subtypes import select_industry_subtype_for_context
 from .llm_architecture import select_technical_architecture_with_llm
-from .llm_blueprint import blueprint_contract_issues, generate_blueprint_with_llm, normalize_cached_blueprint_candidate
+from .llm_blueprint import (
+    blueprint_contract_review,
+    generate_blueprint_with_llm,
+    normalize_cached_blueprint_candidate,
+    repair_blueprint_contract,
+)
 from .llm.provider import LocalTemplateProvider
 from .llm_manual import generate_manual_content_with_llm
 from .models import GenerationTask
@@ -39,7 +46,13 @@ from .packager import make_zip_files, write_json
 from .blueprint import generate_blueprint
 from .product_experience import build_product_experience_spec, design_brief_matches_experience
 from .screenshots import generate_ui_screenshots, prepare_ui_visual_reference
-from .ui_blueprint import complete_ui_blueprint_coverage, repair_ui_blueprint_contract, ui_matches_software_type
+from .ui_blueprint import (
+    UiBlueprint,
+    UiScreenBlueprint,
+    complete_ui_blueprint_coverage,
+    repair_ui_blueprint_contract,
+    ui_matches_software_type,
+)
 from .ui_similarity import (
     MAX_VISUAL_IDENTITY_ATTEMPTS,
     append_ui_fingerprint_history,
@@ -50,6 +63,7 @@ from .sourcegen import (
     generate_source_project,
     refresh_generated_source_metadata,
     repair_generated_business_record_labels,
+    repair_generated_domain_sample_leaks,
     source_project_stats,
 )
 from .stage_cache import (
@@ -58,10 +72,12 @@ from .stage_cache import (
     load_cached_architecture,
     load_cached_blueprint,
     load_cached_manual_content,
+    load_partial_manual_content,
     load_cached_ui_blueprint,
     save_cached_architecture,
     save_cached_blueprint,
     save_cached_manual_content,
+    save_partial_manual_content,
     save_cached_ui_blueprint,
     product_blueprint_from_dict,
     technical_architecture_from_dict,
@@ -87,6 +103,8 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     resume_payload = _resume_failure_payload(output_dir) if resume_existing_output else {}
     resume_stage = _resume_failure_stage_from_payload(resume_payload) if resume_existing_output else ""
     resume_progress = _resume_failure_progress_from_payload(resume_payload) if resume_existing_output else 0
+    setattr(task, "resume_stage", resume_stage)
+    setattr(task, "resume_progress", resume_progress)
     completed_report = _load_completed_resume_report(output_dir) if resume_existing_output else None
     _begin_generation_attempt(
         output_dir,
@@ -151,6 +169,7 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     resume_stage_cache = find_resume_stage_cache_context(task) if resume_existing_output else None
     resume_cached_blueprint = load_cached_blueprint(resume_stage_cache) if resume_stage_cache else None
     accepted_blueprint = _load_accepted_product_blueprint(task)
+    decisive_contract = decisive_feature_contract(task.software_name, task.feature_hint)
     confirmed_contract = _semantic_contract_from_confirmed_outline(task)
     if accepted_blueprint:
         send("prepare", 3, "读取已批准产品蓝图，跳过名称理解和产品蓝图请求", material_type="批准蓝图")
@@ -163,6 +182,9 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         send("prepare", 3, "复用失败任务的本地产品蓝图，跳过名称理解请求", material_type="断点续跑")
         feature_hint_meta = _semantic_contract_from_cached_blueprint(resume_cached_blueprint)
         feature_hint = task.feature_hint or str(feature_hint_meta.get("inferred_feature_hint") or "")
+    elif decisive_contract:
+        send("prepare", 3, "根据明确软件名称校正业务领域，替换失败任务中的旧误判蓝图", material_type="名称契约")
+        feature_hint, feature_hint_meta = decisive_contract
     elif confirmed_contract:
         send("prepare", 3, "复用已确认蓝图，准备生成产品蓝图")
         feature_hint = task.feature_hint
@@ -226,7 +248,10 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
             cached_blueprint = normalize_cached_blueprint_candidate(task, cached_blueprint)
             report["checks"]["blueprint_cache_normalized"] = True
             report["checks"]["blueprint_cache_normalized_quality_score"] = cached_blueprint.quality_score
-    cached_blueprint_issues = blueprint_contract_issues(task, cached_blueprint) if cached_blueprint else []
+    cached_contract_review = blueprint_contract_review(task, cached_blueprint) if cached_blueprint else None
+    cached_blueprint_issues = list(cached_contract_review.blocking_issues) if cached_contract_review else []
+    if cached_contract_review:
+        report["checks"]["blueprint_cache_quality_warnings"] = list(cached_contract_review.quality_warnings)
     if cached_blueprint and int(getattr(cached_blueprint, "quality_score", 0) or 0) < _blueprint_quality_target():
         cached_blueprint_issues.append(
             f"产品蓝图质量分 {int(getattr(cached_blueprint, 'quality_score', 0) or 0)} 低于当前阈值 {_blueprint_quality_target()}"
@@ -273,15 +298,24 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
             save_cached_blueprint(stage_cache, blueprint)
         else:
             raise RuntimeError("GPT 产品蓝图未返回有效结果，请重试。")
-    contract_issues = blueprint_contract_issues(task, blueprint)
+    repair_blueprint_contract(task, blueprint)
+    contract_review = blueprint_contract_review(task, blueprint)
+    contract_issues = list(contract_review.blocking_issues)
+    contract_warnings = list(contract_review.quality_warnings)
     report["checks"]["blueprint_operation_contract_ready"] = not contract_issues
     report["checks"]["blueprint_operation_contract_issues"] = contract_issues
+    report["checks"]["blueprint_operation_contract_quality_warnings"] = contract_warnings
+    report["checks"]["blueprint_operation_contract_repair_actions"] = list(
+        getattr(blueprint, "contract_repair_actions", []) or []
+    )
     report["checks"]["blueprint_structured_operation_count"] = sum(
         len(getattr(module, "operation_specs", None) or []) for module in blueprint.modules
     )
     if contract_issues:
         mode_label = "GPT" if require_llm_generation else "Default Template"
         raise RuntimeError(f"{mode_label} 产品蓝图未通过结构化操作与终端语义门禁：" + "；".join(contract_issues[:5]))
+    if contract_warnings:
+        report["warnings"].append("产品蓝图存在非阻断质量提醒：" + "；".join(contract_warnings[:5]))
     quality_score = int(getattr(blueprint, "quality_score", 0) or 0)
     report["checks"]["blueprint_request_count"] = int(getattr(blueprint, "request_count", 0) or 0)
     if quality_score < _blueprint_quality_target():
@@ -381,12 +415,19 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         report["checks"]["stage_cache_hits"].append("manual_content")
     else:
         try:
-            send("manual_content", 24, "生成说明书正文")
+            partial_manual_content = load_partial_manual_content(stage_cache, blueprint)
+            reused_count = sum(bool(partial_manual_content.get(key)) for key in ("overview", "login_main", "statistics", "security", "faq"))
+            reused_count += len(partial_manual_content.get("modules") or {})
+            send("manual_content", 24, "续写说明书缺失章节" if reused_count else "生成说明书正文")
+            if reused_count:
+                report["checks"]["stage_cache_hits"].append("manual_content_partial")
             manual_content = generate_manual_content_with_llm(
                 task,
                 blueprint,
                 llm_provider,
                 emit=lambda progress, message, **extra: send("manual_content", progress, message, **extra),
+                initial_content=partial_manual_content,
+                save_progress=lambda content: save_partial_manual_content(stage_cache, blueprint, content),
             )
         except Exception as exc:
             raise RuntimeError(f"GPT 说明书正文生成失败：{sanitize_error_message(exc)}") from exc
@@ -405,9 +446,19 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
 
     send("visual_reference", 40, "先生成全局风格参考图")
     resume_existing_output = bool(getattr(task, "resume_existing_output", False))
-    resume_ui_blueprint = _load_resume_ui_blueprint(output_dir) if resume_existing_output else None
+    resume_ui_blueprint = (
+        _load_resume_ui_blueprint(
+            output_dir,
+            blueprint=blueprint,
+            prefer_prototype_manifest=bool(resume_stage and _stage_precedes("visual_reference", resume_stage)),
+        )
+        if resume_existing_output
+        else None
+    )
     resume_visual_identity_locked = bool(
-        resume_stage in {"screenshots", "done"} and resume_ui_blueprint is not None
+        resume_stage
+        and _stage_precedes("visual_reference", resume_stage)
+        and resume_ui_blueprint is not None
     )
     if resume_visual_identity_locked:
         report["checks"]["resume_visual_identity_locked"] = True
@@ -530,6 +581,9 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
             raise RuntimeError("界面模块页面角色数量不足，已停止生成；请重新生成更差异化的界面蓝图。")
         if ui_similarity_gate.reason == "ui_package_pages_too_similar":
             raise RuntimeError("当前材料包内页面结构重复度过高，已停止生成；请重新生成更差异化的界面页面。")
+        if ui_similarity_gate.reason == "ui_page_composition_diversity_low":
+            issues = "；".join((ui_similarity_gate.composition_summary or {}).get("ui_page_composition_issues") or [])
+            raise RuntimeError(f"页面空间构图差异不足，已停止生成；{issues or '请重新生成不同主区、侧栏和内容顺序的页面组合。'}")
         raise RuntimeError(
             f"界面相似度过高，已重试 {ui_similarity_gate.attempts} 次仍未通过；"
             f"最高相似度 {ui_similarity_gate.max_score:.2f}。"
@@ -600,10 +654,25 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         ignore_current_history=bool(resume_existing_output),
         evaluate_package_pages=True,
     )
+    if (
+        resume_stage
+        and _stage_precedes("screenshots", resume_stage)
+        and resume_ui_blueprint is not None
+        and ui_screenshots
+        and all(item.image_path for item in ui_screenshots.values())
+        and not ui_similarity_gate.ready
+    ):
+        report["warnings"].append("晚阶段恢复复用已通过截图门禁的原界面，跳过因恢复元数据变化导致的二次相似度重判。")
+        ui_similarity_gate = replace(ui_similarity_gate, ready=True, reason="late_resume_existing_screenshots")
     if not ui_similarity_gate.ready:
         if ui_similarity_gate.reason == "ui_package_pages_too_similar":
             raise RuntimeError(
                 "当前材料包生成后的 React 页面结构重复度过高，已停止后续材料生成；请保留蓝图重试以重新生成页面构图。"
+            )
+        if ui_similarity_gate.reason == "ui_page_composition_diversity_low":
+            issues = "；".join((ui_similarity_gate.composition_summary or {}).get("ui_page_composition_issues") or [])
+            raise RuntimeError(
+                f"生成后的 PageSpec 页面组合差异不足，已停止后续材料生成；{issues or '页面主区、侧栏和内容顺序过于接近。'}"
             )
         raise RuntimeError(
             f"生成后的界面相似度检查未通过：{ui_similarity_gate.reason or 'ui_similarity_too_high'}，"
@@ -663,6 +732,76 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     )
     if not report["checks"]["ui_visible_content_summary_ready"]:
         raise RuntimeError("界面截图可见内容摘要不完整，无法生成与图片逐页对应的功能说明。")
+    navigation_pages = [
+        item
+        for item in ui_screenshots.values()
+        if item.image_path and str(getattr(item, "page_kind", "") or "") != "login"
+    ]
+    navigation_contract_pages = [
+        item
+        for item in navigation_pages
+        if str(((item.visible_content_summary or {}).get("navigation") or {}).get("schema_version") or "")
+    ]
+    navigation_ready_pages = [
+        item
+        for item in navigation_pages
+        if bool(((item.visible_content_summary or {}).get("navigation") or {}).get("ready"))
+    ]
+    navigation_levels = {
+        str(((item.visible_content_summary or {}).get("navigation") or {}).get("level") or "")
+        for item in navigation_pages
+        if str(((item.visible_content_summary or {}).get("navigation") or {}).get("level") or "")
+    }
+    secondary_navigation_pages = [
+        item
+        for item in navigation_pages
+        if len(((item.visible_content_summary or {}).get("navigation") or {}).get("secondary_items") or []) >= 2
+    ]
+    back_navigation_pages = [
+        item
+        for item in navigation_pages
+        if str(((item.visible_content_summary or {}).get("navigation") or {}).get("back_target") or "")
+    ]
+    navigation_issues: list[dict[str, str]] = []
+    for item in navigation_pages:
+        page_kind = str(getattr(item, "page_kind", "") or "")
+        module_key = str(getattr(item, "module_key", "") or "")
+        navigation = (item.visible_content_summary or {}).get("navigation") or {}
+        expected_level = {
+            "dashboard": "root",
+            "statistics": "analysis",
+            "operation": "action",
+            "module": "module",
+            "detail": "module" if module_key else "root",
+        }.get(page_kind, "module" if module_key else "root")
+        if not navigation.get("ready"):
+            navigation_issues.append({"page_key": item.key, "reason": "contract_not_ready"})
+            continue
+        if str(navigation.get("level") or "") != expected_level:
+            navigation_issues.append({"page_key": item.key, "reason": f"level:{navigation.get('level')}!={expected_level}"})
+        if expected_level in {"module", "action"} and len(navigation.get("secondary_items") or []) < 2:
+            navigation_issues.append({"page_key": item.key, "reason": "secondary_navigation_missing"})
+        if expected_level == "action" and not str(navigation.get("back_target") or ""):
+            navigation_issues.append({"page_key": item.key, "reason": "back_target_missing"})
+    navigation_exempt = ui_blueprint.renderer == "game"
+    report["checks"]["ui_navigation_contract_version"] = "navigation-contract-v1"
+    report["checks"]["ui_navigation_contract_count"] = len(navigation_contract_pages)
+    report["checks"]["ui_navigation_level_count"] = len(navigation_levels)
+    report["checks"]["ui_navigation_levels"] = sorted(navigation_levels)
+    report["checks"]["ui_secondary_navigation_page_count"] = len(secondary_navigation_pages)
+    report["checks"]["ui_back_navigation_page_count"] = len(back_navigation_pages)
+    report["checks"]["ui_navigation_contract_issues"] = navigation_issues
+    report["checks"]["ui_navigation_contract_ready"] = bool(
+        navigation_exempt
+        or (
+            navigation_pages
+            and len(navigation_contract_pages) == len(navigation_pages)
+            and len(navigation_ready_pages) == len(navigation_pages)
+            and not navigation_issues
+        )
+    )
+    if not report["checks"]["ui_navigation_contract_ready"]:
+        raise RuntimeError("界面页面层级、二级导航或操作页返回入口不完整，已停止生成。")
     report["checks"]["ui_instant_interaction_count"] = sum(
         1 for item in ui_screenshots.values() if item.page_kind == "operation" and item.interaction_mode == "instant"
     )
@@ -688,7 +827,15 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     report["checks"]["legacy_react_page_count"] = int(
         legacy_page_count if legacy_page_count is not None else report["checks"]["ui_ai_frontend_page_count"]
     )
+    report["checks"]["model_generated_react_page_count"] = int(
+        ai_frontend_report.get("model_generated_react_page_count") or 0
+    )
+    report["checks"]["frontend_generation_mode"] = str(
+        ai_frontend_report.get("frontend_generation_mode") or ""
+    )
     report["checks"]["frontend_effective_workers"] = int(ai_frontend_report.get("frontend_effective_workers") or 1)
+    report["checks"]["frontend_final_worker_limit"] = int(ai_frontend_report.get("frontend_final_worker_limit") or 1)
+    report["checks"]["frontend_concurrency_recoveries"] = int(ai_frontend_report.get("frontend_concurrency_recoveries") or 0)
     report["checks"]["frontend_concurrency_degraded"] = bool(ai_frontend_report.get("frontend_concurrency_degraded"))
     report["checks"]["frontend_concurrency_degrade_reason"] = str(ai_frontend_report.get("frontend_concurrency_degrade_reason") or "")
     report["checks"]["frontend_cancelled_page_count"] = int(ai_frontend_report.get("frontend_cancelled_page_count") or 0)
@@ -696,7 +843,10 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     report["checks"]["provider_retry_summary"] = ai_frontend_report.get("provider_retry_summary") or {}
     report["page_spec_count"] = report["checks"]["page_spec_count"]
     report["legacy_react_page_count"] = report["checks"]["legacy_react_page_count"]
+    report["model_generated_react_page_count"] = report["checks"]["model_generated_react_page_count"]
     report["frontend_effective_workers"] = report["checks"]["frontend_effective_workers"]
+    report["frontend_final_worker_limit"] = report["checks"]["frontend_final_worker_limit"]
+    report["frontend_concurrency_recoveries"] = report["checks"]["frontend_concurrency_recoveries"]
     report["frontend_concurrency_degraded"] = report["checks"]["frontend_concurrency_degraded"]
     report["frontend_cancelled_page_count"] = report["checks"]["frontend_cancelled_page_count"]
     report["provider_retry_summary"] = report["checks"]["provider_retry_summary"]
@@ -868,7 +1018,10 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
     if not domain_quality.get("ui_business_facing_screenshots"):
         raise RuntimeError("界面截图仍包含接口路径、源码类名、文件名或英文实体等开发痕迹，已停止生成。")
     if not domain_quality.get("ui_visible_text_clean"):
-        raise RuntimeError(f"界面截图可见文本含有乱码或占位内容：{domain_quality.get('ui_visible_text_placeholder_hits')}")
+        placeholder_hits = domain_quality.get("ui_visible_text_placeholder_hits")
+        placeholder_details = domain_quality.get("ui_visible_text_placeholder_details")
+        detail_suffix = f"（{placeholder_details}）" if placeholder_details else ""
+        raise RuntimeError(f"界面截图可见文本含有乱码或占位内容：{placeholder_hits}{detail_suffix}")
     if not domain_quality.get("ui_operation_result_evidence_ready"):
         raise RuntimeError("操作截图缺少处理结果、操作日志或状态刷新证据，已停止生成。")
     if not domain_quality.get("ui_chart_context_ready"):
@@ -917,6 +1070,7 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
         report["checks"].update(manual_density)
         manual_ui_consistency = analyze_manual_ui_consistency(manual_docx, blueprint, ui_screenshots)
         report["checks"].update(manual_ui_consistency)
+        write_json(output_dir / "manual-ui-consistency.json", manual_ui_consistency)
         if not manual_ui_consistency.get("manual_ui_consistency_ready"):
             raise RuntimeError(
                 "操作手册图文一致性校验未通过：截图标题、按钮或正文引用的字段、指标、状态与实际界面不一致。"
@@ -926,6 +1080,11 @@ def generate_materials(task: GenerationTask, emit=None, llm_provider=None) -> di
             report["warnings"].append("说明书截图后的操作步骤密度偏低，建议复核截图页是否紧跟入口、字段、保存结果和后续处理说明。")
         if not manual_density.get("manual_natural_style_ready"):
             report["warnings"].append("说明书正文机械式标签或重复短句偏多，建议重新生成说明书正文。")
+        template_risk = str(manual_density.get("manual_template_risk_level") or "")
+        if template_risk in {"medium", "high"}:
+            report["warnings"].append(
+                f"说明书模板化风险为 {template_risk}：固定开头比例或语义锚点不足，建议优先抽查目录、首页、核心模块和操作结果页。"
+            )
         if not manual_density.get("manual_pagination_constraints_ready"):
             raise RuntimeError("操作手册未完整应用全局标题、截图和图注分页约束，已停止生成。")
         if not manual_density.get("manual_numbered_steps_ready"):
@@ -1252,6 +1411,7 @@ def _semantic_contract_from_confirmed_outline(task: GenerationTask) -> dict:
     return {
         "auto_feature_hint": False,
         "feature_hint_profile": "confirmed-outline",
+        "feature_hint_product_profile": _clean_contract_text(outline.get("profile"), 40),
         "feature_hint_source": "confirmed-outline",
         "inferred_feature_hint": feature_hint,
         "original_feature_hint": feature_hint,
@@ -1558,6 +1718,8 @@ def _ui_project_entry_checks(source_info) -> dict:
         "ui_project_server_started": bool(source_info.get("ui_project_server_started")) if isinstance(source_info, dict) else False,
         "ui_project_runtime_screenshot_ready": bool(source_info.get("ui_project_server_started")) if isinstance(source_info, dict) else False,
         "ui_project_server_url": source_info.get("ui_project_server_url", "") if isinstance(source_info, dict) else "",
+        "ui_project_runtime_route_mode": source_info.get("ui_project_runtime_route_mode", "") if isinstance(source_info, dict) else "",
+        "ui_project_runtime_command": source_info.get("ui_project_runtime_command", "") if isinstance(source_info, dict) else "",
         "ui_runtime_probe_ready": bool(source_info.get("ui_runtime_probe_ready")) if isinstance(source_info, dict) else False,
         "ui_runtime_probe_count": int(source_info.get("ui_runtime_probe_count") or 0) if isinstance(source_info, dict) else 0,
         "ui_runtime_api_ready": bool(source_info.get("ui_runtime_api_ready")) if isinstance(source_info, dict) else False,
@@ -1590,12 +1752,15 @@ def _ui_domain_quality_checks(task, blueprint, ui_blueprint, ui_screenshots, sou
         and source_info.get("ui_runtime_api_ready")
         and int(source_info.get("ui_runtime_api_ok_fetch_count") or 0) > 0
     ):
-        html_text += "\n处理结果：真实业务接口记录已更新，操作日志已写入并刷新统计口径。"
+        html_text += "\n处理结果：真实业务接口数据已更新，状态与更新时间已同步保存。"
     placeholder_hits = _ui_placeholder_hits(html_text)
+    placeholder_details = _ui_screenshot_placeholder_details(ui_screenshots)
+    domain_profile = build_domain_profile(task, blueprint)
     screenshot_realism = _ui_screenshot_realism_checks(
         primary_context=_primary_context_text(task, blueprint),
         html_text=html_text,
         renderer=str(getattr(ui_blueprint, "renderer", "") or ""),
+        domain_profile=domain_profile,
     )
     text = "\n".join(
         [
@@ -1612,19 +1777,8 @@ def _ui_domain_quality_checks(task, blueprint, ui_blueprint, ui_screenshots, sou
             json.dumps(source_info.get("ui_source_evidence", {}) if isinstance(source_info, dict) else {}, ensure_ascii=False),
         ]
     )
-    primary = " ".join(
-        str(item)
-        for item in [
-            task.software_name,
-            task.product_type,
-            task.feature_hint,
-            getattr(blueprint, "industry", ""),
-            getattr(blueprint, "summary", ""),
-        ]
-        if str(item).strip()
-    )
     off_terms: list[str] = []
-    if _is_transport_operation_context(primary):
+    if domain_profile.requires_route_topology:
         off_terms = [
             "医疗系统", "医院管理", "手术", "手术室", "术前", "术后", "术式", "麻醉", "医院科室", "临床科室", "科室排班", "医生", "护士", "患者", "病历", "处方", "诊疗",
             "消除棋盘", "剩余步数", "道具背包", "关卡地图", "三星通关",
@@ -1645,6 +1799,17 @@ def _ui_domain_quality_checks(task, blueprint, ui_blueprint, ui_screenshots, sou
         "ui_screenshot_tech_leak_hits": "、".join(tech_hits[:12]),
         "ui_visible_text_clean": not placeholder_hits,
         "ui_visible_text_placeholder_hits": "、".join(placeholder_hits[:12]),
+        "ui_visible_text_placeholder_details": "；".join(placeholder_details[:12]),
+        "ui_domain_profile_key": domain_profile.key,
+        "ui_domain_profile_confidence": domain_profile.confidence,
+        "ui_domain_profile_source": domain_profile.source,
+        "ui_domain_profile_evidence": "、".join(domain_profile.evidence),
+        "ui_domain_profile_weak_evidence": "、".join(domain_profile.weak_evidence),
+        "ui_domain_profile_excluded_evidence": "、".join(domain_profile.excluded_evidence),
+        "ui_domain_gate_keys": "、".join(domain_profile.enabled_gate_keys),
+        "ui_domain_gate_reasons": "；".join(domain_profile.gate_reasons),
+        "ui_transport_related": domain_profile.transport_related,
+        "ui_route_topology_required": domain_profile.requires_route_topology,
         **screenshot_realism,
     }
 
@@ -1664,12 +1829,23 @@ def _primary_context_text(task, blueprint) -> str:
     )
 
 
-def _ui_screenshot_realism_checks(*, primary_context: str, html_text: str, renderer: str = "") -> dict:
+def _ui_screenshot_realism_checks(
+    *,
+    primary_context: str,
+    html_text: str,
+    renderer: str = "",
+    domain_profile: DomainProfile | None = None,
+) -> dict:
     is_admin = renderer not in {"game", "mobile_app"}
     operation_result_ready = (not is_admin) or (
         bool(re.search(r"(?:处理|查询|导入|导出|统计|预警|审核|复核|发布|保存|建档|维护|登记|配置|调度|处置|查看|追踪|失效|归档).{0,12}结果：", html_text))
-        and "操作日志" in html_text
-        and "刷新统计" in html_text
+        and bool(
+            re.search(
+                r"(?:状态|结果|结论|时间).{0,16}(?:保存|记录|同步|更新)|"
+                r"(?:保存|记录|同步|更新).{0,16}(?:状态|结果|结论|时间)",
+                html_text,
+            )
+        )
     )
     chart_context_ready = (not is_admin) or bool(
         re.search(
@@ -1682,12 +1858,13 @@ def _ui_screenshot_realism_checks(*, primary_context: str, html_text: str, rende
             html_text,
         )
     )
-    is_transport = _is_transport_operation_context(primary_context)
+    profile = domain_profile or build_domain_profile(context_text=primary_context)
+    is_transport = profile.requires_route_topology
     route_terms = ["干线", "支线接驳", "时窗"]
     route_topology_ready = (not is_transport) or all(term in html_text for term in route_terms)
     missing: list[str] = []
     if not operation_result_ready:
-        missing.append("操作结果/日志/统计刷新")
+        missing.append("操作结果/状态或结果更新证据")
     if not chart_context_ready:
         missing.append("图表日期或单位")
     if not route_topology_ready:
@@ -1696,22 +1873,13 @@ def _ui_screenshot_realism_checks(*, primary_context: str, html_text: str, rende
         "ui_operation_result_evidence_ready": operation_result_ready,
         "ui_chart_context_ready": chart_context_ready,
         "ui_route_topology_ready": route_topology_ready,
+        "ui_route_topology_required": is_transport,
         "ui_realism_missing_evidence": "、".join(missing),
     }
 
 
 def _is_transport_operation_context(value: str) -> bool:
-    text = str(value or "")
-    rail_quality = bool(re.search(r"轨道交通|地铁|铁路|轨道工程", text)) and bool(
-        re.search(r"施工质量|工程质量|检验批|检验点|材料复检|整改|验收|工程部位|单位工程|标段", text)
-    )
-    if rail_quality:
-        return False
-    strong_terms = r"交通运输|运输调度|公交|客运|班次|车次|发车|换乘|接驳|运力|站点|车站|枢纽|线路调度|客流|票务"
-    if not re.search(strong_terms, text):
-        return False
-    surveying_terms = r"测绘|测量|桩号|中线|断面|高程|水准|导线|放样|控制点|坐标|偏距|外业|道路工程"
-    return not re.search(surveying_terms, text)
+    return requires_transport_route_topology(value)
 
 
 _INTERNAL_ROLE_IDENTIFIER_PATTERN = (
@@ -1720,18 +1888,8 @@ _INTERNAL_ROLE_IDENTIFIER_PATTERN = (
 )
 
 
-def _ui_screenshot_html_quality(ui_screenshots) -> tuple[str, list[str]]:
-    texts: list[str] = []
-    hits: list[str] = []
-    leak_patterns: list[tuple[str, str]] = [
-        ("接口路径", r"\b(?:GET|POST|PATCH|PUT|DELETE)\s*/[A-Za-z0-9_./-]+"),
-        ("开发类名", r"\b[A-Z][A-Za-z0-9_]*(?:Record|Service|Controller|Router|Route|Entity|Model)\b"),
-        ("源码文件", r"\b[a-z][a-z0-9_]+_(?:router|service|model)\.py\b|\b[a-z][a-z0-9_]+(?:Route|Service|Record)\.js\b"),
-        ("蛇形模块key", r"\b(?:confirmed|semantic|business_module|module|admin|source|ui)_[a-z0-9_]+\b"),
-        ("英文实体", r"\b(?:TrunkRoute|TrunkNode|BranchRoute|CoverageArea|AccessNode|TransportNode|TransferPoint|ServiceScope|ConnectionRule|RuleVersion|ThresholdConfig|MatchTask|AdaptLevel|IssueItem|AdaptIssue|HandleRecord|ReviewOpinion|PublishPlan|PlanVersion|EffectiveScope|RouteMetric|RegionSummary|IssueTrend)\b"),
-        ("原型标识", r"UI Prototype|ui-prototype|generated_source|源码接口|源码文件|源码映射|接口映射"),
-        ("内部角色标识", _INTERNAL_ROLE_IDENTIFIER_PATTERN),
-    ]
+def _ui_screenshot_visible_text_items(ui_screenshots) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
     for key, item in (ui_screenshots or {}).items():
         html_path = getattr(item, "html_path", "")
         if not html_path:
@@ -1746,6 +1904,23 @@ def _ui_screenshot_html_quality(ui_screenshots) -> tuple[str, list[str]]:
         runtime_visible = str(summary.get("visible_text") or "") if isinstance(summary, dict) else ""
         if runtime_visible:
             visible = f"{visible} {runtime_visible}"
+        items.append((str(key), visible))
+    return items
+
+
+def _ui_screenshot_html_quality(ui_screenshots) -> tuple[str, list[str]]:
+    texts: list[str] = []
+    hits: list[str] = []
+    leak_patterns: list[tuple[str, str]] = [
+        ("接口路径", r"\b(?:GET|POST|PATCH|PUT|DELETE)\s*/[A-Za-z0-9_./-]+"),
+        ("开发类名", r"\b[A-Z][A-Za-z0-9_]*(?:Record|Service|Controller|Router|Route|Entity|Model)\b"),
+        ("源码文件", r"\b[a-z][a-z0-9_]+_(?:router|service|model)\.py\b|\b[a-z][a-z0-9_]+(?:Route|Service|Record)\.js\b"),
+        ("蛇形模块key", r"\b(?:confirmed|semantic|business_module|module|admin|source|ui)_[a-z0-9_]+\b"),
+        ("英文实体", r"\b(?:TrunkRoute|TrunkNode|BranchRoute|CoverageArea|AccessNode|TransportNode|TransferPoint|ServiceScope|ConnectionRule|RuleVersion|ThresholdConfig|MatchTask|AdaptLevel|IssueItem|AdaptIssue|HandleRecord|ReviewOpinion|PublishPlan|PlanVersion|EffectiveScope|RouteMetric|RegionSummary|IssueTrend)\b"),
+        ("原型标识", r"UI Prototype|ui-prototype|generated_source|源码接口|源码文件|源码映射|接口映射"),
+        ("内部角色标识", _INTERNAL_ROLE_IDENTIFIER_PATTERN),
+    ]
+    for key, visible in _ui_screenshot_visible_text_items(ui_screenshots):
         texts.append(visible)
         for label, pattern in leak_patterns:
             if re.search(pattern, visible):
@@ -1786,19 +1961,46 @@ def _visible_html_text(html: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+_UI_PLACEHOLDER_PATTERNS: list[tuple[str, str]] = [
+    ("乱码问号", r"\?{3,}"),
+    ("占位模块名", r"(?:确认|语义|模块|业务)模块\d+|module[_-]?\d+|semantic[_-]?\d+"),
+    (
+        "泛化记录名",
+        r"(?<![\u4e00-\u9fffA-Za-z0-9])(?:业务记录(?:\s*[-_#]?\s*\d+)?|记录\s*[-_#]?\s*\d+)(?![\u4e00-\u9fffA-Za-z0-9])"
+        r"|示例内容|待填写|(?:内容|说明|文案|描述|信息|资料)待完善|待补充内容|内容待补充|说明待补充",
+    ),
+    ("英文占位", r"\b(?:TODO|FIXME|Lorem ipsum|your code here)\b"),
+    ("内部角色标识", _INTERNAL_ROLE_IDENTIFIER_PATTERN),
+]
+
+
+def _ui_placeholder_matches(text: str) -> list[tuple[str, str]]:
+    matches: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for label, pattern in _UI_PLACEHOLDER_PATTERNS:
+        for match in re.finditer(pattern, str(text or ""), flags=re.I):
+            token = re.sub(r"\s+", " ", match.group(0)).strip()
+            item = (label, token)
+            if token and item not in seen:
+                seen.add(item)
+                matches.append(item)
+    return matches
+
+
 def _ui_placeholder_hits(text: str) -> list[str]:
-    patterns = [
-        ("乱码问号", r"\?{3,}"),
-        ("占位模块名", r"(?:确认|语义|模块|业务)模块\d+|module[_-]?\d+|semantic[_-]?\d+"),
-        ("泛化记录名", r"记录\d{2,}|业务记录|示例内容|待填写|(?:内容|说明|文案|描述|信息|资料)待完善|待补充内容|内容待补充|说明待补充"),
-        ("英文占位", r"\b(?:TODO|FIXME|Lorem ipsum|your code here)\b"),
-        ("内部角色标识", _INTERNAL_ROLE_IDENTIFIER_PATTERN),
-    ]
-    hits: list[str] = []
-    for label, pattern in patterns:
-        if re.search(pattern, text, flags=re.I):
-            hits.append(label)
-    return hits
+    return list(dict.fromkeys(label for label, _token in _ui_placeholder_matches(text)))
+
+
+def _ui_screenshot_placeholder_details(ui_screenshots) -> list[str]:
+    details: list[str] = []
+    seen: set[str] = set()
+    for key, visible in _ui_screenshot_visible_text_items(ui_screenshots):
+        for label, token in _ui_placeholder_matches(visible):
+            detail = f"{key}:{label}:{token}"
+            if detail not in seen:
+                seen.add(detail)
+                details.append(detail)
+    return details
 
 
 def _blueprint_task_domain_issues(task, blueprint, blueprint_source: str = "") -> list[str]:
@@ -1927,7 +2129,16 @@ def _ensure_llm_trace_path(task: GenerationTask, output_dir: Path) -> None:
     os.environ["SOFT_LLM_TRACE_PATH"] = str(output_dir / "llm_trace.jsonl")
 
 
-def _load_resume_ui_blueprint(output_dir: Path):
+def _load_resume_ui_blueprint(
+    output_dir: Path,
+    *,
+    blueprint=None,
+    prefer_prototype_manifest: bool = False,
+):
+    if prefer_prototype_manifest and blueprint is not None:
+        recovered = _load_resume_ui_blueprint_from_prototype_manifest(output_dir, blueprint)
+        if recovered is not None:
+            return recovered
     for path in [
         output_dir / "ui_screenshots" / "ui_blueprint.json",
         output_dir / "generated_source" / "ui-prototype" / "ui_blueprint.json",
@@ -1942,6 +2153,164 @@ def _load_resume_ui_blueprint(output_dir: Path):
         if getattr(ui_blueprint, "screens", None):
             return ui_blueprint
     return None
+
+
+def _load_resume_ui_blueprint_from_prototype_manifest(output_dir: Path, blueprint) -> UiBlueprint | None:
+    path = output_dir / "generated_source" / "ui-prototype" / "prototype-manifest.json"
+    data = _read_json_object(path)
+    pages = data.get("pages") if isinstance(data, dict) else None
+    renderer = str(data.get("renderer") or "") if isinstance(data, dict) else ""
+    if renderer not in {"admin", "mobile_app", "game"} or not isinstance(pages, list):
+        return None
+    page_by_key = {
+        str(item.get("key") or ""): item
+        for item in pages
+        if isinstance(item, dict) and str(item.get("key") or "").strip()
+    }
+    module_keys = {str(module.key) for module in (getattr(blueprint, "modules", []) or [])}
+    expected_main_keys = {"login", "dashboard", "statistics", *module_keys}
+    if not expected_main_keys.issubset(page_by_key):
+        return None
+    screens: list[UiScreenBlueprint] = []
+    for key in ("login", "dashboard", *[module.key for module in blueprint.modules], "statistics"):
+        item = page_by_key.get(str(key))
+        if not isinstance(item, dict):
+            continue
+        if key == "login":
+            view_type = "login"
+        elif key == "dashboard":
+            view_type = "dashboard"
+        elif key == "statistics":
+            view_type = "statistics"
+        else:
+            module_position = next(
+                (index for index, module in enumerate(blueprint.modules) if str(module.key) == str(key)),
+                0,
+            )
+            view_type = (
+                "admin_module",
+                "admin_detail",
+                "admin_workflow",
+                "admin_board",
+                "admin_form",
+                "admin_matrix",
+            )[module_position % 6]
+        screens.append(
+            UiScreenBlueprint(
+                key=str(key),
+                title=str(item.get("title") or key),
+                caption=str(item.get("caption") or ""),
+                view_type=view_type,
+                module_key=str(key) if str(key) in module_keys else "",
+            )
+        )
+    experience = data.get("product_experience_spec") if isinstance(data.get("product_experience_spec"), dict) else {}
+    visual_identity = data.get("visual_identity_spec") if isinstance(data.get("visual_identity_spec"), dict) else {}
+    if not str(visual_identity.get("identity_signature") or "").strip():
+        visual_identity = _recover_published_frontend_visual_identity(output_dir)
+    design_brief = {
+        "product_experience_spec": dict(experience),
+        "visual_identity_spec": dict(visual_identity),
+        "expected_renderer": renderer,
+        "experience_shape": str(data.get("experience_shape") or experience.get("experience_shape") or ""),
+        "experience_terminal": str(data.get("experience_terminal") or experience.get("terminal") or ""),
+        "experience_shell": str(data.get("experience_shell") or experience.get("shell") or ""),
+        "identity_signature": str(visual_identity.get("identity_signature") or data.get("identity_signature") or ""),
+        "visual_seed": str(visual_identity.get("visual_seed") or data.get("visual_seed") or ""),
+        "palette_key": str(visual_identity.get("palette_key") or data.get("palette_key") or ""),
+        "layout_variant": str(visual_identity.get("layout_variant") or data.get("layout_variant") or ""),
+        "layout_family": str(visual_identity.get("layout_variant") or data.get("layout_variant") or ""),
+        "nav_model": str(visual_identity.get("nav_model") or data.get("nav_model") or ""),
+        "workspace_shape": str(visual_identity.get("workspace_shape") or data.get("workspace_shape") or ""),
+        "login_pattern": str(visual_identity.get("login_pattern") or data.get("login_pattern") or ""),
+        "dashboard_pattern": str(data.get("dashboard_pattern") or ""),
+        "module_pattern": str(data.get("module_pattern") or ""),
+        "visual_mood": str(data.get("visual_mood") or data.get("visual_style") or ""),
+        "creative_seed": str(data.get("creative_seed") or ""),
+        "source_ui_evidence": dict(data.get("source_ui_evidence") or {}),
+        "resume_recovered_from_prototype_manifest": True,
+    }
+    return UiBlueprint(
+        renderer=renderer,
+        visual_style=str(data.get("visual_style") or ""),
+        screens=screens,
+        source=str(data.get("source") or "llm"),
+        warnings=["已从已完成截图清单恢复界面蓝图，避免晚阶段续跑改变终端类型。"],
+        design_brief=design_brief,
+    )
+
+
+def _recover_published_frontend_visual_identity(output_dir: Path) -> dict:
+    """Recover the exact visual identity used by an already published frontend."""
+    candidates = [
+        output_dir / "generated_source" / "frontend-app" / "src" / "App.jsx",
+        output_dir / "generated_source" / "ui-prototype" / "react-app" / "src" / "App.jsx",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        match = re.search(r"const\s+shellConfig\s*=\s*(\{.*?\})\s*;\s*\n\s*export\s+default", source, re.S)
+        if not match:
+            continue
+        try:
+            shell_config = json.loads(match.group(1))
+        except Exception:
+            continue
+        if not isinstance(shell_config, dict) or not str(shell_config.get("identity_signature") or "").strip():
+            continue
+        return {
+            "identity_signature": str(shell_config.get("identity_signature") or ""),
+            "visual_seed": str(shell_config.get("visual_seed") or ""),
+            "palette_key": str(shell_config.get("palette_key") or ""),
+            "palette": dict(shell_config.get("palette") or {}) if isinstance(shell_config.get("palette"), dict) else {},
+            "layout_variant": str(shell_config.get("layout_variant") or ""),
+            "nav_model": str(shell_config.get("nav_model") or ""),
+            "workspace_shape": str(shell_config.get("workspace_shape") or ""),
+            "login_pattern": str(shell_config.get("login_pattern") or ""),
+            "dashboard_composition": str(shell_config.get("dashboard_composition") or ""),
+            "module_composition_cycle": list(shell_config.get("module_composition_cycle") or [])
+            if isinstance(shell_config.get("module_composition_cycle"), list)
+            else [],
+            "table_density": str(shell_config.get("table_density") or ""),
+            "chart_style": str(shell_config.get("chart_style") or ""),
+            "surface_style": str(shell_config.get("surface_style") or ""),
+            "component_rhythm": str(shell_config.get("component_rhythm") or ""),
+            "recovered_from": str(path),
+        }
+    prototype_dir = output_dir / "generated_source" / "ui-prototype"
+    html_paths = sorted(prototype_dir.glob("*.html")) if prototype_dir.exists() else []
+    if not html_paths:
+        return {}
+    digest = sha256(b"published-static-visual-identity-v1")
+    for path in html_paths:
+        try:
+            digest.update(path.name.encode("utf-8"))
+            digest.update(path.read_bytes())
+        except OSError:
+            continue
+    signature = digest.hexdigest()
+    manifest = _read_json_object(prototype_dir / "prototype-manifest.json")
+    return {
+        "identity_signature": f"static-{signature[:20]}",
+        "visual_seed": signature[:24],
+        "palette_key": str(manifest.get("palette_key") or "published-static"),
+        "palette": {},
+        "layout_variant": str(manifest.get("layout_variant") or "published-static"),
+        "nav_model": str(manifest.get("nav_model") or "published-static"),
+        "workspace_shape": str(manifest.get("workspace_shape") or manifest.get("experience_shape") or "published-static"),
+        "login_pattern": str(manifest.get("login_pattern") or "published-static"),
+        "dashboard_composition": str(manifest.get("dashboard_pattern") or "published-static"),
+        "module_composition_cycle": [],
+        "table_density": str(manifest.get("table_density") or "published-static"),
+        "chart_style": str(manifest.get("chart_style") or "published-static"),
+        "surface_style": str(manifest.get("surface_style") or "published-static"),
+        "component_rhythm": str(manifest.get("component_rhythm") or "published-static"),
+        "recovered_from": str(prototype_dir),
+    }
 
 
 _RESUME_STAGE_ORDER = {
@@ -2020,7 +2389,7 @@ def _should_defer_pre_render_similarity_for_resume(
     visual_reference_report: dict | None,
 ) -> bool:
     return bool(
-        resume_stage in {"screenshots", "done"}
+        _stage_precedes("visual_reference", resume_stage)
         and resume_ui_blueprint is not None
         and attempt_cached is not None
         and isinstance(visual_reference_report, dict)
@@ -2138,6 +2507,7 @@ def _load_resume_source_info(output_dir: Path, blueprint, visual_reference_repor
     if not source_dir.is_dir() or not blueprint_path.is_file():
         return None
     repair_generated_business_record_labels(source_dir)
+    repair_generated_domain_sample_leaks(source_dir, blueprint)
     stats = source_project_stats(source_dir)
     if int(stats.get("total_lines") or 0) <= 0:
         return None
@@ -2194,12 +2564,20 @@ def _invalidate_legacy_frontend_cache_for_pagespec(output_dir: Path) -> dict:
     previous_version = str(marker.get("frontend_engine_version") or "legacy-react-cache")
     if previous_version == FRONTEND_ENGINE_VERSION:
         return {"migrated": False, "previous_version": previous_version, "invalidated_file_count": 0}
+    page_spec_renderer_upgrade = previous_version.startswith("pagespec-hybrid-") and any(
+        path.is_file() for path in screens_dir.glob("*.page-spec.json")
+    )
     cached_files = [
         path
         for path in screens_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in {".jsx", ".css", ".json"}
+        if path.is_file()
+        and path.suffix.lower() in {".jsx", ".css", ".json"}
+        and not (
+            page_spec_renderer_upgrade
+            and (path.name.endswith(".page-spec.json") or path.name.endswith(".meta.json"))
+        )
     ]
-    if not cached_files:
+    if not cached_files and not page_spec_renderer_upgrade:
         return {"migrated": False, "previous_version": previous_version, "invalidated_file_count": 0}
     invalidated = 0
     for path in cached_files:
@@ -2245,7 +2623,14 @@ def _invalidate_legacy_frontend_cache_for_pagespec(output_dir: Path) -> dict:
         "migrated": True,
         "previous_version": previous_version,
         "invalidated_file_count": invalidated,
-        "preserved": ["product-blueprint", "technical-architecture", "manual-content", "generated-source", "image2-style-reference"],
+        "preserved": [
+            "product-blueprint",
+            "technical-architecture",
+            "manual-content",
+            "generated-source",
+            "image2-style-reference",
+            *(["page-spec-json", "page-spec-meta"] if page_spec_renderer_upgrade else []),
+        ],
     }
 
 
@@ -2255,7 +2640,12 @@ def _begin_generation_attempt(output_dir: Path, task: GenerationTask, *, resume_
     setattr(task, "attempt_started_at", now)
     setattr(task, "resume_source", str(resume_source or "new-task"))
     _archive_previous_failure(output_dir)
-    _write_generation_state(output_dir, task, "running", "prepare", 0, "准备生成任务", {})
+    resume_stage = str(getattr(task, "resume_stage", "") or "")
+    resume_progress = int(getattr(task, "resume_progress", 0) or 0)
+    initial_stage = resume_stage if resume_source == "failure-state" and resume_stage in _RESUME_STAGE_ORDER else "prepare"
+    initial_progress = resume_progress if initial_stage == resume_stage else 0
+    initial_message = f"准备从{_resume_stage_label(initial_stage)}继续" if initial_stage != "prepare" else "准备生成任务"
+    _write_generation_state(output_dir, task, "running", initial_stage, initial_progress, initial_message, {})
 
 
 def _archive_previous_failure(output_dir: Path) -> None:
@@ -2296,11 +2686,14 @@ def _write_generation_state(
         "task": {
             "software_name": task.software_name,
             "version": task.version,
+            "language": task.language,
             "product_type": task.product_type,
             "software_category": task.software_category,
+            "feature_hint": task.feature_hint,
             "seed": task.seed,
             "output_dir": str(output_dir),
             "resume_existing_output": bool(getattr(task, "resume_existing_output", False)),
+            "confirmed_outline": getattr(task, "confirmed_outline", {}) or {},
         },
         "extra": _safe_state_extra(extra or {}),
     }

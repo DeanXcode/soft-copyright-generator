@@ -16,13 +16,17 @@ export default function QueuePanel({
   onRestoreRecoverableTask,
   onDeleteRecoverableTask
 }) {
-  const visibleTasks = taskQueue.slice(-8);
-  const hasTasks = taskQueue.length > 0;
-  const runningTask = taskQueue.find((task) => task.status === "running" || task.status === "planning");
-  const canToggleQueue = hasTasks && (queuePaused ? queueSummary.queued > 0 : queueSummary.queued > 0);
-  const recoverableVisible = (recoverableTasks || []).slice(0, 3);
+  const safeTasks = Array.isArray(taskQueue) ? taskQueue.filter((task) => task && typeof task === "object") : [];
+  const safeSummary = queueSummary && typeof queueSummary === "object"
+    ? queueSummary
+    : { total: safeTasks.length, queued: 0, running: 0, success: 0, error: 0, cancelled: 0 };
+  const visibleTasks = safeTasks.slice(-8);
+  const hasTasks = safeTasks.length > 0;
+  const runningTask = safeTasks.find((task) => task.status === "running" || task.status === "planning");
+  const canToggleQueue = hasTasks && safeSummary.queued > 0;
+  const recoverableVisible = Array.isArray(recoverableTasks) ? recoverableTasks.filter(Boolean).slice(0, 3) : [];
   const summaryText = hasTasks
-    ? `${queueSummary.total} 项 · ${queueSummary.queued} 等待 · ${queueSummary.running} 运行 · ${queueSummary.success} 完成`
+    ? `${safeSummary.total} 项 · ${safeSummary.queued} 等待 · ${safeSummary.running} 运行 · ${safeSummary.success} 完成`
     : "可在底部输入框追加任务，队列会按顺序一个一个生成";
   return (
     <section className="work-section queue-section">
@@ -49,6 +53,7 @@ export default function QueuePanel({
                 <span>
                   恢复 {task.title}
                   {task.pageEngineUpgradeRequired && <small>页面生成引擎已升级，将复用蓝图和参考图并重新生成全部界面</small>}
+                  {task.domainProfile?.key && <small>领域：{domainProfileLabel(task.domainProfile.key)}{task.domainProfile.gateReasons ? ` · ${task.domainProfile.gateReasons}` : ""}</small>}
                 </span>
               </button>
               <button
@@ -111,11 +116,25 @@ export default function QueuePanel({
               </div>
             );
           })}
-          {taskQueue.length > visibleTasks.length && <small className="queue-more">仅显示最近 {visibleTasks.length} 项，共 {taskQueue.length} 项</small>}
+          {safeTasks.length > visibleTasks.length && <small className="queue-more">仅显示最近 {visibleTasks.length} 项，共 {safeTasks.length} 项</small>}
         </div>
       )}
     </section>
   );
+}
+
+function domainProfileLabel(key) {
+  const labels = {
+    transport_route: "交通线路",
+    download_manager: "下载管理",
+    workforce_attendance: "考勤人力",
+    medical: "医疗",
+    survey_mapping: "测绘地理",
+    smart_manufacturing: "智能制造",
+    rail_construction_quality: "轨道施工质量",
+    general_business: "通用业务"
+  };
+  return labels[key] || key;
 }
 
 function queueTaskStatusLabel(task) {

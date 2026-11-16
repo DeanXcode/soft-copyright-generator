@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import requests
 
+from backend.softcopyright.llm import provider as provider_module
 from backend.softcopyright.llm.provider import (
     AnthropicProvider,
     LLMConfig,
@@ -46,9 +47,10 @@ class _CaptureSession:
 class _StatusResponse(_JsonResponse):
     headers = {"content-type": "application/json"}
 
-    def __init__(self, status_code, data=None):
+    def __init__(self, status_code, data=None, text=""):
         super().__init__(data or {"choices": [{"message": {"content": "ok"}}]})
         self.status_code = status_code
+        self.text = text
         self.closed = False
 
     def raise_for_status(self):
@@ -99,6 +101,12 @@ class _BlockingStreamingResponse:
 
 
 class LlmProviderVariantTests(unittest.TestCase):
+    def test_requests_session_uses_proxy_environment_only_when_explicitly_enabled(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(provider_module._new_requests_session().trust_env)
+        with patch.dict("os.environ", {"SOFT_LLM_USE_SYSTEM_PROXY": "true"}, clear=True):
+            self.assertTrue(provider_module._new_requests_session().trust_env)
+
     def test_text_error_classification_covers_retry_and_configuration_categories(self):
         cases = [
             (_StatusResponse(401), TextErrorCategory.CONFIGURATION),
@@ -167,6 +175,86 @@ class LlmProviderVariantTests(unittest.TestCase):
         self.assertEqual(raised.exception.attempts, 1)
         self.assertEqual(raised.exception.stop_reason, "configuration_error_no_retry")
         self.assertEqual(len(configuration_session.calls), 1)
+
+    def test_json_response_format_compatibility_fallback_is_narrow_and_one_shot(self):
+        provider = OpenAICompatibleProvider(
+            LLMConfig(provider="gpt", base_url="https://gateway.example/v1", api_key="test-key", model="test-model")
+        )
+        rejected = _StatusResponse(400, text="unsupported parameter: response_format")
+        session = _SequenceSession([rejected, _StatusResponse(200)])
+        with patch("backend.softcopyright.llm.provider._new_requests_session", return_value=session), patch(
+            "backend.softcopyright.llm.provider._extract_chat_content", return_value="ok"
+        ), patch("backend.softcopyright.llm.provider.trace_event") as trace:
+            result = provider.chat(
+                [{"role": "user", "content": "test"}],
+                response_format={"type": "json_object"},
+                retry_policy=TextRetryPolicy(max_retries=0),
+            )
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(session.calls), 2)
+        self.assertIn("response_format", session.calls[0][1]["json"])
+        self.assertNotIn("response_format", session.calls[1][1]["json"])
+        self.assertTrue(any(call.args and call.args[0] == "provider_request_compatibility_fallback" for call in trace.call_args_list))
+
+    def test_root_gateway_html_falls_back_to_v1_chat_endpoint(self):
+        provider = OpenAICompatibleProvider(
+            LLMConfig(provider="custom", base_url="https://gateway.example", api_key="test-key", model="test-model")
+        )
+        html = _StatusResponse(200)
+        html.headers = {"content-type": "text/html; charset=utf-8"}
+        session = _SequenceSession([html, _StatusResponse(200)])
+        with patch("backend.softcopyright.llm.provider._new_requests_session", return_value=session), patch(
+            "backend.softcopyright.llm.provider.trace_event"
+        ) as trace:
+            result = provider.chat([{"role": "user", "content": "test"}], retry_policy=TextRetryPolicy(max_retries=0))
+        self.assertEqual(result, "ok")
+        self.assertEqual([item[0] for item in session.calls], [
+            "https://gateway.example/chat/completions",
+            "https://gateway.example/v1/chat/completions",
+        ])
+        self.assertTrue(any(call.args and call.args[0] == "provider_request_endpoint_fallback" for call in trace.call_args_list))
+
+    def test_authentication_400_does_not_use_compatibility_fallback(self):
+        provider = OpenAICompatibleProvider(
+            LLMConfig(provider="gpt", base_url="https://gateway.example/v1", api_key="test-key", model="test-model")
+        )
+        rejected = _StatusResponse(400, text="invalid model: test-model")
+        session = _SequenceSession([rejected, _StatusResponse(200)])
+        with patch("backend.softcopyright.llm.provider._new_requests_session", return_value=session):
+            with self.assertRaises(TextProviderError) as raised:
+                provider.chat(
+                    [{"role": "user", "content": "test"}],
+                    response_format={"type": "json_object"},
+                    retry_policy=TextRetryPolicy(max_retries=2),
+                )
+        self.assertEqual(raised.exception.category, TextErrorCategory.CONFIGURATION)
+        self.assertEqual(len(session.calls), 1)
+
+    def test_no_effective_pricing_uses_configured_model_fallback_once(self):
+        provider = OpenAICompatibleProvider(
+            LLMConfig(provider="gpt", base_url="https://gateway.example/v1", api_key="test-key", model="frontend-model")
+        )
+        rejected = _StatusResponse(400, text='{"error":{"message":"Current group has no effective pricing for model frontend-model"}}')
+        session = _SequenceSession([rejected, _StatusResponse(200)])
+        with patch.dict("os.environ", {"SOFT_MODEL_GPT_NAME": "main-model"}, clear=False), patch(
+            "backend.softcopyright.llm.provider._new_requests_session", return_value=session
+        ), patch("backend.softcopyright.llm.provider._extract_chat_content", return_value="ok"):
+            result = provider.chat([{"role": "user", "content": "test"}], retry_policy=TextRetryPolicy(max_retries=0))
+        self.assertEqual(result, "ok")
+        self.assertEqual(session.calls[0][1]["json"]["model"], "frontend-model")
+        self.assertEqual(session.calls[1][1]["json"]["model"], "main-model")
+
+    def test_unsupported_model_404_uses_same_configured_fallback(self):
+        provider = OpenAICompatibleProvider(
+            LLMConfig(provider="gpt", base_url="https://gateway.example/v1", api_key="test-key", model="frontend-model")
+        )
+        rejected = _StatusResponse(404, text='{"error":{"message":"当前模型暂不支持请更换模型使用"}}')
+        session = _SequenceSession([rejected, _StatusResponse(200)])
+        with patch.dict("os.environ", {"SOFT_MODEL_GPT_NAME": "main-model"}, clear=False), patch(
+            "backend.softcopyright.llm.provider._new_requests_session", return_value=session
+        ), patch("backend.softcopyright.llm.provider._extract_chat_content", return_value="ok"):
+            self.assertEqual(provider.chat([{"role": "user", "content": "test"}], retry_policy=TextRetryPolicy(max_retries=0)), "ok")
+        self.assertEqual(session.calls[1][1]["json"]["model"], "main-model")
 
     def test_cancelling_stream_closes_response_and_session(self):
         provider = OpenAICompatibleProvider(

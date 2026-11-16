@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -9,6 +10,50 @@ from backend.softcopyright.ui_similarity import _package_page_similarity
 
 
 HTML = """<!doctype html><html><body><main class="workspace"><section class="query-grid"><table class="table-frame"></table></section></main></body></html>"""
+
+
+def _write_page_spec_screen(
+    root: Path,
+    *,
+    key: str,
+    page_kind: str,
+    layout: str,
+    components: list[str],
+    action_variants: list[str],
+) -> Path:
+    html_path = root / f"{key}.html"
+    html_path.write_text(
+        f'<!doctype html><html><head><meta name="soft-react-screen" content="{key}"></head><body></body></html>',
+        encoding="utf-8",
+    )
+    screens_dir = root / "react-app" / "src" / "screens"
+    screens_dir.mkdir(parents=True, exist_ok=True)
+    stem = "".join(part.title() for part in key.split("_"))
+    (screens_dir / f"{stem}.meta.json").write_text(
+        json.dumps({"page_key": key, "engine": "page-spec-v1"}),
+        encoding="utf-8",
+    )
+    (screens_dir / f"{stem}.page-spec.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "page-spec-v1",
+                "page_key": key,
+                "page_kind": page_kind,
+                "layout": layout,
+                "regions": [
+                    {"id": f"region_{index}", "component": component}
+                    for index, component in enumerate(components)
+                ],
+                "actions": [
+                    {"id": f"action_{index}", "variant": variant}
+                    for index, variant in enumerate(action_variants)
+                ],
+                "interaction_contract": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return html_path
 
 
 class UiPackageSimilarityTests(unittest.TestCase):
@@ -109,6 +154,75 @@ class UiPackageSimilarityTests(unittest.TestCase):
 
         self.assertEqual(reason, "")
         self.assertEqual(score, 0.0)
+
+    def test_pagespec_uses_layout_and_region_order_instead_of_shared_component_css(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            left_path = _write_page_spec_screen(
+                root,
+                key="publish_validation",
+                page_kind="operation",
+                layout="result_confirmation",
+                components=["metric_group", "detail", "data_table", "workflow", "form", "operation_result"],
+                action_variants=["danger"],
+            )
+            right_path = _write_page_spec_screen(
+                root,
+                key="execute_recognition",
+                page_kind="operation",
+                layout="result_confirmation",
+                components=["detail", "form", "metric_group", "workflow", "operation_result", "data_table"],
+                action_variants=["primary"],
+            )
+            screenshots = {
+                "left": SimpleNamespace(
+                    html_path=str(left_path),
+                    page_kind="operation",
+                    interaction_mode="query",
+                    interaction_surface="query_results",
+                    requires_confirmation=True,
+                ),
+                "right": SimpleNamespace(
+                    html_path=str(right_path),
+                    page_kind="operation",
+                    interaction_mode="workflow",
+                    interaction_surface="workflow_result",
+                    requires_confirmation=False,
+                ),
+                "module-a": SimpleNamespace(html_path=str(left_path), page_kind="general"),
+                "module-b": SimpleNamespace(html_path=str(right_path), page_kind="general"),
+            }
+
+            score, reason = _package_page_similarity(screenshots)
+
+        self.assertEqual(reason, "")
+        self.assertLess(score, 0.86)
+
+    def test_identical_pagespec_primary_module_pages_still_fail(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            screenshots = {}
+            for index in range(4):
+                path = _write_page_spec_screen(
+                    root,
+                    key=f"module_{index}",
+                    page_kind="module",
+                    layout="table_workspace",
+                    components=["filter_bar", "metric_group", "data_table", "detail"],
+                    action_variants=["primary"],
+                )
+                screenshots[str(index)] = SimpleNamespace(
+                    html_path=str(path),
+                    page_kind="module",
+                    interaction_mode="",
+                    interaction_surface="",
+                    requires_confirmation=False,
+                )
+
+            score, reason = _package_page_similarity(screenshots)
+
+        self.assertEqual(reason, "ui_package_pages_too_similar")
+        self.assertGreaterEqual(score, 0.86)
 
 
 if __name__ == "__main__":

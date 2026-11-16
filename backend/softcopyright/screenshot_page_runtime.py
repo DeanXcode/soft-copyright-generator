@@ -7,6 +7,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from typing import Any
 import urllib.request
@@ -25,12 +26,15 @@ def start_project_server(source_info: dict | None) -> dict[str, Any]:
     port = select_port(default_port)
     base_url = f"http://127.0.0.1:{port}/ui-prototype"
     command = project_server_command(source_dir, route_mode, port)
+    runtime_route_mode = str(command.get("route_mode") or route_mode)
     process = subprocess.Popen(
         command["args"],
         cwd=str(source_dir),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         text=True,
+        encoding="utf-8",
+        errors="ignore",
         env=command.get("env"),
     )
     try:
@@ -39,7 +43,15 @@ def start_project_server(source_info: dict | None) -> dict[str, Any]:
         stop_project_server({"process": process})
         raise
     source_info["ui_project_server_url"] = base_url
-    return {"process": process, "base_url": base_url, "port": port, "route_mode": route_mode, "command": command["display"]}
+    source_info["ui_project_runtime_route_mode"] = runtime_route_mode
+    source_info["ui_project_runtime_command"] = command["display"]
+    return {
+        "process": process,
+        "base_url": base_url,
+        "port": port,
+        "route_mode": runtime_route_mode,
+        "command": command["display"],
+    }
 
 
 def default_project_port(route_mode: str) -> int:
@@ -51,9 +63,18 @@ def project_server_command(source_dir: Path, route_mode: str, port: int) -> dict
     env["PORT"] = str(port)
     if route_mode == "aspnet-static":
         dotnet = shutil.which("dotnet")
-        if not dotnet:
-            raise RuntimeError("未找到 dotnet，无法启动 C# 生成项目")
-        return {"args": [dotnet, "run", "--urls", f"http://127.0.0.1:{port}"], "env": env, "display": "dotnet run"}
+        if dotnet:
+            return {
+                "args": [dotnet, "run", "--urls", f"http://127.0.0.1:{port}"],
+                "env": env,
+                "display": "dotnet run",
+                "route_mode": "aspnet-static",
+            }
+        fallback = node_fallback_command(source_dir, port, env)
+        if fallback:
+            fallback["display"] = "node web-console/src/server.js（未安装 .NET 时使用生成项目备用入口）"
+            return fallback
+        raise RuntimeError("未找到 dotnet，且 C# 生成项目缺少零依赖 web-console 备用入口")
     if route_mode == "spring-static":
         mvn = shutil.which("mvn") or shutil.which("mvn.cmd")
         if mvn:
@@ -61,13 +82,12 @@ def project_server_command(source_dir: Path, route_mode: str, port: int) -> dict
                 "args": [mvn, "spring-boot:run", f"-Dspring-boot.run.arguments=--server.port={port}"],
                 "env": env,
                 "display": "mvn spring-boot:run",
+                "route_mode": "spring-static",
             }
-        for folder in ("web-console", "gateway-service"):
-            node_app = source_dir / folder
-            if (node_app / "src" / "server.js").exists():
-                command = project_server_command(node_app, "node-static", port)
-                command["display"] = f"node {folder}/src/server.js"
-                return command
+        fallback = node_fallback_command(source_dir, port, env)
+        if fallback:
+            fallback["display"] = "node web-console/src/server.js（未安装 Maven 时使用生成项目备用入口）"
+            return fallback
         raise RuntimeError("未找到 Maven，且生成项目缺少 web-console/gateway-service 运行入口，无法启动 Java/Spring Boot 生成项目")
     if route_mode == "node-static" and (source_dir / "gateway-service" / "src" / "server.js").exists():
         command = project_server_command(source_dir / "gateway-service", "node-static", port)
@@ -78,9 +98,7 @@ def project_server_command(source_dir: Path, route_mode: str, port: int) -> dict
         command["display"] = "node web-console/src/server.js"
         return command
     if route_mode in {"node-static", "express-static"}:
-        node = shutil.which("node")
-        if not node:
-            raise RuntimeError("未找到 Node.js，无法启动 JavaScript/Express 生成项目")
+        node, env = resolve_node_runtime(env)
         app_dir = source_dir
         server_path = app_dir / "src" / "server.js"
         if not server_path.exists():
@@ -93,18 +111,68 @@ def project_server_command(source_dir: Path, route_mode: str, port: int) -> dict
         ensure_node_dependencies(app_dir, allow_install=route_mode == "express-static")
         if not server_path.exists():
             raise RuntimeError("生成项目缺少 src/server.js")
-        return {"args": [node, str(server_path.resolve())], "env": env, "display": "node src/server.js"}
+        return {
+            "args": [node, str(server_path.resolve())],
+            "env": env,
+            "display": "node src/server.js",
+            "route_mode": "node-static",
+        }
     if route_mode == "fastapi-static":
-        python = shutil.which("python") or shutil.which("python.exe")
+        python = sys.executable or shutil.which("python") or shutil.which("python.exe")
         if not python:
             raise RuntimeError("未找到 Python，无法启动 FastAPI 生成项目")
-        module_name = "app.runtime_routes:app" if (source_dir / "app" / "runtime_routes.py").exists() else "app.main:app"
-        return {
-            "args": [python, "-m", "uvicorn", module_name, "--host", "127.0.0.1", "--port", str(port)],
-            "env": env,
-            "display": f"python -m uvicorn {module_name}",
-        }
+        if python_runtime_has_fastapi(python):
+            module_name = "app.runtime_routes:app" if (source_dir / "app" / "runtime_routes.py").exists() else "app.main:app"
+            return {
+                "args": [python, "-m", "uvicorn", module_name, "--host", "127.0.0.1", "--port", str(port)],
+                "env": env,
+                "display": f"python -m uvicorn {module_name}",
+                "route_mode": "fastapi-static",
+            }
+        fallback = node_fallback_command(source_dir, port, env)
+        if fallback:
+            fallback["display"] = "node web-console/src/server.js（包内 Python 缺少 FastAPI/Uvicorn 时使用生成项目备用入口）"
+            return fallback
+        raise RuntimeError("包内 Python 缺少 FastAPI/Uvicorn，且生成项目缺少零依赖 web-console 备用入口")
     raise RuntimeError(f"不支持的生成项目服务路由模式：{route_mode or 'unknown'}")
+
+
+def python_runtime_has_fastapi(python: str) -> bool:
+    try:
+        result = subprocess.run(
+            [python, "-c", "import fastapi, uvicorn"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def resolve_node_runtime(env: dict[str, str] | None = None) -> tuple[str, dict[str, str]]:
+    child_env = dict(env or os.environ)
+    electron_node = os.getenv("SOFT_ELECTRON_NODE", "").strip()
+    node = electron_node or shutil.which("node") or shutil.which("node.exe")
+    if not node:
+        raise RuntimeError("未找到随软件提供的 Node 运行环境，无法启动 JavaScript/Express 生成项目")
+    if electron_node and os.path.normcase(str(node)) == os.path.normcase(electron_node):
+        child_env["ELECTRON_RUN_AS_NODE"] = "1"
+    else:
+        child_env.pop("ELECTRON_RUN_AS_NODE", None)
+    return node, child_env
+
+
+def node_fallback_command(source_dir: Path, port: int, env: dict[str, str]) -> dict[str, Any] | None:
+    for folder in ("web-console", "gateway-service"):
+        node_app = source_dir / folder
+        if not (node_app / "src" / "server.js").exists():
+            continue
+        command = project_server_command(node_app, "node-static", port)
+        command["env"].update({key: value for key, value in env.items() if key == "PORT"})
+        return command
+    return None
 
 
 def ensure_node_dependencies(source_dir: Path, *, allow_install: bool = False) -> None:
@@ -162,7 +230,8 @@ def wait_for_http(url: str, process, timeout_seconds: int) -> None:
     last_error = ""
     while time.time() < deadline:
         if process.poll() is not None:
-            raise RuntimeError("生成项目服务启动后立即退出")
+            detail = f"exit code {process.returncode}"
+            raise RuntimeError(f"生成项目服务启动后立即退出：{detail}")
         try:
             with urllib.request.urlopen(url, timeout=2) as response:
                 if 200 <= response.status < 500:
@@ -184,7 +253,11 @@ def verify_project_runtime(source_info: dict | None, source_evidence: dict[str, 
     module_keys = list(modules.keys())[:3] if isinstance(modules, dict) else []
     if not module_keys:
         raise RuntimeError("未找到可验证的源码模块接口证据")
-    route_mode = str((source_info.get("ui_project_entry") or {}).get("route_mode") or "")
+    route_mode = str(
+        source_info.get("ui_project_runtime_route_mode")
+        or (source_info.get("ui_project_entry") or {}).get("route_mode")
+        or ""
+    )
     for module_key in module_keys:
         urls = runtime_probe_urls(root_url, route_mode, module_key)
         ok_probe = None

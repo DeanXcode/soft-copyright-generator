@@ -8,18 +8,24 @@ import unittest
 from backend.softcopyright.blueprint import FeatureModule, ProductBlueprint, generate_blueprint
 from backend.softcopyright.industry_subtypes import INDUSTRY_SUBTYPES
 from backend.softcopyright.llm_blueprint import (
+    blueprint_contract_review,
     _clean_workflows,
     _generate_modules,
     _generate_module_batches,
+    generate_blueprint_with_llm,
     _expected_plan_terminal,
+    _feature_term_matches_plan,
     _normalize_plan_terminal_semantics,
     _quality_review,
+    _reconcile_plan_with_contract,
     _select_contract_modules,
     blueprint_contract_issues,
     normalize_cached_blueprint_candidate,
+    repair_blueprint_contract,
 )
 from backend.softcopyright.models import GenerationTask
 from backend.softcopyright.module_keys import is_placeholder_module_key, semantic_module_key
+from backend.softcopyright.product_experience import build_product_experience_spec
 from backend.softcopyright.generator import _load_accepted_product_blueprint
 from backend.softcopyright.validator import validate_materials
 
@@ -101,6 +107,114 @@ def _valid_blueprint(task):
 
 
 class BlueprintOperationContractTests(unittest.TestCase):
+    def test_download_manager_app_stays_mobile_despite_queue_scheduling_terms(self):
+        task = GenerationTask(
+            software_name="疾风下载",
+            product_type="APP",
+            feature_hint="下载链接解析、下载任务创建、下载队列调度、后台下载和断点续传",
+        )
+
+        self.assertEqual(_expected_plan_terminal(task), "mobile_app")
+
+    def test_download_manager_experience_ignores_background_download_as_admin_signal(self):
+        task = GenerationTask(
+            software_name="疾风下载",
+            product_type="APP",
+            feature_hint="下载链接、下载任务、下载队列调度、后台下载、下载进度和断点续传",
+        )
+        blueprint = _valid_blueprint(task)
+        blueprint.modules = [deepcopy(blueprint.modules[index % 2]) for index in range(4)]
+        for index, module in enumerate(blueprint.modules, start=1):
+            module.key = f"download_experience_{index}"
+        blueprint.industry = "移动文件下载与传输管理"
+        blueprint.summary = "用户可在手机 App 的个人中心查看会员状态和会员并发权益，并持续执行后台下载。"
+
+        experience = build_product_experience_spec(task, blueprint)
+        normalized = normalize_cached_blueprint_candidate(task, blueprint)
+        joined = json.dumps(normalized.to_dict(), ensure_ascii=False)
+
+        self.assertEqual(experience.industry_subtype_key, "download_manager")
+        self.assertEqual(experience.renderer, "mobile_app")
+        self.assertNotIn("会员状态", joined)
+        self.assertNotIn("会员权益", joined)
+        self.assertNotIn("个人中心", joined)
+
+    def test_download_manager_cached_generic_operations_are_repaired_locally(self):
+        task = GenerationTask(
+            software_name="疾风下载",
+            product_type="APP",
+            feature_hint="下载链接解析、下载任务、下载队列、后台下载和断点续传",
+        )
+        blueprint = _valid_blueprint(task)
+        blueprint.modules = [deepcopy(blueprint.modules[index % 2]) for index in range(4)]
+        for index, (module, title) in enumerate(
+            zip(
+                blueprint.modules,
+                ("下载链接解析", "新建下载任务", "下载队列编排", "加速与后台下载"),
+            ),
+            start=1,
+        ):
+            module.key = f"download_module_{index}"
+            module.title = title
+            module.operation_specs = [
+                _operation(f"{module.key}_{index}", label, category, "当前用户", "需要处理下载任务", ["任务编号", "任务状态"], "待处理", "已更新", "页面结果和更新时间")
+                for index, (label, category) in enumerate(
+                    [
+                        (f"筛选{module.title}记录", "lookup"),
+                        (f"{module.title}登记", "mutation"),
+                        (f"{module.title}校验", "workflow"),
+                    ],
+                    start=1,
+                )
+            ]
+            module.operations = [spec["label"] for spec in module.operation_specs]
+
+        normalized = normalize_cached_blueprint_candidate(task, blueprint)
+        labels = {module.title: [spec["label"] for spec in module.operation_specs] for module in normalized.modules}
+
+        self.assertIn("解析下载链接", labels["下载链接解析"])
+        self.assertIn("调整任务优先级", labels["下载队列编排"])
+        self.assertNotIn("下载队列编排登记", labels["下载队列编排"])
+
+    def test_generic_lookup_record_suffix_does_not_trigger_cross_module_duplication(self):
+        task = GenerationTask(software_name="下载任务工具", product_type="APP")
+        blueprint = _valid_blueprint(task)
+        titles = ["链接解析", "任务创建", "队列编排", "传输执行", "异常恢复", "文件交付"]
+        verbs = ["解析", "创建", "调序", "传输", "续传", "交付"]
+        blueprint.modules = []
+        for index, (title, verb) in enumerate(zip(titles, verbs), start=1):
+            operations = [
+                _operation(f"lookup_{index}", f"筛选{title}记录", "lookup", "当前用户", f"需要定位{title}", [f"{title}编号", f"{title}状态"], "未筛选", "显示匹配结果", "筛选条件和结果数量"),
+                _operation(f"action_{index}", f"{verb}目标对象", "workflow", "当前用户", f"需要执行{verb}", [f"{title}编号", "执行参数"], "待执行", f"已完成{verb}", f"{verb}结果和状态轨迹"),
+                _operation(f"result_{index}", f"查看{verb}结果", "result", "当前用户", f"{verb}完成后", [f"{title}编号", "完成时间"], f"已完成{verb}", "结果已展示", f"{verb}结果和完成时间"),
+            ]
+            module = _module(f"download_{index}", title, operations)
+            module.description = f"围绕{title}执行{verb}处理，核对输入参数、状态变化和结果证据。"
+            blueprint.modules.append(module)
+
+        issues = blueprint_contract_issues(task, blueprint)
+
+        self.assertFalse(any("跨模块操作重复度过高" in issue for issue in issues), issues)
+
+    def test_agency_accounting_app_uses_admin_terminal(self):
+        task = GenerationTask(
+            software_name="风灵月影代账",
+            product_type="APP",
+            feature_hint="企业客户建档、核算账套、税务申报、财务报表",
+            model_provider="custom",
+        )
+        self.assertEqual(_expected_plan_terminal(task), "admin")
+
+    def test_figma_design_viewer_app_uses_desktop_terminal(self):
+        task = GenerationTask(
+            software_name="Figma浏览器",
+            product_type="APP",
+            feature_hint="设计文件、页面画板、图层组件、原型演示和设计评审",
+            model_provider="custom",
+        )
+
+        self.assertEqual(_expected_plan_terminal(task), "admin")
+
     def setUp(self):
         self.task = GenerationTask(
             software_name="智能生产效率提升平台",
@@ -113,6 +227,51 @@ class BlueprintOperationContractTests(unittest.TestCase):
         blueprint = _valid_blueprint(self.task)
 
         self.assertEqual(blueprint_contract_issues(self.task, blueprint), [])
+
+    def test_feature_hint_semantic_phrases_match_equivalent_business_actions(self):
+        joined = "移动现场点检执行、消防设施档案、隐患整改复验闭环、异常告警联动处置"
+
+        self.assertTrue(_feature_term_matches_plan("移动巡检", joined))
+        self.assertTrue(_feature_term_matches_plan("消防设施台账", joined))
+        self.assertTrue(_feature_term_matches_plan("隐患闭环", joined))
+        self.assertFalse(_feature_term_matches_plan("会员积分兑换", joined))
+
+    def test_real_business_action_descriptions_are_not_penalized_as_generic(self):
+        task = GenerationTask(
+            software_name="智慧园区消防设施巡检与隐患闭环平台",
+            product_type="物联网软件",
+            feature_hint="消防设施台账、移动巡检、隐患闭环",
+            seed="fire-blueprint-quality",
+        )
+        blueprint = _valid_blueprint(task)
+        blueprint.summary = (
+            "面向园区消防安全管理岗位，围绕消防设施档案、移动现场点检、告警联动、隐患上报、整改复验和闭环统计，"
+            "形成从对象建档到结果追溯的完整流程；系统按设施位置和责任范围组织任务，记录每次采集、处置和复验结果，"
+            "为日常巡检、隐患治理、管理复盘和审计追踪提供统一且可核验的业务依据。"
+        )
+        descriptions = [
+            "围绕消防设施档案执行对象建档、二维码绑定和停用恢复，记录设施位置、责任单位和有效期限。",
+            "按责任区域编排巡检计划并下达现场点检任务，记录执行人员、计划时间和任务状态。",
+            "采集消防设施状态并监测异常阈值，生成告警后联动派发处置任务并保留反馈证据。",
+            "接收隐患上报并生成整改要求，责任人员提交结果后由复验人员关闭或退回隐患。",
+        ]
+        blueprint.modules = [deepcopy(blueprint.modules[index % 2]) for index in range(4)]
+        for index, module in enumerate(blueprint.modules):
+            module.key = f"fire_module_{index}"
+            module.title = ["消防设施对象建档", "巡检计划任务编排", "状态监测告警联动", "隐患整改复验闭环"][index]
+            module.description = descriptions[index] + "系统同步保存前后状态、责任岗位与结果依据，支持后续查询和追溯。"
+            module.data_fields = ["设施编号", "安装位置", "责任单位", "当前状态", "更新时间", "结果证据"]
+            module.operations = ["查询消防设施", "执行现场点检", "上报告警隐患", "提交整改结果", "复验关闭隐患"]
+        blueprint.business_objects = ["消防设施档案", "巡检计划", "点检任务", "告警事件", "隐患单", "整改任务"]
+        blueprint.workflows = blueprint.workflows * 3
+        blueprint.report_metrics = ["巡检完成率", "告警处置率", "隐患闭环率", "平均整改时长", "复验通过率", "逾期数量"]
+        blueprint.quality_rules = ["设施编号唯一", "任务按责任区域下达", "隐患关闭必须复验", "关键动作记录人员", "导出受权限控制"]
+        blueprint.uniqueness_notes = ["设施到隐患可追溯", "点检证据关联任务", "整改与复验岗位分离", "闭环指标可下钻"]
+
+        score, reasons = _quality_review(task, blueprint)
+
+        self.assertNotIn("多个模块描述缺少具体业务动作", reasons)
+        self.assertNotIn("产品方案与业务补充关键词关联不足", reasons)
 
     def test_local_template_subtype_modules_keep_unique_keys(self):
         task = GenerationTask(
@@ -197,9 +356,70 @@ class BlueprintOperationContractTests(unittest.TestCase):
             blueprint.modules.append(module)
 
         issues = blueprint_contract_issues(self.task, blueprint)
+        review = blueprint_contract_review(self.task, blueprint)
 
         self.assertTrue(any("结构化操作缺少语义差异" in issue for issue in issues))
         self.assertTrue(any("说明仅替换业务对象" in issue for issue in issues))
+        self.assertEqual(review.blocking_issues, ())
+        self.assertTrue(review.quality_warnings)
+
+    def test_unknown_industry_generic_contract_is_repaired_without_subtype_rules(self):
+        task = GenerationTask(
+            software_name="量子态熵谱跃迁实验分析系统",
+            product_type="人工智能软件",
+            feature_hint="量子样本接入、熵谱参数标定、跃迁特征计算、态矢异常识别、标定结果复核、实验批次归档",
+            seed="unknown-domain-contract-repair",
+        )
+        blueprint = _valid_blueprint(task)
+        module_data = [
+            ("量子样本接入", ["量子样本编号", "接入通道", "采集状态"]),
+            ("熵谱参数标定", ["熵谱参数编号", "标定区间", "标定偏差"]),
+            ("跃迁特征计算", ["跃迁特征编号", "跃迁频率", "计算结果"]),
+            ("态矢异常识别", ["态矢记录编号", "异常阈值", "识别结论"]),
+            ("标定结果复核", ["复核任务编号", "结果版本", "复核结论"]),
+            ("实验批次归档", ["实验批次编号", "归档目录", "归档状态"]),
+        ]
+        blueprint.modules = [deepcopy(blueprint.modules[index % 2]) for index in range(len(module_data))]
+        for index, (module, (title, fields)) in enumerate(zip(blueprint.modules, module_data), start=1):
+            module.key = f"domain_{index:02d}_98765"
+            module.title = title
+            module.description = f"围绕{title}提供业务录入、状态跟踪、异常处理和统计分析。"
+            module.data_fields = fields + ["处理人员", "更新时间", "备注说明"]
+            module.operations = [f"筛选{title}记录", f"{title}登记", f"{title}校验", f"{title}跟踪"]
+            module.operation_specs = [
+                _operation(
+                    f"generic_{index}_{spec_index}",
+                    label,
+                    category,
+                    "业务人员",
+                    "需要处理实验数据",
+                    fields[:2],
+                    "待处理",
+                    "已更新",
+                    "页面结果和更新时间",
+                )
+                for spec_index, (label, category) in enumerate(
+                    (
+                        (f"筛选{title}记录", "lookup"),
+                        (f"{title}登记", "mutation"),
+                        (f"{title}校验", "workflow"),
+                    ),
+                    start=1,
+                )
+            ]
+
+        before = blueprint_contract_review(task, blueprint)
+        repaired = repair_blueprint_contract(task, blueprint)
+        after = blueprint_contract_review(task, repaired)
+        labels = [[str(spec.get("label") or "") for spec in module.operation_specs] for module in repaired.modules]
+
+        self.assertTrue(before.quality_warnings)
+        self.assertEqual(after.blocking_issues, ())
+        self.assertEqual(after.quality_warnings, ())
+        self.assertTrue(all(not is_placeholder_module_key(module.key) for module in repaired.modules))
+        self.assertEqual(len({tuple(items) for items in labels}), len(module_data))
+        self.assertTrue(any("接入量子样本" in label for label in labels[0]))
+        self.assertIn("计算跃迁特征", labels[2])
 
     def test_all_local_subtypes_pass_semantic_contract_review(self):
         checked = 0
@@ -628,6 +848,136 @@ class BlueprintOperationContractTests(unittest.TestCase):
 
         batch_generation.assert_not_called()
         self.assertEqual(len(result["modules"]), 6)
+
+    def test_confirmed_outline_without_operation_specs_is_completed_locally(self):
+        task = GenerationTask(
+            software_name="Figma浏览器",
+            product_type="APP",
+            feature_hint="设计文件浏览、画板预览、图层检查、原型演示",
+            seed="confirmed-outline-local-completion",
+        )
+        task.semantic_contract = {
+            "feature_hint_domain": "Figma设计文件浏览与预览",
+            "feature_hint_keywords": ["设计文件", "画板", "图层", "组件", "原型"],
+            "feature_hint_avoid_terms": ["通用网页浏览器", "搜索引擎"],
+            "feature_hint_blueprint_modules": [
+                {
+                    "key": f"figma_module_{index}",
+                    "category": "设计预览",
+                    "title": f"设计资源模块{index}",
+                    "description": "围绕设计文件、页面画板和图层对象提供浏览、定位、查看与结果反馈，保留访问状态和操作记录。",
+                    "data_objects": ["设计文件", "页面画板", "图层对象"],
+                    "screens": ["设计资源页", "画板详情页"],
+                }
+                for index in range(1, 9)
+            ],
+        }
+
+        with patch("backend.softcopyright.llm_blueprint._generate_module_batches") as batch_generation:
+            result = _generate_modules(task, object(), {}, [])
+
+        batch_generation.assert_not_called()
+        self.assertEqual(len(result["modules"]), 8)
+        self.assertTrue(all(len(module["operation_specs"]) >= 3 for module in result["modules"]))
+        self.assertTrue(all(len(module["data_fields"]) >= 7 for module in result["modules"]))
+
+    def test_approved_contract_removes_exact_off_domain_phrases_before_review(self):
+        task = GenerationTask(software_name="Figma浏览器", product_type="APP")
+        task.semantic_contract = {
+            "feature_hint_domain": "Figma设计文件浏览与预览",
+            "feature_hint_keywords": ["设计文件", "画板预览"],
+            "feature_hint_avoid_terms": ["通用网页浏览器", "搜索引擎"],
+        }
+        plan = {
+            "positioning": "面向设计评审的通用网页浏览器",
+            "summary": "使用搜索引擎定位设计文件",
+            "business_objects": ["搜索引擎索引", "设计文件"],
+        }
+
+        reconciled = _reconcile_plan_with_contract(task, plan)
+        joined = json.dumps(reconciled, ensure_ascii=False)
+
+        self.assertNotIn("搜索引擎", joined)
+        self.assertNotIn("通用网页浏览器", joined)
+        self.assertIn("设计资源检索", joined)
+
+    def test_confirmed_figma_outline_passes_with_two_core_requests(self):
+        titles_and_objects = [
+            ("Figma文件接入", "文件链接"),
+            ("设计资源导航", "项目资源"),
+            ("页面与画板预览", "页面画板"),
+            ("图层与组件检查", "图层组件"),
+            ("原型流程演示", "原型流程"),
+            ("评论与评审查看", "评审评论"),
+            ("设计版本追踪", "设计版本"),
+            ("浏览记录与收藏", "收藏记录"),
+        ]
+        task = GenerationTask(
+            software_name="Figma浏览器",
+            product_type="APP",
+            feature_hint="、".join(title for title, _object in titles_and_objects),
+            seed="figma-two-request-contract",
+        )
+        task.semantic_contract = {
+            "feature_hint_profile": "confirmed-outline",
+            "feature_hint_domain": "Figma设计文件浏览与预览",
+            "feature_hint_keywords": ["设计文件", "页面画板", "图层组件", "原型流程", "评审评论", "设计版本"],
+            "feature_hint_target_users": ["UI/UX设计师", "产品经理", "设计评审参与者"],
+            "feature_hint_avoid_terms": ["通用网页浏览器", "搜索引擎"],
+            "feature_hint_blueprint_modules": [
+                {
+                    "key": f"figma_contract_{index}",
+                    "category": "设计浏览",
+                    "title": title,
+                    "description": f"围绕{data_object}执行访问、定位、状态反馈和结果追踪，保留与设计文件关联的操作上下文和可见证据。",
+                    "data_objects": [data_object, "设计文件", f"{data_object}状态"],
+                    "screens": [f"{title}页", f"{data_object}详情页"],
+                }
+                for index, (title, data_object) in enumerate(titles_and_objects, start=1)
+            ],
+        }
+        identity = {
+            "industry": "Figma设计文件浏览与预览",
+            "scenario": "设计团队文件预览与评审协作场景",
+            "positioning": "使用搜索引擎的通用网页浏览器",
+            "purpose": "支持设计资源浏览、画板预览和评审协作",
+            "summary": "面向设计团队集中浏览文件、检查图层并跟踪评审结果。",
+        }
+        workflows = [
+            {
+                "name": f"{title}协作流程",
+                "trigger": f"用户进入{title}工作区",
+                "steps": [f"选择{data_object}", f"核对{data_object}访问状态", f"执行{title}操作", f"记录{data_object}结果"],
+                "output": f"形成{data_object}结果记录",
+            }
+            for title, data_object in titles_and_objects[:3]
+        ]
+        business = {
+            "business_objects": [data_object for _title, data_object in titles_and_objects],
+            "workflows": workflows,
+            "report_metrics": [],
+            "quality_rules": [],
+            "uniqueness_notes": [],
+            "data_relations": ["项目资源包含设计文件", "设计文件包含页面画板", "评审评论关联画板锚点"],
+            "deployment_topology": "桌面工作区访问设计文件服务并保存浏览状态。",
+            "pages": [],
+        }
+
+        class Provider:
+            def __init__(self):
+                self.responses = iter((identity, business))
+
+            def chat(self, *_args, **_kwargs):
+                return json.dumps(next(self.responses), ensure_ascii=False)
+
+        blueprint = generate_blueprint_with_llm(task, Provider())
+        joined = json.dumps(blueprint.to_dict(), ensure_ascii=False)
+
+        self.assertGreaterEqual(blueprint.quality_score, 86)
+        self.assertEqual(blueprint.request_count, 2)
+        self.assertEqual(len(blueprint.modules), 8)
+        self.assertNotIn("搜索引擎", joined)
+        self.assertNotIn("通用网页浏览器", joined)
 
 
 if __name__ == "__main__":

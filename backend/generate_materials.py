@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 import re
 import sys
+from types import SimpleNamespace
 
+from softcopyright.domain_profile import build_domain_profile
 from softcopyright.errors import sanitize_error_message
 from softcopyright.generator import generate_materials
 from softcopyright.llm.provider import build_provider, config_from_env
@@ -88,7 +90,7 @@ def main() -> int:
     except Exception as exc:
         error_message = sanitize_error_message(exc)
         print(f"错误：{error_message}", file=sys.stderr)
-        failure_checks = _collect_failure_checks(task.output_dir)
+        failure_checks = _collect_failure_checks(task.output_dir, task=task)
         _write_failure_report(task.output_dir, error_message, failure_checks)
         print(
             "RESULT_JSON:"
@@ -239,8 +241,25 @@ def _confirmed_outline_from_resume_dir(output_dir: Path) -> dict:
     return {}
 
 
-def _collect_failure_checks(output_dir: Path) -> dict:
-    checks: dict = {}
+def _collect_failure_checks(output_dir: Path, *, task: GenerationTask | None = None) -> dict:
+    checks: dict = _persisted_domain_checks(output_dir)
+    if task is not None and not checks.get("ui_domain_profile_key"):
+        blueprint = _domain_blueprint_from_output(output_dir)
+        profile = build_domain_profile(task, blueprint)
+        checks.update(
+            {
+                "ui_domain_profile_key": profile.key,
+                "ui_domain_profile_confidence": profile.confidence,
+                "ui_domain_profile_source": profile.source,
+                "ui_domain_profile_evidence": "、".join(profile.evidence),
+                "ui_domain_profile_weak_evidence": "、".join(profile.weak_evidence),
+                "ui_domain_profile_excluded_evidence": "、".join(profile.excluded_evidence),
+                "ui_domain_gate_keys": "、".join(profile.enabled_gate_keys),
+                "ui_domain_gate_reasons": "；".join(profile.gate_reasons),
+                "ui_transport_related": profile.transport_related,
+                "ui_route_topology_required": profile.requires_route_topology,
+            }
+        )
     manifest = _latest_visual_reference_manifest(output_dir)
     if manifest:
         mode = str(manifest.get("mode") or "")
@@ -279,6 +298,64 @@ def _collect_failure_checks(output_dir: Path) -> dict:
         checks["ui_visual_reference_error"] = sanitize_error_message(manifest.get("error") or "", limit=500)
         checks["ui_visual_reference_directory"] = str(manifest.get("directory") or "")
     return checks
+
+
+def _persisted_domain_checks(output_dir: Path) -> dict:
+    keys = {
+        "ui_domain_profile_key",
+        "ui_domain_profile_confidence",
+        "ui_domain_profile_source",
+        "ui_domain_profile_evidence",
+        "ui_domain_profile_weak_evidence",
+        "ui_domain_profile_excluded_evidence",
+        "ui_domain_gate_keys",
+        "ui_domain_gate_reasons",
+        "ui_transport_related",
+        "ui_route_topology_required",
+        "ui_route_topology_ready",
+        "ui_realism_missing_evidence",
+    }
+    collected: dict = {}
+    for filename in ("generation_report.json", "validation_report.json"):
+        try:
+            payload = json.loads((output_dir / filename).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        candidates = [payload.get("checks"), payload.get("authenticity")]
+        validation = payload.get("validation") if isinstance(payload, dict) else None
+        if isinstance(validation, dict):
+            candidates.append(validation.get("authenticity"))
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            for key in keys:
+                if key in candidate:
+                    collected[key] = candidate[key]
+    return collected
+
+
+def _domain_blueprint_from_output(output_dir: Path) -> SimpleNamespace | None:
+    path = output_dir / "generated_source" / "product-blueprint.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    modules = [
+        SimpleNamespace(title=str(item.get("title") or item.get("name") or ""))
+        for item in payload.get("modules", [])
+        if isinstance(item, dict)
+    ]
+    return SimpleNamespace(
+        industry=str(payload.get("industry") or ""),
+        summary=str(payload.get("summary") or ""),
+        scenario=str(payload.get("scenario") or ""),
+        positioning=str(payload.get("positioning") or ""),
+        business_objects=payload.get("business_objects") if isinstance(payload.get("business_objects"), list) else [],
+        modules=modules,
+        industry_subtype_key=str(payload.get("industry_subtype_key") or ""),
+    )
 
 
 def _latest_visual_reference_manifest(output_dir: Path) -> dict:

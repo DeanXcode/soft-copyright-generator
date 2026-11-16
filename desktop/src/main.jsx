@@ -2,10 +2,16 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import appIcon from "../../build/icon.png";
 import QueuePanel from "./components/QueuePanel";
+import RendererErrorBoundary from "./components/RendererErrorBoundary";
 import ResultReport from "./components/ResultReport";
 import SettingsDrawer from "./components/SettingsDrawer";
 import useTaskQueuePersistence from "./hooks/useTaskQueuePersistence";
 import { modelProviders, textProviderChoices } from "./modelOptions";
+import {
+  enqueueOrReplaceRetryTask,
+  normalizeBusinessPlanState,
+  normalizeModelCatalogState
+} from "./stateNormalization";
 import {
   AlertTriangle,
   Archive,
@@ -50,7 +56,22 @@ const stagePlannedSteps = {
   ]
 };
 
-const OUTLINE_TIMEOUT_BUFFER_MS = 20000;
+const generationStages = [
+  ["start", "提交任务"],
+  ["prepare", "确认业务蓝图"],
+  ["blueprint", "生成产品蓝图"],
+  ["manual_content", "生成说明书正文"],
+  ["visual_reference", "生成风格参考图"],
+  ["source", "业务后端与接口"],
+  ["screenshots", "风格图到界面截图"],
+  ["manual", "生成文档材料"],
+  ["source_doc", "源码鉴别材料"],
+  ["pdf", "转换 PDF"],
+  ["info", "申请信息表"],
+  ["package", "打包与校验"]
+];
+
+const OUTLINE_TIMEOUT_BUFFER_MS = 30000;
 const QUEUE_STORAGE_KEY = "soft-copyright-generator.taskQueue.v1";
 let cachedQueueState = null;
 
@@ -99,13 +120,25 @@ function App() {
     balanceLabel: "待配置",
     updatedAt: ""
   });
-  const [modelCatalog, setModelCatalog] = useState({ status: "idle", provider: "", models: [], message: "" });
+  const [modelCatalogState, setModelCatalogState] = useState({ status: "idle", provider: "", models: [], message: "" });
+  const modelCatalog = useMemo(() => normalizeModelCatalogState(modelCatalogState), [modelCatalogState]);
+  const setModelCatalog = (nextValue) => {
+    setModelCatalogState((current) => normalizeModelCatalogState(typeof nextValue === "function" ? nextValue(normalizeModelCatalogState(current)) : nextValue));
+  };
   const [status, setStatus] = useState("idle");
   const [result, setResult] = useState(null);
   const [progress, setProgress] = useState(0);
   const [events, setEvents] = useState([]);
   const [processClock, setProcessClock] = useState({ mode: "idle", startedAt: 0, elapsedMs: 0 });
-  const [businessPlan, setBusinessPlan] = useState(createEmptyPlan());
+  const [businessPlanState, setBusinessPlanState] = useState(createEmptyPlan);
+  const businessPlan = useMemo(() => normalizeBusinessPlanState(businessPlanState), [businessPlanState]);
+  const setBusinessPlan = (nextValue) => {
+    setBusinessPlanState((current) => {
+      const normalizedCurrent = normalizeBusinessPlanState(current);
+      const next = typeof nextValue === "function" ? nextValue(normalizedCurrent) : nextValue;
+      return normalizeBusinessPlanState(next);
+    });
+  };
   const [featureHintMeta, setFeatureHintMeta] = useState({});
   const [inputText, setInputText] = useState("");
   const [outlineState, setOutlineState] = useState("empty");
@@ -368,14 +401,16 @@ function App() {
     let featureHint = "";
     let meta = {};
     if (!templateMode && !(modelConfig.apiBaseUrlConfigured || modelConfig.apiBaseUrl.trim())) {
-      setConfigStatus("请先配置文本模型请求地址");
+      const message = "请先配置文本模型请求地址";
+      setConfigStatus(message);
       setSettingsOpen(true);
-      return null;
+      return { error: message };
     }
     if (!templateMode && !(modelConfig.apiKey.trim() || (bridgeAvailable && modelConfig.apiKeyConfigured))) {
-      setConfigStatus("请先配置文本模型 API Key");
+      const message = "请先配置文本模型 API Key";
+      setConfigStatus(message);
       setSettingsOpen(true);
-      return null;
+      return { error: message };
     }
     setStatus("planning");
     try {
@@ -405,7 +440,7 @@ function App() {
                 apiBaseUrl: modelConfig.apiBaseUrl,
                 apiKey: modelConfig.apiKey
               });
-        const outlineTimeoutMs = normalizeOutlineTimeout(modelConfig.outlineTimeoutSeconds || 60) * 1000 + OUTLINE_TIMEOUT_BUFFER_MS;
+        const outlineTimeoutMs = normalizeOutlineTimeout(modelConfig.outlineTimeoutSeconds || 60) * 2 * 1000 + OUTLINE_TIMEOUT_BUFFER_MS;
         const response = await withTimeout(request, outlineTimeoutMs, "GPT 蓝图生成超时，请稍后重试或检查模型网关响应速度");
         if (response?.cancelled) {
           return { cancelled: true };
@@ -420,14 +455,14 @@ function App() {
           if (response?.meta?.requires_gpt_config) {
             setSettingsOpen(true);
           }
-          return null;
+          return { error: message };
         }
       }
     } catch (error) {
       const message = sanitizeErrorMessage(error?.message || "GPT 蓝图生成失败，请检查服务配置");
       setConfigStatus(message);
       setEvents((current) => [...current, createProcessEvent("outline", 0, message, startedAt)]);
-      return null;
+      return { error: message };
     }
     return {
       hint: featureHint,
@@ -477,9 +512,25 @@ function App() {
       setProcessClock((current) => ({ ...current, elapsedMs: Date.now() - startedAt }));
       return;
     }
+    if (response?.error) {
+      setProgress(0);
+      setStatus(businessPlan.modules.length ? "editing" : "idle");
+      setCancelRequested(false);
+      setProcessClock({ mode: "idle", startedAt: 0, elapsedMs: 0 });
+      return;
+    }
     if (!response) {
       setProgress(0);
       setStatus(businessPlan.modules.length ? "editing" : "idle");
+      setCancelRequested(false);
+      setProcessClock({ mode: "idle", startedAt: 0, elapsedMs: 0 });
+      return;
+    }
+    const responsePlan = normalizeBusinessPlanState(response.plan);
+    if (!responsePlan.modules.length) {
+      setConfigStatus("蓝图返回结构不完整，未读取到有效模块，请重试当前蓝图请求");
+      setProgress(0);
+      setStatus("idle");
       setCancelRequested(false);
       setProcessClock({ mode: "idle", startedAt: 0, elapsedMs: 0 });
       return;
@@ -490,7 +541,7 @@ function App() {
       createProcessEvent(
         "outline",
         72,
-        `${templateMode ? "已生成本地模板结果" : "已收到 GPT 结构化结果"}，正在校验 ${response.plan.modules.length} 个模块的重复度和领域一致性`,
+        `${templateMode ? "已生成本地模板结果" : "已收到 GPT 结构化结果"}，正在校验 ${responsePlan.modules.length} 个模块的重复度和领域一致性`,
         startedAt
       )
     ]);
@@ -502,13 +553,13 @@ function App() {
     ]);
     await wait(180);
     setFeatureHintMeta({ ...(response.meta || {}), _plannedAt: new Date().toLocaleTimeString() });
-    setBusinessPlan(response.plan);
+    setBusinessPlan(responsePlan);
     setForm((current) => ({
       ...current,
-      productType: response.plan.productType || inferProductType(name, response.hint),
+      productType: responsePlan.productType || inferProductType(name, response.hint),
       softwareCategory: inferSoftwareCategory(name, response.hint),
       language: "自动选择",
-      featureHint: serializePlan(response.plan)
+      featureHint: serializePlan(responsePlan)
     }));
     setOutlineState("draft");
     setProgress(100);
@@ -517,7 +568,7 @@ function App() {
       createProcessEvent(
         "outline",
         100,
-        `已生成 ${response.plan.modules.length} 个可申请材料使用的蓝图模块，可编辑后确认生成材料包`,
+        `已生成 ${responsePlan.modules.length} 个可申请材料使用的蓝图模块，可编辑后确认生成材料包`,
         startedAt
       )
     ]);
@@ -1017,7 +1068,7 @@ function App() {
     }
     const task = createQueuedTaskFromCurrent(overrides, submitMessage, options);
     if (!task) return false;
-    setTaskQueue((current) => [...current, task]);
+    setTaskQueue((current) => enqueueOrReplaceRetryTask(current, task, { retry: Boolean(options.retry) }));
     setInputText("");
     setQueuePaused(false);
     setConfigStatus("");
@@ -1146,7 +1197,7 @@ function App() {
             ok: false,
             zipPath: "",
             outputDir: recoverableTask.outputDir || "",
-            checks: {},
+            checks: domainProfileChecks(recoverableTask.domainProfile),
             warnings: [],
             stdout: "",
             stderr: recoverableTask.errorSummary
@@ -1221,6 +1272,34 @@ function App() {
     if (queueRunningRef.current) return;
     const initialTask = taskQueueRef.current.find((task) => task.id === taskId);
     if (!initialTask || initialTask.status !== "queued") return;
+    const restoredOutputDir = String(initialTask.recovery?.outputDir || initialTask.result?.outputDir || "").trim();
+    if (initialTask.restoredFromRunning && !restoredOutputDir) {
+      const message = "检测到应用重启前遗留的队列状态。请使用上方恢复卡片续跑，避免重新生成蓝图和重复消耗额度。";
+      const failedResult = {
+        ok: false,
+        zipPath: "",
+        outputDir: "",
+        checks: {},
+        warnings: [],
+        stdout: "",
+        stderr: message
+      };
+      const event = createProcessEvent("start", 0, message, Date.now());
+      setRecoveryStatus(message);
+      setResult(failedResult);
+      setStatus("error");
+      setEvents([event]);
+      setQueuePaused(true);
+      updateQueueTask(taskId, {
+        status: "error",
+        phase: "interrupted",
+        progress: 0,
+        events: [event],
+        result: failedResult,
+        finishedAt: Date.now()
+      });
+      return;
+    }
     queueRunningRef.current = true;
     activeQueueTaskIdRef.current = taskId;
     setActiveQueueTaskId(taskId);
@@ -1235,6 +1314,8 @@ function App() {
     try {
       if (needsPlan) {
         const firstEvent = createProcessEvent("outline", 6, `队列任务「${task.title}」开始生成蓝图`, startedAt);
+        setBusinessPlan(createEmptyPlan());
+        setOutlineState("empty");
         setStatus("planning");
         setProgress(6);
         setProcessClock({ mode: "outline", startedAt, elapsedMs: 0 });
@@ -1270,8 +1351,11 @@ function App() {
           });
           return;
         }
+        if (outlineResponse?.error) {
+          throw new Error(outlineResponse.error);
+        }
         if (!outlineResponse?.plan?.modules?.length) {
-          throw new Error(configStatus || "队列任务蓝图生成失败，请检查文本模型配置或稍后重试");
+          throw new Error("队列任务蓝图生成失败，请检查文本模型配置或稍后重试");
         }
         planSnapshot = clonePlainObject(outlineResponse.plan);
         formSnapshot = {
@@ -1380,7 +1464,8 @@ function App() {
         phase: "materials",
         progress: 3,
         result: null,
-        startedAt
+        startedAt,
+        restoredFromRunning: false
       });
     }
     if (!bridgeAvailable) {
@@ -1877,7 +1962,7 @@ function TaskTranscript({
             </button>
           </div>
           {status === "planning" && <OutlineProgress progress={progress} events={events} elapsedMs={processClock.elapsedMs} />}
-          {planReady ? (
+          {status === "planning" ? null : planReady ? (
             <ModuleTreeEditor
               plan={businessPlan}
               onAddModule={onAddModule}
@@ -1957,6 +2042,7 @@ function TaskTranscript({
               {result.cancelled ? <Square size={22} /> : <AlertTriangle size={22} />}
               <div>
                 <p>{result.stderr || (result.cancelled ? "生成任务已中止。" : "生成任务异常，请查看运行日志定位问题。")}</p>
+                <DomainProfileDiagnostic checks={result.checks} />
                 <VisualReferenceFailureHint result={result} />
                 {canRetryGenerate ? (
                   <small>已保留当前确认的蓝图，重试会直接复用蓝图并继续生成材料包。</small>
@@ -1968,6 +2054,17 @@ function TaskTranscript({
           )}
         </section>
       )}
+    </div>
+  );
+}
+
+function DomainProfileDiagnostic({ checks = {} }) {
+  if (!checks || typeof checks !== "object" || !checks.ui_domain_profile_key) return null;
+  return (
+    <div className="domain-profile-diagnostic">
+      <b>领域判断：{domainProfileLabel(checks)}</b>
+      <span>{domainProfileDetail(checks)}</span>
+      {checks.ui_realism_missing_evidence && <small>缺失证据：{checks.ui_realism_missing_evidence}</small>}
     </div>
   );
 }
@@ -2336,11 +2433,10 @@ function loadPersistedQueueState() {
     const tasks = Array.isArray(parsed?.tasks) ? parsed.tasks.map(normalizePersistedQueueTask).filter(Boolean).slice(-30) : [];
     const recoveredRunning = tasks.some((task) => task._restoredFromRunning);
     cachedQueueState = {
-      tasks: tasks.map((task) => {
-        const next = { ...task };
-        delete next._restoredFromRunning;
-        return next;
-      }),
+      tasks: tasks.map((task) => ({
+        ...task,
+        restoredFromRunning: Boolean(task.restoredFromRunning || task._restoredFromRunning)
+      })),
       paused: Boolean(parsed?.paused || recoveredRunning || tasks.some((task) => task.status === "queued"))
     };
     return cachedQueueState;
@@ -2353,7 +2449,7 @@ function loadPersistedQueueState() {
 function normalizePersistedQueueTask(task) {
   if (!task || typeof task !== "object") return null;
   const status = ["queued", "success", "error", "cancelled"].includes(task.status) ? task.status : "queued";
-  const restoredFromRunning = task.status === "running" || task.status === "planning";
+  const restoredFromRunning = Boolean(task.restoredFromRunning || task.status === "running" || task.status === "planning");
   const events = Array.isArray(task.events) ? task.events.slice(-80) : [];
   const restoreEvent = restoredFromRunning
     ? createProcessEvent("start", 0, "应用重启后已恢复为等待中，请确认后继续队列", Date.now())
@@ -2376,6 +2472,7 @@ function normalizePersistedQueueTask(task) {
     startedAt: 0,
     finishedAt: status === "queued" ? 0 : Number(task.finishedAt || 0),
     recovery: clonePlainObject(task.recovery || {}),
+    restoredFromRunning,
     _restoredFromRunning: restoredFromRunning
   };
 }
@@ -2416,7 +2513,8 @@ function compactQueueTaskForStorage(task) {
     createdAt: Number(task.createdAt || Date.now()),
     startedAt: Number(task.startedAt || 0),
     finishedAt: Number(task.finishedAt || 0),
-    recovery: clonePlainObject(task.recovery || {})
+    recovery: clonePlainObject(task.recovery || {}),
+    restoredFromRunning: Boolean(task.restoredFromRunning)
   };
 }
 
@@ -3236,6 +3334,50 @@ function deliveryStatus(result) {
   };
 }
 
+function domainProfileChecks(profile) {
+  if (!profile || typeof profile !== "object") return {};
+  return {
+    ui_domain_profile_key: profile.key || "",
+    ui_domain_profile_confidence: profile.confidence || 0,
+    ui_domain_profile_source: profile.source || "",
+    ui_domain_profile_evidence: profile.evidence || "",
+    ui_domain_profile_weak_evidence: profile.weakEvidence || "",
+    ui_domain_profile_excluded_evidence: profile.excludedEvidence || "",
+    ui_domain_gate_keys: profile.gateKeys || "",
+    ui_domain_gate_reasons: profile.gateReasons || "",
+    ui_route_topology_required: Boolean(profile.routeTopologyRequired),
+    ui_route_topology_ready: !profile.routeTopologyRequired
+  };
+}
+
+function domainProfileLabel(checks = {}) {
+  const key = String(checks.ui_domain_profile_key || "").trim();
+  if (!key) return "未识别";
+  const confidence = Number(checks.ui_domain_profile_confidence || 0);
+  return `${domainProfileKeyLabel(key)}${confidence ? ` · ${Math.round(confidence * 100)}%` : ""}`;
+}
+
+function domainProfileKeyLabel(key) {
+  const labels = {
+    transport_route: "交通线路",
+    download_manager: "下载管理",
+    workforce_attendance: "考勤人力",
+    medical: "医疗",
+    survey_mapping: "测绘地理",
+    smart_manufacturing: "智能制造",
+    rail_construction_quality: "轨道施工质量",
+    general_business: "通用业务"
+  };
+  return labels[key] || key;
+}
+
+function domainProfileDetail(checks = {}) {
+  const reason = String(checks.ui_domain_gate_reasons || "").trim();
+  const evidence = String(checks.ui_domain_profile_evidence || "").trim();
+  const excluded = String(checks.ui_domain_profile_excluded_evidence || "").trim();
+  return reason || (evidence ? `证据：${evidence}` : excluded ? `排除证据：${excluded}` : "未启用行业专属硬门禁。");
+}
+
 function buildQualityItems(result) {
   if (!result?.checks) return [];
   const checks = result.checks;
@@ -3248,6 +3390,12 @@ function buildQualityItems(result) {
   const sourceLines = Number(checks.source_total_lines || 0);
   const selectedPages = Number(checks.source_selected_pages || 0);
   return [
+    {
+      label: "领域门禁",
+      value: domainProfileLabel(checks),
+      detail: domainProfileDetail(checks),
+      state: checks.ui_route_topology_required && !checks.ui_route_topology_ready ? "fail" : "pass"
+    },
     {
       label: "生成策略",
       value: generationProfileLabel(checks.generation_quality_profile),
@@ -3405,4 +3553,10 @@ function inferFeatureHint(name, productType = "") {
     : "用户入口、首页导航、核心工作台、业务表单处理、记录查询、统计分析、消息提醒、系统设置";
 }
 
-createRoot(document.getElementById("root")).render(<App />);
+const rootElement = document.getElementById("root");
+if (!rootElement) throw new Error("应用根节点不存在");
+createRoot(rootElement).render(
+  <RendererErrorBoundary>
+    <App />
+  </RendererErrorBoundary>
+);

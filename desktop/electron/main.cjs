@@ -49,7 +49,7 @@ let activeGenerationTask = null;
 let activeOutlineTask = null;
 let lastGenerationResult = null;
 const RECOVERY_DISMISSED_FILE = "generation-recovery-dismissed.json";
-const FRONTEND_ENGINE_VERSION = "pagespec-hybrid-v1";
+const FRONTEND_ENGINE_VERSION = "pagespec-hybrid-v6";
 
 const modelPlans = {
   template: {
@@ -301,11 +301,18 @@ function recoverTaskFromOutputDir(outputDir, mtimeMs = 0) {
   if (fs.existsSync(path.join(outputDir, RECOVERY_DISMISSED_FILE))) return null;
   const blueprintPath = path.join(outputDir, "generated_source", "product-blueprint.json");
   const tracePath = path.join(outputDir, "llm_trace.jsonl");
-  if (!fs.existsSync(blueprintPath) || !fs.existsSync(tracePath)) return null;
   const generationState = readJsonConfig(path.join(outputDir, "generation-state.json"));
+  const confirmedOutline = generationState.task?.confirmed_outline || {};
+  const confirmedOutlineReady = Array.isArray(confirmedOutline.modules) && confirmedOutline.modules.length > 0;
+  if ((!fs.existsSync(blueprintPath) && !confirmedOutlineReady) || !fs.existsSync(tracePath)) return null;
   const generationFailure = readJsonConfig(path.join(outputDir, "generation-failure.json"));
   const generationReport = readJsonConfig(path.join(outputDir, "generation_report.json"));
   const validationReport = readJsonConfig(path.join(outputDir, "validation_report.json"));
+  const domainProfile = domainProfileFromChecks({
+    ...(generationReport.checks || {}),
+    ...(validationReport.authenticity || {}),
+    ...(generationFailure.checks || {})
+  });
   const latestAttemptId = String(generationState.attempt_id || "").trim();
   const failureMatchesAttempt = !latestAttemptId || !generationFailure.attempt_id || String(generationFailure.attempt_id) === latestAttemptId;
   const effectiveFailure = failureMatchesAttempt ? generationFailure : {};
@@ -320,7 +327,18 @@ function recoverTaskFromOutputDir(outputDir, mtimeMs = 0) {
   ).trim();
   const completedZipReady = Boolean(reportedZipPath && fs.existsSync(reportedZipPath) && fs.statSync(reportedZipPath).isFile());
   if ((stateStatus === "success" || validationReport.ready_for_delivery === true) && completedZipReady) return null;
-  const blueprint = readJsonConfig(blueprintPath);
+  const blueprint = fs.existsSync(blueprintPath)
+    ? readJsonConfig(blueprintPath)
+    : {
+        software_name: generationState.task?.software_name || confirmedOutline.softwareName || "",
+        version: generationState.task?.version || "V1.0",
+        product_type: generationState.task?.product_type || confirmedOutline.productType || "APP",
+        software_category: generationState.task?.software_category || "应用软件",
+        industry: confirmedOutline.domain || "",
+        target_users: confirmedOutline.targetUsers || [],
+        avoid_terms: confirmedOutline.avoidTerms || [],
+        modules: confirmedOutline.modules
+      };
   const businessPlan = businessPlanFromProductBlueprint(blueprint);
   if (!businessPlan.modules.length) return null;
   const trace = latestTraceFailure(tracePath);
@@ -362,22 +380,39 @@ function recoverTaskFromOutputDir(outputDir, mtimeMs = 0) {
     interrupted,
     failedStage,
     errorSummary,
+    domainProfile,
     visualReferenceReady: fs.existsSync(visualReferencePath),
     pageEngineUpgradeRequired,
     promptText: businessPlan.softwareName,
     formSnapshot: {
       name: businessPlan.softwareName,
       version: String(blueprint.version || "V1.0"),
-      language: "自动选择",
+      language: String(generationState.task?.language || "自动选择"),
       productType: businessPlan.productType || "APP",
       softwareCategory: String(blueprint.software_category || "应用软件"),
-      featureHint: "",
+      featureHint: String(generationState.task?.feature_hint || ""),
       modelPlan: "gpt",
       modelProvider: "custom",
       modelName: modelPlans.gpt.modelName || "gpt-5.5",
       randomness: "standard"
     },
     businessPlan
+  };
+}
+
+function domainProfileFromChecks(checks = {}) {
+  const key = String(checks.ui_domain_profile_key || checks.validation_ui_domain_profile_key || "").trim();
+  if (!key) return null;
+  return {
+    key,
+    confidence: Number(checks.ui_domain_profile_confidence || checks.validation_ui_domain_profile_confidence || 0),
+    source: String(checks.ui_domain_profile_source || checks.validation_ui_domain_profile_source || ""),
+    evidence: String(checks.ui_domain_profile_evidence || checks.validation_ui_domain_profile_evidence || ""),
+    weakEvidence: String(checks.ui_domain_profile_weak_evidence || checks.validation_ui_domain_profile_weak_evidence || ""),
+    excludedEvidence: String(checks.ui_domain_profile_excluded_evidence || checks.validation_ui_domain_profile_excluded_evidence || ""),
+    gateKeys: String(checks.ui_domain_gate_keys || checks.validation_ui_domain_gate_keys || ""),
+    gateReasons: String(checks.ui_domain_gate_reasons || checks.validation_ui_domain_gate_reasons || ""),
+    routeTopologyRequired: Boolean(checks.ui_route_topology_required || checks.validation_ui_route_topology_required)
   };
 }
 
@@ -1066,6 +1101,33 @@ function createWindow() {
   });
   mainWindow.setMenu(null);
 
+  mainWindow.webContents.on("console-message", (_event, level, message, line) => {
+    if (Number(level) < 2) return;
+    writeRuntimeLog("renderer_console", {
+      level: Number(level),
+      message: sanitizeErrorMessage(message).slice(0, 1000),
+      line: Number(line || 0)
+    });
+  });
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    writeRuntimeLog("renderer_process_gone", {
+      reason: String(details?.reason || "unknown"),
+      exitCode: Number(details?.exitCode || 0)
+    });
+  });
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, _validatedUrl, isMainFrame) => {
+    if (!isMainFrame) return;
+    writeRuntimeLog("renderer_load_failed", {
+      errorCode: Number(errorCode || 0),
+      message: sanitizeErrorMessage(errorDescription).slice(0, 500)
+    });
+  });
+  mainWindow.webContents.on("did-finish-load", () => {
+    writeRuntimeLog("renderer_loaded");
+  });
+  mainWindow.on("unresponsive", () => writeRuntimeLog("renderer_unresponsive"));
+  mainWindow.on("responsive", () => writeRuntimeLog("renderer_responsive"));
+
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
@@ -1089,6 +1151,15 @@ app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {
     createWindow();
   }
+});
+
+ipcMain.handle("report-renderer-error", async (_event, payload) => {
+  writeRuntimeLog("renderer_react_error", {
+    message: sanitizeErrorMessage(payload?.message || "渲染异常").slice(0, 1000),
+    stack: sanitizeErrorMessage(payload?.stack || "").slice(0, 4000),
+    componentStack: sanitizeErrorMessage(payload?.componentStack || "").slice(0, 4000)
+  });
+  return { ok: true };
 });
 
 ipcMain.handle("cancel-generation", async () => {
@@ -1210,6 +1281,8 @@ ipcMain.handle("generate-materials", async (_event, payload) => {
         SOFT_ELECTRON_NODE: process.execPath,
         SOFT_NODE_MODULE_ROOT: path.join(app.getAppPath(), "node_modules"),
         ...(packagedEsbuildBinaryPath() ? { ESBUILD_BINARY_PATH: packagedEsbuildBinaryPath() } : {}),
+        // Keep the bundled runtime deterministic on machines with unrelated user-site packages.
+        PYTHONNOUSERSITE: "1",
         PYTHONIOENCODING: "utf-8"
       }
     });
@@ -1452,6 +1525,7 @@ ipcMain.handle("infer-feature-hint", async (_event, payload) => {
         ...process.env,
         SOFT_MODEL_GPT_BASE_URL: modelPlan.apiBaseUrl || process.env.SOFT_MODEL_GPT_BASE_URL || "",
         SOFT_MODEL_GPT_API_KEY: modelPlan.apiKey || process.env.SOFT_MODEL_GPT_API_KEY || "",
+        PYTHONNOUSERSITE: "1",
         PYTHONIOENCODING: "utf-8"
       }
     });
@@ -1498,7 +1572,7 @@ ipcMain.handle("infer-feature-hint", async (_event, payload) => {
         featureHint: "",
         meta: { feature_hint_source: "llm-timeout", requires_gpt: true }
       });
-    }, (requestTimeoutSeconds + 15) * 1000);
+    }, (requestTimeoutSeconds * 2 + 30) * 1000);
     child.on("error", (error) => {
       if (settled) return;
       settled = true;

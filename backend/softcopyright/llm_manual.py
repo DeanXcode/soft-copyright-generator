@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import json
 import os
 import re
@@ -9,8 +9,9 @@ from typing import Any
 
 from .blueprint import ProductBlueprint
 from .errors import sanitize_error_message
-from .llm.provider import LLMProvider, LocalTemplateProvider, TextProviderError, TextRetryPolicy
+from .llm.provider import LLMProvider, LocalTemplateProvider, TextErrorCategory, TextProviderError, TextRetryPolicy
 from .llm.trace import trace_event
+from .llm.json_response import parse_json_object
 from .models import GenerationTask
 
 
@@ -19,76 +20,84 @@ def generate_manual_content_with_llm(
     blueprint: ProductBlueprint,
     provider: LLMProvider | None,
     emit=None,
+    initial_content: dict[str, Any] | None = None,
+    save_progress=None,
 ) -> dict[str, Any] | None:
     if provider is None or isinstance(provider, LocalTemplateProvider):
         return None
 
-    result: dict[str, Any] = {"modules": {}}
+    result: dict[str, Any] = {**(initial_content or {}), "modules": dict((initial_content or {}).get("modules") or {})}
     warnings: list[str] = []
 
     batch_size = 1 if _authenticity_first(task) else 2
-    section_batches = list(_chunks(_section_specs(), batch_size))
-    section_results: dict[int, dict[str, Any]] = {}
-    failed_section_batches: list[tuple[int, list[tuple[str, str, str, int, int, int]], str]] = []
+    section_batches = list(_chunks([spec for spec in _section_specs() if not result.get(spec[0])], batch_size))
+    module_batches = list(_chunks([module for module in blueprint.modules if module.key not in result["modules"]], batch_size))
     workers = 1 if _authenticity_first(task) else _llm_batch_workers()
-    with ThreadPoolExecutor(max_workers=min(workers, len(section_batches) or 1)) as executor:
-        futures = {}
-        for batch_index, specs in enumerate(section_batches, start=1):
-            _emit(emit, 24 + batch_index, f"生成说明书公共章节 {batch_index}/{len(section_batches)}")
-            futures[executor.submit(_generate_section_batch, task, blueprint, provider, specs)] = (batch_index, specs)
-        for future in as_completed(futures):
-            batch_index, specs = futures[future]
-            try:
-                section_results[batch_index] = future.result()
-            except Exception as exc:
-                failed_section_batches.append((batch_index, specs, sanitize_error_message(exc)))
+    jobs = [
+        ("section", index, specs) for index, specs in enumerate(section_batches, start=1)
+    ] + [
+        ("module", index, modules) for index, modules in enumerate(module_batches, start=1)
+    ]
+    missing_sections = []
+    missing_modules = []
+    # Both kinds are independent. One bounded queue lets module work start while
+    # a slower common-section request is still running. Only the main thread
+    # merges results and saves checkpoints.
+    executor = ThreadPoolExecutor(max_workers=min(workers, len(jobs) or 1))
+    futures = {}
+    next_job = 0
+    completed_jobs = 0
+    try:
+        while next_job < len(jobs) or futures:
+            while next_job < len(jobs) and len(futures) < workers:
+                kind, index, items = jobs[next_job]
+                next_job += 1
+                fn = _generate_section_batch if kind == "section" else _generate_module_batch
+                futures[executor.submit(fn, task, blueprint, provider, items)] = (kind, index, items)
+            completed, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            # Save successful peers even if this completion set also contains
+            # a fatal error, then stop before submitting any more work.
+            fatal_error = None
+            for future in completed:
+                kind, index, items = futures.pop(future)
+                error = ""
+                try:
+                    data = future.result()
+                except Exception as exc:
+                    if _fatal_provider_error(exc):
+                        fatal_error = exc
+                        continue
+                    data = {}
+                    error = f"批次请求失败：{sanitize_error_message(exc)}"
+                if kind == "section":
+                    for spec in items:
+                        key, _title, _hint, min_count, _budget, limit = spec
+                        paragraphs = _section_paragraphs_from_data(data, key, min_count, limit)
+                        if paragraphs:
+                            result[key] = paragraphs
+                        else:
+                            missing_sections.append((spec, error or "模型生成有效段落不足"))
+                else:
+                    for module in items:
+                        content = _module_content_from_data(data, module)
+                        if content:
+                            result["modules"][module.key] = content
+                        else:
+                            missing_modules.append((module, error or "模型生成有效段落不足"))
+                completed_jobs += 1
+                _emit(emit, 24 + int(6 * completed_jobs / max(len(jobs), 1)),
+                      f"说明书章节批次完成 {completed_jobs}/{len(jobs)}")
+                if save_progress:
+                    save_progress(result)
+            if fatal_error is not None:
+                raise fatal_error
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
 
-    missing_sections: list[tuple[tuple[str, str, str, int, int, int], str]] = []
-    for batch_index, specs in enumerate(section_batches, start=1):
-        batch_data = section_results.get(batch_index)
-        if not batch_data:
-            continue
-        for key, title, _count_hint, min_count, _max_tokens, limit in specs:
-            paragraphs = _section_paragraphs_from_data(batch_data, key, min_count, limit)
-            if paragraphs:
-                result[key] = paragraphs
-            else:
-                missing_sections.append(((key, title, _count_hint, min_count, _max_tokens, limit), "模型生成有效段落不足"))
-    for _batch_index, specs, error in failed_section_batches:
-        for spec in specs:
-            missing_sections.append((spec, f"批次请求失败：{error}"))
-    _retry_missing_sections(task, blueprint, provider, missing_sections, result, warnings, emit)
-
-    module_batches = list(_chunks(blueprint.modules, batch_size))
-    module_results: dict[int, dict[str, Any]] = {}
-    failed_module_batches: list[tuple[int, list[Any], str]] = []
-    with ThreadPoolExecutor(max_workers=min(workers, len(module_batches) or 1)) as executor:
-        futures = {}
-        for batch_index, modules in enumerate(module_batches, start=1):
-            _emit(emit, 27 + batch_index, f"生成说明书模块章节 {batch_index}/{len(module_batches)}")
-            futures[executor.submit(_generate_module_batch, task, blueprint, provider, modules)] = (batch_index, modules)
-        for future in as_completed(futures):
-            batch_index, modules = futures[future]
-            try:
-                module_results[batch_index] = future.result()
-            except Exception as exc:
-                failed_module_batches.append((batch_index, modules, sanitize_error_message(exc)))
-
-    missing_modules: list[tuple[Any, str]] = []
-    for batch_index, modules in enumerate(module_batches, start=1):
-        batch_data = module_results.get(batch_index)
-        if not batch_data:
-            continue
-        for module in modules:
-            module_content = _module_content_from_data(batch_data, module)
-            if module_content:
-                result["modules"][module.key] = module_content
-            else:
-                missing_modules.append((module, "模型生成有效段落不足"))
-    for _batch_index, modules, error in failed_module_batches:
-        for module in modules:
-            missing_modules.append((module, f"批次请求失败：{error}"))
-    _retry_missing_modules(task, blueprint, provider, missing_modules, result, warnings, emit)
+    _retry_missing_sections(task, blueprint, provider, missing_sections, result, warnings, emit, save_progress)
+    _retry_missing_modules(task, blueprint, provider, missing_modules, result, warnings, emit, save_progress)
 
     generated_section_count = sum(1 for key, *_rest in _section_specs() if result.get(key))
     generated_module_count = len(result["modules"])
@@ -200,6 +209,7 @@ def _retry_missing_sections(
     result: dict[str, Any],
     warnings: list[str],
     emit=None,
+    save_progress=None,
 ) -> None:
     seen: set[str] = set()
     for spec, reason in missing_sections:
@@ -212,9 +222,14 @@ def _retry_missing_sections(
             paragraphs = _generate_section(task, blueprint, provider, key, title, count_hint, min_count, max_tokens, limit)
             if paragraphs:
                 result[key] = paragraphs
-                continue
         except Exception as exc:
+            if _fatal_provider_error(exc):
+                raise
             reason = f"{reason}；拆分重试失败：{sanitize_error_message(exc)}"
+        if result.get(key):
+            if save_progress:
+                save_progress(result)
+            continue
         warnings.append(f"{title}模型生成失败，需重试：{sanitize_error_message(reason)}")
 
 
@@ -226,6 +241,7 @@ def _retry_missing_modules(
     result: dict[str, Any],
     warnings: list[str],
     emit=None,
+    save_progress=None,
 ) -> None:
     seen: set[str] = set()
     modules_result = result.setdefault("modules", {})
@@ -240,9 +256,14 @@ def _retry_missing_modules(
             module_content = _generate_module_section(task, blueprint, provider, module)
             if module_content:
                 modules_result[module_key] = module_content
-                continue
         except Exception as exc:
+            if _fatal_provider_error(exc):
+                raise
             reason = f"{reason}；拆分重试失败：{sanitize_error_message(exc)}"
+        if module_key in modules_result:
+            if save_progress:
+                save_progress(result)
+            continue
         warnings.append(f"{module_title}模型生成失败，需重试：{sanitize_error_message(reason)}")
 
 
@@ -250,6 +271,12 @@ def _chunks(items, size: int):
     items = list(items)
     for index in range(0, len(items), size):
         yield items[index : index + size]
+
+
+def _fatal_provider_error(exc: Exception) -> bool:
+    return isinstance(exc, TextProviderError) and exc.category in {
+        TextErrorCategory.CONFIGURATION, TextErrorCategory.CANCELLED,
+    }
 
 
 def _llm_batch_workers() -> int:
@@ -387,15 +414,13 @@ def _generate_section(
 """.strip(),
         },
     ]
-    content = provider.chat(
+    data = _chat_json(
+        provider,
         messages,
         temperature=_temperature(task.randomness),
         max_tokens=max_tokens,
-        response_format={"type": "json_object"},
-        trace_label=f"manual:{title}",
-        retry_policy=TextRetryPolicy(max_retries=1),
+        label=title,
     )
-    data = _parse_json(content)
     paragraphs = _paragraphs(data.get("paragraphs"), min_count=min_count, limit=limit)
     if not paragraphs:
         raise ValueError(f"{title}有效段落不足")
@@ -430,7 +455,7 @@ def _generate_module_batch(
                 "content": f"""
 请为《{task.software_name}软件说明书》的本批功能模块生成正文。
 
-{_build_context(task, blueprint)}
+{_build_module_context(task, blueprint)}
 
 本批模块：
 {json.dumps(module_payload, ensure_ascii=False, indent=2)}
@@ -456,7 +481,7 @@ def _generate_module_batch(
             },
         ],
         temperature=_temperature(task.randomness),
-        max_tokens=2600,
+        max_tokens=3600,
         label="说明书模块章节批次",
     )
 
@@ -479,7 +504,7 @@ def _module_content_from_data(data: dict[str, Any], module) -> dict[str, Any] | 
     if not paragraphs:
         return None
     return {
-        "title": _clean_text(str(value.get("title") or module.title), 40),
+        "title": module.title,
         "paragraphs": paragraphs,
     }
 
@@ -500,7 +525,7 @@ def _generate_module_section(
             "content": f"""
 请为《{task.software_name}软件说明书》的功能模块章节生成正文。
 
-{_build_context(task, blueprint)}
+{_build_module_context(task, blueprint)}
 
 当前模块：
 - key: {module.key}
@@ -530,20 +555,18 @@ def _generate_module_section(
 """.strip(),
         },
     ]
-    content = provider.chat(
+    data = _chat_json(
+        provider,
         messages,
         temperature=_temperature(task.randomness),
-        max_tokens=900,
-        response_format={"type": "json_object"},
-        trace_label=f"manual:{module.title}",
-        retry_policy=TextRetryPolicy(max_retries=1),
+        max_tokens=2200,
+        label=module.title,
     )
-    data = _parse_json(content)
     paragraphs = _paragraphs(data.get("paragraphs"), min_count=2, limit=150)
     if not paragraphs:
         raise ValueError("模块有效段落不足")
     return {
-        "title": _clean_text(str(data.get("title") or module.title), 40),
+        "title": module.title,
         "paragraphs": paragraphs,
     }
 
@@ -586,6 +609,16 @@ def _build_context(task: GenerationTask, blueprint: ProductBlueprint) -> str:
 """.strip()
 
 
+def _build_module_context(task: GenerationTask, blueprint: ProductBlueprint) -> str:
+    return f"""
+软件：{task.software_name}（{task.version}）
+行业与场景：{blueprint.industry}；{blueprint.scenario or blueprint.positioning}
+目标用户：{"、".join((blueprint.target_users or blueprint.roles)[:5])}
+业务对象：{"、".join(blueprint.business_objects[:8])}
+业务补充：{(task.feature_hint or "无")[:300]}
+""".strip()
+
+
 def _system_prompt() -> str:
     return (
         "你是中文软件著作权软件说明书撰写专家。请根据产品蓝图生成可直接写入 Word 的说明书正文。"
@@ -595,18 +628,13 @@ def _system_prompt() -> str:
 
 
 def _parse_json(content: str) -> dict[str, Any]:
-    cleaned = content.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
-        cleaned = re.sub(r"```$", "", cleaned).strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start >= 0 and end > start:
-        cleaned = cleaned[start : end + 1]
-    data = json.loads(cleaned)
-    if not isinstance(data, dict):
-        raise ValueError("LLM 说明书不是 JSON 对象")
-    return data
+    cleaned = str(content or "").strip()
+    if len(cleaned) < 2:
+        raise ValueError("模型返回内容为空或被截断，未收到完整 JSON")
+    try:
+        return parse_json_object(cleaned, label="manual")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"模型返回不完整或无效 JSON（{len(cleaned)} 字符，第 {exc.lineno} 行，第 {exc.colno} 列）") from exc
 
 
 def _chat_json(
@@ -652,9 +680,9 @@ def _chat_json(
                 content_chars=len(content or ""),
             )
             return data
-        except TextProviderError:
-            raise
         except Exception as exc:
+            if isinstance(exc, TextProviderError) and exc.category != TextErrorCategory.FORMAT:
+                raise
             last_error = exc
             safe_error = sanitize_error_message(exc, limit=500)
             trace_event(

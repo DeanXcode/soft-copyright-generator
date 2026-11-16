@@ -15,6 +15,7 @@ python-runtime/
 libreoffice/
 output/
 output*/
+output-api-debug-*-trace.jsonl
 release/
 tmp/
 tmp-workbench*.png

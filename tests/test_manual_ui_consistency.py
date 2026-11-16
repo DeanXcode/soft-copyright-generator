@@ -20,10 +20,41 @@ from backend.softcopyright.screenshots import UiScreenshot
 
 
 class ManualUiConsistencyTests(unittest.TestCase):
+    def test_industry_login_fields_generate_consistent_notes_without_captcha_value(self):
+        for account in ("医护账号", "教师账户", "企业邮箱"):
+            with self.subTest(account=account), TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory)
+                item = UiScreenshot(
+                    "login", "登录界面", "", "login.html", page_kind="login",
+                    image_path=str(root / "login.png"),
+                    visible_content_summary={
+                        "ready": True,
+                        "visible_text": f"用户登录 {account} 密码 验证码 7K4P 记住账号 登录系统",
+                        "headings": ["用户登录"],
+                        "fields": [account, "密码", "验证码 7K4P", "记住账号"],
+                        "actions": ["登录系统"],
+                    },
+                )
+                caption = _visible_content_caption(item)
+                notes = _actual_screenshot_operation_notes(item, self._blueprint().modules[0])
+                self.assertIn(account, caption)
+                self.assertIn(account, " ".join(notes))
+                self.assertNotIn("7K4P", caption + " ".join(notes))
+                self.assertNotIn("记住账号", caption)
+                document = Document()
+                document.add_paragraph("图：登录界面，" + caption)
+                for index, note in enumerate(notes, 1):
+                    document.add_paragraph(f"{index}. {note}")
+                path = root / "manual.docx"
+                document.save(path)
+                result = analyze_manual_ui_consistency(path, self._blueprint(), {"login": item})
+                self.assertTrue(result["manual_ui_consistency_ready"], result)
+
     def test_semantic_aliases_cover_equivalent_visible_field_labels(self):
         self.assertTrue(_manual_semantic_term_covered("来源计划版本", "来源版本计划版本"))
         self.assertTrue(_manual_semantic_term_covered("预测范围", "影响范围预测周期"))
         self.assertTrue(_manual_semantic_term_covered("生产工单进度", "订单完工进度生产进度"))
+        self.assertTrue(_manual_semantic_term_covered("状态条件", "会话状态网络类型"))
         self.assertFalse(_manual_semantic_term_covered("生产工单进度", "物料齐套日期"))
 
     def test_symbol_only_button_labels_match_exact_screenshot_actions(self):
@@ -724,6 +755,81 @@ class ManualUiConsistencyTests(unittest.TestCase):
 
             self.assertTrue(result["manual_ui_consistency_ready"])
             self.assertTrue(result["manual_ui_semantic_ready"])
+
+    def test_semantic_gate_allows_archived_state_in_workflow_precondition(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            image = root / "page.png"
+            image.write_bytes(b"png")
+            screenshots = {
+                "quality_plan_operation_2_2": UiScreenshot(
+                    "quality_plan_operation_2_2",
+                    "质量策划",
+                    "质量策划页面。",
+                    str(root / "main.html"),
+                    page_kind="operation",
+                    module_key="quality_plan",
+                    image_path=str(image),
+                    action_crops={"生成留存结果": str(root / "save.png")},
+                    visible_content_summary={
+                        "ready": True,
+                        "visible_text": "质量策划 留存范围 生成留存结果",
+                        "headings": ["留存范围", "生成后结果"],
+                        "metrics": [],
+                        "fields": ["留存用途"],
+                        "statuses": [],
+                        "filters": [],
+                        "actions": ["生成留存结果"],
+                    },
+                )
+            }
+            document = Document()
+            document.add_paragraph("图：质量策划，页面展示留存范围和生成后结果。")
+            document.add_paragraph("1. 操作前状态为目标记录已归档，填写留存用途后点击【生成留存结果】。")
+            path = root / "manual.docx"
+            document.save(path)
+
+            result = analyze_manual_ui_consistency(path, self._blueprint(), screenshots)
+
+            self.assertTrue(result["manual_ui_consistency_ready"])
+            self.assertEqual(result["manual_ui_semantic_mismatch_count"], 0)
+
+    def test_semantic_gate_still_rejects_explicit_archive_control_when_not_visible(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            image = root / "page.png"
+            image.write_bytes(b"png")
+            screenshots = {
+                "quality_plan_operation_2_2": UiScreenshot(
+                    "quality_plan_operation_2_2",
+                    "质量策划",
+                    "质量策划页面。",
+                    str(root / "main.html"),
+                    page_kind="operation",
+                    module_key="quality_plan",
+                    image_path=str(image),
+                    visible_content_summary={
+                        "ready": True,
+                        "visible_text": "质量策划 留存范围 生成留存结果",
+                        "headings": ["留存范围", "生成后结果"],
+                        "metrics": [],
+                        "fields": ["留存用途"],
+                        "statuses": [],
+                        "filters": [],
+                        "actions": ["生成留存结果"],
+                    },
+                )
+            }
+            document = Document()
+            document.add_paragraph("图：质量策划，页面展示留存范围和生成后结果。")
+            document.add_paragraph("1. 点击归档按钮完成处理。")
+            path = root / "manual.docx"
+            document.save(path)
+
+            result = analyze_manual_ui_consistency(path, self._blueprint(), screenshots)
+
+            self.assertFalse(result["manual_ui_consistency_ready"])
+            self.assertIn("归档", result["manual_ui_semantic_mismatches"][0]["references"])
 
     def test_semantic_gate_accepts_input_placeholder_captured_as_filter(self):
         with TemporaryDirectory() as temporary_directory:

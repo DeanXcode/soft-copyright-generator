@@ -14,6 +14,7 @@ from softcopyright.generator import (
     _delivery_zip_path,
     _invalidate_legacy_frontend_cache_for_pagespec,
     _load_completed_resume_report,
+    _load_resume_ui_blueprint_from_prototype_manifest,
     _resume_failure_payload,
     _resume_failure_progress,
     _resume_failure_progress_from_payload,
@@ -25,10 +26,141 @@ from softcopyright.generator import (
     _write_generation_state,
 )
 from softcopyright.models import GenerationTask
+from softcopyright.blueprint import FeatureModule, ProductBlueprint
 from softcopyright.packager import write_json
+from softcopyright.frontend_codegen.page_spec import FRONTEND_ENGINE_VERSION
 
 
 class ResumeConfirmedOutlineTests(unittest.TestCase):
+    def test_generation_state_persists_confirmed_outline_before_blueprint_exists(self):
+        outline = {
+            "softwareName": "Figma浏览器",
+            "productType": "APP",
+            "domain": "Figma设计文件浏览与预览",
+            "modules": [{"title": "设计资源导航", "description": "浏览团队、项目和设计文件资源。"}],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "early-blueprint-failure"
+            task = GenerationTask(
+                software_name="Figma浏览器",
+                product_type="APP",
+                feature_hint="设计文件、页面画板和图层组件",
+                confirmed_outline=outline,
+            )
+
+            _write_generation_state(output_dir, task, "running", "blueprint", 21, "生成产品蓝图", {})
+            state = json.loads((output_dir / "generation-state.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(state["task"]["confirmed_outline"], outline)
+        self.assertEqual(state["task"]["feature_hint"], task.feature_hint)
+
+    def test_late_resume_recovers_visual_identity_from_published_frontend(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "resume-identity"
+            prototype_dir = output_dir / "generated_source" / "ui-prototype"
+            frontend_src = output_dir / "generated_source" / "frontend-app" / "src"
+            prototype_dir.mkdir(parents=True)
+            frontend_src.mkdir(parents=True)
+            module = FeatureModule("access", "门禁管理", "维护门禁记录。", ["AccessRecord"])
+            blueprint = ProductBlueprint(
+                software_name="门禁系统",
+                version="V1.0",
+                language="JavaScript",
+                product_type="应用软件",
+                industry="社区门禁",
+                purpose="门禁管理",
+                summary="门禁管理",
+                modules=[module],
+                roles=["管理员"],
+                pages=["系统首页"],
+                dev_environment={},
+                runtime_environment={},
+            )
+            pages = [
+                {"key": "login", "title": "登录", "caption": "登录", "file": "login.html"},
+                {"key": "dashboard", "title": "系统首页", "caption": "首页", "file": "dashboard.html"},
+                {"key": "access", "title": "门禁管理", "caption": "门禁", "file": "access.html"},
+                {"key": "statistics", "title": "统计报表", "caption": "统计", "file": "statistics.html"},
+            ]
+            write_json(
+                prototype_dir / "prototype-manifest.json",
+                {
+                    "renderer": "admin",
+                    "source": "llm",
+                    "visual_style": "石墨绿门禁工作台",
+                    "product_experience_spec": {"experience_shape": "desktop_web", "terminal": "desktop_browser"},
+                    "pages": pages,
+                },
+            )
+            (frontend_src / "App.jsx").write_text(
+                'const shellConfig = {\n'
+                '  "nav_model": "rail",\n'
+                '  "layout_variant": "kanban",\n'
+                '  "workspace_shape": "triage_console",\n'
+                '  "identity_signature": "identity-from-built-app",\n'
+                '  "palette": {"accent": "#65a30d", "sidebar": "#25330b"}\n'
+                '};\n\nexport default function App() { return null; }\n',
+                encoding="utf-8",
+            )
+
+            recovered = _load_resume_ui_blueprint_from_prototype_manifest(output_dir, blueprint)
+
+        self.assertIsNotNone(recovered)
+        identity = recovered.design_brief["visual_identity_spec"]
+        self.assertEqual(identity["identity_signature"], "identity-from-built-app")
+        self.assertEqual(identity["nav_model"], "rail")
+        self.assertEqual(recovered.design_brief["layout_variant"], "kanban")
+
+    def test_late_resume_recovers_visual_identity_from_published_static_pages(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "resume-static-identity"
+            prototype_dir = output_dir / "generated_source" / "ui-prototype"
+            prototype_dir.mkdir(parents=True)
+            module = FeatureModule("records", "档案管理", "维护档案记录。", ["Record"])
+            blueprint = ProductBlueprint(
+                software_name="档案系统",
+                version="V1.0",
+                language="Python",
+                product_type="应用软件",
+                industry="企业服务",
+                purpose="档案管理",
+                summary="档案管理",
+                modules=[module],
+                roles=["管理员"],
+                pages=["系统首页"],
+                dev_environment={},
+                runtime_environment={},
+            )
+            pages = [
+                {"key": "login", "title": "登录", "caption": "登录", "file": "login.html"},
+                {"key": "dashboard", "title": "系统首页", "caption": "首页", "file": "dashboard.html"},
+                {"key": "records", "title": "档案管理", "caption": "档案", "file": "records.html"},
+                {"key": "statistics", "title": "统计报表", "caption": "统计", "file": "statistics.html"},
+            ]
+            write_json(
+                prototype_dir / "prototype-manifest.json",
+                {
+                    "renderer": "admin",
+                    "source": "local-template",
+                    "visual_style": "蓝灰档案工作台",
+                    "experience_shape": "desktop_web",
+                    "pages": pages,
+                },
+            )
+            for page in pages:
+                (prototype_dir / page["file"]).write_text(
+                    f"<html><body data-page='{page['key']}'>{page['title']}</body></html>",
+                    encoding="utf-8",
+                )
+
+            recovered = _load_resume_ui_blueprint_from_prototype_manifest(output_dir, blueprint)
+
+        self.assertIsNotNone(recovered)
+        identity = recovered.design_brief["visual_identity_spec"]
+        self.assertTrue(identity["identity_signature"].startswith("static-"))
+        self.assertEqual(identity["palette_key"], "published-static")
+        self.assertEqual(recovered.design_brief["layout_variant"], "published-static")
+
     def test_generation_state_v2_and_failure_share_one_attempt(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "state-v2"
@@ -74,6 +206,25 @@ class ResumeConfirmedOutlineTests(unittest.TestCase):
         self.assertEqual(state["resume_source"], "failure-state")
         self.assertEqual(len(history), 1)
         self.assertFalse(failure_exists)
+
+    def test_late_resume_attempt_starts_at_failed_stage_instead_of_prepare(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "late-stage-resume"
+            output_dir.mkdir()
+            write_json(
+                output_dir / "generation-failure.json",
+                {"schema_version": 2, "attempt_id": "old-attempt", "status": "error", "stage": "validate", "progress": 99},
+            )
+            task = GenerationTask(software_name="晚阶段恢复测试系统", product_type="APP", seed="late-stage-resume")
+            task.resume_stage = "validate"
+            task.resume_progress = 99
+
+            _begin_generation_attempt(output_dir, task, resume_source="failure-state")
+            state = json.loads((output_dir / "generation-state.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(state["stage"], "validate")
+        self.assertEqual(state["progress"], 99)
+        self.assertIn("材料校验", state["message"])
 
     def test_stale_failure_file_does_not_override_latest_attempt(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -144,7 +295,7 @@ class ResumeConfirmedOutlineTests(unittest.TestCase):
             screens_dir.mkdir(parents=True)
             (screens_dir / "ScreenA.page-spec.json").write_text('{"schema_version":"page-spec-v1"}', encoding="utf-8")
             (react_dir / ".frontend-engine.json").write_text(
-                '{"frontend_engine_version":"pagespec-hybrid-v1"}',
+                json.dumps({"frontend_engine_version": FRONTEND_ENGINE_VERSION}),
                 encoding="utf-8",
             )
 
@@ -152,6 +303,35 @@ class ResumeConfirmedOutlineTests(unittest.TestCase):
 
             self.assertFalse(result["migrated"])
             self.assertTrue((screens_dir / "ScreenA.page-spec.json").exists())
+
+    def test_renderer_upgrade_preserves_pagespec_and_meta_for_local_rerender(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            react_dir = output_dir / "generated_source" / "ui-prototype" / "react-app"
+            screens_dir = react_dir / "src" / "screens"
+            screens_dir.mkdir(parents=True)
+            spec_path = screens_dir / "ScreenA.page-spec.json"
+            meta_path = screens_dir / "ScreenA.meta.json"
+            jsx_path = screens_dir / "ScreenA.jsx"
+            css_path = screens_dir / "ScreenA.css"
+            spec_path.write_text('{"schema_version":"page-spec-v1","page_key":"screen_a"}', encoding="utf-8")
+            meta_path.write_text('{"engine":"page-spec-v1","page_key":"screen_a"}', encoding="utf-8")
+            jsx_path.write_text("old jsx", encoding="utf-8")
+            css_path.write_text("old css", encoding="utf-8")
+            (react_dir / ".frontend-engine.json").write_text(
+                '{"frontend_engine_version":"pagespec-hybrid-v1"}',
+                encoding="utf-8",
+            )
+
+            result = _invalidate_legacy_frontend_cache_for_pagespec(output_dir)
+
+            self.assertTrue(result["migrated"])
+            self.assertEqual(result["previous_version"], "pagespec-hybrid-v1")
+            self.assertTrue(spec_path.exists())
+            self.assertTrue(meta_path.exists())
+            self.assertFalse(jsx_path.exists())
+            self.assertFalse(css_path.exists())
+            self.assertIn("page-spec-json", result["preserved"])
 
     def test_completed_resume_returns_existing_material_package(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -308,6 +488,14 @@ class ResumeConfirmedOutlineTests(unittest.TestCase):
         self.assertTrue(
             _should_defer_pre_render_similarity_for_resume(
                 resume_stage="done",
+                resume_ui_blueprint=ui_blueprint,
+                attempt_cached=ui_blueprint,
+                visual_reference_report=reference,
+            )
+        )
+        self.assertTrue(
+            _should_defer_pre_render_similarity_for_resume(
+                resume_stage="manual",
                 resume_ui_blueprint=ui_blueprint,
                 attempt_cached=ui_blueprint,
                 visual_reference_report=reference,

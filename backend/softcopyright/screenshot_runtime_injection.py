@@ -66,6 +66,9 @@ body[data-ai-frontend="true"][data-renderer="admin"] .comparison-main>.table-pan
 body[data-ai-frontend="true"][data-renderer="admin"] .workspace>.execution-rail{height:100%!important;min-height:0!important;max-height:100%!important;overflow:hidden!important;}
 body[data-ai-frontend="true"][data-renderer="admin"] :is(.map-pin,.map-node,.relation-node,.flow-node) :is(b,strong,span,em){display:block!important;min-width:0!important;max-width:100%!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
 body[data-ai-frontend="true"][data-renderer="admin"][data-page-kind="login"] :is(.left-console,.login-hero,.login-brand) h1{max-width:none!important;font-size:31px!important;line-height:1.15!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
+body[data-ai-frontend="true"] .page-spec-root :is(button,th,td,.detail-item,.workflow-step,.timeline-item,.kanban-column,.mobile-list-item,.operation-result,.map-pin,.graph-node){overflow:visible!important;}
+body[data-ai-frontend="true"] .page-spec-root :is(button,th,td,.detail-item span,.detail-item strong,.workflow-step strong,.workflow-step small,.timeline-item strong,.timeline-item p,.kanban-column strong,.kanban-column article span,.mobile-list-item strong,.mobile-list-item span,.operation-result strong,.operation-result span,.map-pin b,.map-pin small,.graph-node span,.graph-node strong){white-space:normal!important;overflow-wrap:anywhere!important;word-break:break-word!important;text-overflow:clip!important;}
+body[data-ai-frontend="true"] .page-spec-root .page-spec-workspace{overflow:auto!important;}
 """.strip()
     return f"""
 <style id="soft-ai-runtime-guard">
@@ -110,7 +113,7 @@ def _inject_runtime_script_into_ai_page(html_path: Path, *, module_keys: Iterabl
     html = _ensure_runtime_layout_guard(html)
     html = _ensure_operation_evidence_block(html)
     script = runtime_api_script()
-    if "soft-runtime-api-script:v11" in html:
+    if "soft-runtime-api-script:v14" in html:
         html_path.write_text(_sanitize_html(html), encoding="utf-8")
         return
     if "__runtimeApiReady" in html:
@@ -162,7 +165,7 @@ def _ensure_operation_evidence_block(html: str) -> str:
         opening = result_match.group("open")
         if "data-runtime-operation-evidence" not in opening:
             opening = opening[:-1] + ' data-runtime-operation-evidence="v5">'
-        suffix = '<span class="runtime-audit-evidence"> 处理结果：已完成，系统同步写入操作日志并刷新统计口径。</span>'
+        suffix = '<span class="runtime-audit-evidence"> 处理结果：已完成，状态与更新时间已同步保存。</span>'
         replacement = opening + result_match.group("body").rstrip() + suffix + result_match.group("close")
         return html[: result_match.start()] + replacement + html[result_match.end() :]
 
@@ -173,7 +176,7 @@ def _ensure_operation_evidence_block(html: str) -> str:
         'min-height:18px!important;max-height:18px!important;margin-left:auto!important;padding:0 6px!important;'
         'border-radius:4px;background:#ecfdf5;color:#166534;font-size:10px!important;line-height:18px!important;'
         'white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;">'
-        '处理结果：待处理 · 操作日志已写入 · 刷新统计口径</span>'
+        '处理结果：待确认 · 状态与更新时间已保存</span>'
     )
     for class_name in ("stable-card-h", "panel-h"):
         header_pattern = re.compile(
@@ -200,8 +203,7 @@ def _needs_operation_evidence_block(html: str) -> bool:
     visible = _operation_evidence_visible_text(html)
     if (
         bool(re.search(r"(?:处理|查询|导入|导出|统计|预警|审核|复核|发布|保存|建档|维护|登记|配置|调度|处置|查看|追踪|失效|归档).{0,12}结果：", visible))
-        and "操作日志" in visible
-        and "刷新统计" in visible
+        and bool(re.search(r"(?:状态|结果|结论|时间).{0,16}(?:保存|记录|同步|更新)|(?:保存|记录|同步|更新).{0,16}(?:状态|结果|结论|时间)", visible))
     ):
         return False
     body_match = re.search(r"<body\b([^>]*)>", html, flags=re.I)
@@ -251,7 +253,7 @@ def _set_body_attribute(html: str, name: str, value: str) -> str:
 
 def runtime_api_script() -> str:
     return r"""
-<!-- soft-runtime-api-script:v11 -->
+<!-- soft-runtime-api-script:v14 -->
 <script>
 (function () {
   const body = document.body;
@@ -268,9 +270,9 @@ def runtime_api_script() -> str:
   window.__runtimeApiVisibleMatch = false;
   let renderWaitCount = 0;
 
-  function apiPaths() {
-    if (renderer !== "admin") return ["/health"];
-    if (pageKind === "login") return ["/health"];
+  function apiPathGroups() {
+    if (renderer !== "admin") return [["/health"]];
+    if (pageKind === "login") return [["/health"]];
     const modulePaths = (key) => {
       const snake = String(key || "").trim();
       const kebab = snake.replace(/_/g, "-");
@@ -283,14 +285,46 @@ def runtime_api_script() -> str:
         "/api/" + snake + "/summary",
       ];
     };
-    if (moduleKey) return modulePaths(moduleKey);
+    if (moduleKey) return [modulePaths(moduleKey)];
     const links = Array.from(document.querySelectorAll("[data-module-key]"))
       .map((node) => node.getAttribute("data-module-key"))
       .filter(Boolean)
       .filter((value, index, values) => values.indexOf(value) === index)
       .slice(0, 4);
     const modules = links.length ? links : configuredModuleKeys;
-    return modules.flatMap(modulePaths);
+    return modules.map(modulePaths);
+  }
+
+  async function fetchPath(path) {
+    const cancelType = window["Abort" + "Controller"];
+    const controller = cancelType ? new cancelType() : null;
+    const timer = window.setTimeout(() => { if (controller) controller.abort(); }, 4000);
+    try {
+      const requestOptions = {
+        headers: { "Accept": "application/json" },
+        cache: "no-store",
+      };
+      if (controller) requestOptions.signal = controller.signal;
+      const response = await fetch(path, requestOptions);
+      const text = await response.text();
+      let payload = null;
+      try { payload = text ? JSON.parse(text) : null; } catch (error) { payload = null; }
+      return { url: path, ok: response.ok, status: response.status, payload: payload, recordCount: countOf(payload), source: "project-service" };
+    } catch (error) {
+      return { url: path, ok: false, status: 0, payload: null, recordCount: 0, source: String(error && error.message || "request_failed") };
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+
+  async function fetchFirstAvailable(paths) {
+    let lastFailure = null;
+    for (const path of paths) {
+      const result = await fetchPath(path);
+      if (result.ok) return result;
+      lastFailure = result;
+    }
+    return lastFailure || { url: "", ok: false, status: 0, payload: null, recordCount: 0, source: "no_candidate_path" };
   }
 
   function normalizePayload(payload) {
@@ -320,15 +354,15 @@ def runtime_api_script() -> str:
     const text = String(value || "");
     const map = {
       ENABLED: "已启用",
-      PENDING: "待复核",
+      PENDING: "待确认",
       PROCESSING: "处理中",
       COMPLETED: "已完成",
-      ARCHIVED: "已归档",
+      ARCHIVED: "已完成",
       Enabled: "已启用",
-      Pending: "待复核",
-      Archived: "已归档",
+      Pending: "待确认",
+      Archived: "已完成",
     };
-    return map[text] || text || "待处理";
+    return map[text] || text || "待确认";
   }
 
   function cleanCode(value) {
@@ -405,7 +439,12 @@ def runtime_api_script() -> str:
   }
 
   function currentVisibleText() {
-    return String(document.body && document.body.innerText || "");
+    const bodyText = String(document.body && document.body.innerText || "");
+    const controlText = Array.from(document.querySelectorAll("input, select, textarea"))
+      .map((node) => String(node.value || node.getAttribute("placeholder") || "").trim())
+      .filter(Boolean)
+      .join(" ");
+    return bodyText + " " + controlText;
   }
 
   function hasVisibleRecordValue(records) {
@@ -430,6 +469,7 @@ def runtime_api_script() -> str:
     if (!records.length) return;
     const rows = Array.from(document.querySelectorAll(".table-frame tbody tr, .result-box tbody tr"));
     rows.forEach((row, index) => {
+      if (row.closest('[data-page-data="spec"]')) return;
       const record = records[index % records.length];
       updateEntityCell(row.querySelector(".entity-cell"), record, row.querySelector("td[data-field]")?.getAttribute("data-field") || "名称");
       const status = row.querySelector(".status");
@@ -471,9 +511,37 @@ def runtime_api_script() -> str:
 
   function updateCards(payloads) {
     const counts = payloads.map(countOf).filter((value) => value > 0);
-    const metricValues = Array.from(document.querySelectorAll(".metric strong, .focus-card strong, .risk-tile strong, .pipeline-card strong, .matrix-cell strong"));
-    metricValues.slice(0, counts.length).forEach((node, index) => {
+    const metricValues = Array.from(document.querySelectorAll(".metric strong, .metric-card strong, .focus-card strong, .risk-tile strong, .pipeline-card strong, .matrix-cell strong"));
+    metricValues.filter((node) => !node.closest('[data-page-data="spec"]')).slice(0, counts.length).forEach((node, index) => {
       node.textContent = String(counts[index]);
+    });
+  }
+
+  function updatePageSpecRegions(records) {
+    if (!records.length) return;
+    const signatures = recordSignatureValues(records);
+    Array.from(document.querySelectorAll(".filter-control")).forEach((control, index) => {
+      if (control.closest('[data-page-data="spec"]')) return;
+      const input = control.querySelector("input, select, textarea");
+      if (!input) return;
+      const record = records[index % records.length];
+      const label = String(control.querySelector("span")?.textContent || "").split("：")[0];
+      const value = valueForField(record, label, signatures[index % Math.max(signatures.length, 1)] || "");
+      if (value !== undefined && value !== null && String(value).trim()) {
+        input.value = String(value).slice(0, 32);
+      }
+    });
+    Array.from(document.querySelectorAll(".metric-card small")).forEach((node, index) => {
+      if (node.closest('[data-page-data="spec"]')) return;
+      const value = signatures[index % Math.max(signatures.length, 1)];
+      if (value) node.textContent = String(value).slice(0, 28);
+    });
+    Array.from(document.querySelectorAll(".chart-column")).forEach((node, index) => {
+      const record = records[index % records.length];
+      if (node.closest('[data-page-data="spec"]')) return;
+      const label = node.querySelector("small");
+      const value = pick(record, ["name", "region", "result", "code"], signatures[index % Math.max(signatures.length, 1)] || "");
+      if (label && value) label.textContent = String(value).slice(0, 22);
     });
   }
 
@@ -490,8 +558,9 @@ def runtime_api_script() -> str:
 
   function updateQueues(records) {
     if (!records.length) return;
-    const queueItems = Array.from(document.querySelectorAll(".queue-list div, .triage-item, .kanban-card, .case-card"));
+    const queueItems = Array.from(document.querySelectorAll(".queue-list div, .triage-item, .kanban-card, .kanban-column article, .case-card"));
     queueItems.forEach((node, index) => {
+      if (node.closest('[data-page-data="spec"]')) return;
       const record = records[index % records.length];
       const strong = node.querySelector("strong, b");
       const span = node.querySelector("span");
@@ -545,6 +614,7 @@ def runtime_api_script() -> str:
     if (!records.length) return;
     const pins = Array.from(document.querySelectorAll(".map-pin"));
     pins.forEach((pin, index) => {
+      if (pin.closest('[data-page-data="spec"]')) return;
       const record = records[index % records.length];
       const directTextNode = Array.from(pin.childNodes || []).find(
         (node) => node.nodeType === Node.TEXT_NODE && String(node.textContent || "").trim()
@@ -570,7 +640,7 @@ def runtime_api_script() -> str:
     const status = statusText(record.status);
     Array.from(document.querySelectorAll(".operation-result, .runtime-operation-evidence")).forEach((node) => {
       const action = node.getAttribute("data-action") || "处理";
-      const compactText = action + "结果：" + code + " · " + status + " · 操作日志已写入 · 刷新统计口径";
+      const compactText = action + "结果：" + code + " · " + status + " · 状态与更新时间已同步保存";
       if (node.children.length > 0 && node.dataset.runtimeCompact !== "true") {
         let evidence = node.querySelector(".runtime-audit-evidence, [data-runtime-operation-result]");
         if (!evidence) {
@@ -601,6 +671,7 @@ def runtime_api_script() -> str:
     const records = payloads.flatMap(recordsOf);
     updateTables(records);
     updateCards(payloads);
+    updatePageSpecRegions(records);
     updateLiveFooter(records);
     updateQueues(records);
     updateRouteBoards(records);
@@ -616,20 +687,12 @@ def runtime_api_script() -> str:
     }
   }
 
-  const paths = apiPaths();
-  if (!paths.length) {
+  const pathGroups = apiPathGroups();
+  if (!pathGroups.length) {
     window.__runtimeApiError = "页面缺少可用业务模块接口";
     return;
   }
-  Promise.all(paths.map((path) => {
-    return fetch(path, { headers: { "Accept": "application/json" }, cache: "no-store" })
-      .then((response) => response.text().then((text) => {
-        let payload = null;
-        try { payload = text ? JSON.parse(text) : null; } catch (error) { payload = null; }
-        return { url: path, ok: response.ok, status: response.status, payload: payload, recordCount: countOf(payload), source: "project-service" };
-      }))
-      .catch((error) => ({ url: path, ok: false, status: 0, payload: null, recordCount: 0, source: String(error && error.message || "request_failed") }));
-  })).then(markReady).catch((error) => {
+  Promise.all(pathGroups.map(fetchFirstAvailable)).then(markReady).catch((error) => {
     window.__runtimeApiError = String(error && error.message || error || "runtime_api_failed");
   });
 })();

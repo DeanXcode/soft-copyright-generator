@@ -1,0 +1,712 @@
+{
+  "scope": "paired first-pass PageSpec requests with cached upstream inputs; not full generation",
+  "model": "gpt-6-sol",
+  "measurements": [
+    {
+      "sample_id": 1,
+      "page_key": "login",
+      "before_input_chars": 28954,
+      "after_input_chars": 7563
+    },
+    {
+      "sample_id": 1,
+      "page_key": "dashboard",
+      "before_input_chars": 28743,
+      "after_input_chars": 7297
+    },
+    {
+      "sample_id": 1,
+      "page_key": "editing_projects",
+      "before_input_chars": 31495,
+      "after_input_chars": 9193
+    },
+    {
+      "sample_id": 1,
+      "page_key": "media_import",
+      "before_input_chars": 31469,
+      "after_input_chars": 9167
+    },
+    {
+      "sample_id": 1,
+      "page_key": "clip_trimming",
+      "before_input_chars": 31504,
+      "after_input_chars": 9202
+    },
+    {
+      "sample_id": 1,
+      "page_key": "timeline_editing",
+      "before_input_chars": 31542,
+      "after_input_chars": 9240
+    },
+    {
+      "sample_id": 1,
+      "page_key": "transitions_and_speed",
+      "before_input_chars": 31562,
+      "after_input_chars": 9260
+    },
+    {
+      "sample_id": 1,
+      "page_key": "subtitle_editing",
+      "before_input_chars": 31531,
+      "after_input_chars": 9229
+    },
+    {
+      "sample_id": 1,
+      "page_key": "voice_recording",
+      "before_input_chars": 31527,
+      "after_input_chars": 9225
+    },
+    {
+      "sample_id": 1,
+      "page_key": "composition_preview",
+      "before_input_chars": 31662,
+      "after_input_chars": 9360
+    },
+    {
+      "sample_id": 1,
+      "page_key": "statistics",
+      "before_input_chars": 28777,
+      "after_input_chars": 7331
+    },
+    {
+      "sample_id": 1,
+      "page_key": "editing_projects_operation_2_2",
+      "before_input_chars": 31882,
+      "after_input_chars": 9542
+    },
+    {
+      "sample_id": 1,
+      "page_key": "editing_projects_operation_3_3",
+      "before_input_chars": 31813,
+      "after_input_chars": 9473
+    },
+    {
+      "sample_id": 1,
+      "page_key": "media_import_operation_2_2",
+      "before_input_chars": 31800,
+      "after_input_chars": 9460
+    },
+    {
+      "sample_id": 1,
+      "page_key": "media_import_operation_3_3",
+      "before_input_chars": 31743,
+      "after_input_chars": 9403
+    },
+    {
+      "sample_id": 1,
+      "page_key": "clip_trimming_operation_2_2",
+      "before_input_chars": 31856,
+      "after_input_chars": 9516
+    },
+    {
+      "sample_id": 1,
+      "page_key": "clip_trimming_operation_3_3",
+      "before_input_chars": 31787,
+      "after_input_chars": 9447
+    },
+    {
+      "sample_id": 1,
+      "page_key": "timeline_editing_operation_2_2",
+      "before_input_chars": 31898,
+      "after_input_chars": 9558
+    },
+    {
+      "sample_id": 1,
+      "page_key": "timeline_editing_operation_3_3",
+      "before_input_chars": 31829,
+      "after_input_chars": 9489
+    },
+    {
+      "sample_id": 1,
+      "page_key": "transitions_and_speed_operation_2_2",
+      "before_input_chars": 31948,
+      "after_input_chars": 9608
+    },
+    {
+      "sample_id": 1,
+      "page_key": "transitions_and_speed_operation_3_3",
+      "before_input_chars": 31879,
+      "after_input_chars": 9539
+    },
+    {
+      "sample_id": 1,
+      "page_key": "subtitle_editing_operation_2_2",
+      "before_input_chars": 31904,
+      "after_input_chars": 9564
+    },
+    {
+      "sample_id": 1,
+      "page_key": "subtitle_editing_operation_3_3",
+      "before_input_chars": 31835,
+      "after_input_chars": 9495
+    },
+    {
+      "sample_id": 1,
+      "page_key": "voice_recording_operation_2_2",
+      "before_input_chars": 31901,
+      "after_input_chars": 9561
+    },
+    {
+      "sample_id": 1,
+      "page_key": "voice_recording_operation_3_3",
+      "before_input_chars": 31832,
+      "after_input_chars": 9492
+    },
+    {
+      "sample_id": 1,
+      "page_key": "composition_preview_operation_2_2",
+      "before_input_chars": 32056,
+      "after_input_chars": 9716
+    },
+    {
+      "sample_id": 1,
+      "page_key": "composition_preview_operation_3_3",
+      "before_input_chars": 31963,
+      "after_input_chars": 9623
+    },
+    {
+      "sample_id": 2,
+      "page_key": "login",
+      "before_input_chars": 29077,
+      "after_input_chars": 7559
+    },
+    {
+      "sample_id": 2,
+      "page_key": "dashboard",
+      "before_input_chars": 28871,
+      "after_input_chars": 7298
+    },
+    {
+      "sample_id": 2,
+      "page_key": "class_course",
+      "before_input_chars": 31535,
+      "after_input_chars": 9106
+    },
+    {
+      "sample_id": 2,
+      "page_key": "class_course_operation_2_2",
+      "before_input_chars": 31860,
+      "after_input_chars": 9393
+    },
+    {
+      "sample_id": 2,
+      "page_key": "class_course_operation_3_3",
+      "before_input_chars": 31834,
+      "after_input_chars": 9367
+    },
+    {
+      "sample_id": 2,
+      "page_key": "class_course_operation_4_4",
+      "before_input_chars": 31815,
+      "after_input_chars": 9348
+    },
+    {
+      "sample_id": 2,
+      "page_key": "assignment_publish",
+      "before_input_chars": 31719,
+      "after_input_chars": 9283
+    },
+    {
+      "sample_id": 2,
+      "page_key": "assignment_publish_operation_2_2",
+      "before_input_chars": 32082,
+      "after_input_chars": 9608
+    },
+    {
+      "sample_id": 2,
+      "page_key": "assignment_publish_operation_3_3",
+      "before_input_chars": 32013,
+      "after_input_chars": 9539
+    },
+    {
+      "sample_id": 2,
+      "page_key": "assignment_publish_operation_4_4",
+      "before_input_chars": 32032,
+      "after_input_chars": 9558
+    },
+    {
+      "sample_id": 2,
+      "page_key": "student_submission",
+      "before_input_chars": 31727,
+      "after_input_chars": 9291
+    },
+    {
+      "sample_id": 2,
+      "page_key": "student_submission_operation_2_2",
+      "before_input_chars": 32084,
+      "after_input_chars": 9610
+    },
+    {
+      "sample_id": 2,
+      "page_key": "student_submission_operation_3_3",
+      "before_input_chars": 32034,
+      "after_input_chars": 9560
+    },
+    {
+      "sample_id": 2,
+      "page_key": "student_submission_operation_4_4",
+      "before_input_chars": 32015,
+      "after_input_chars": 9541
+    },
+    {
+      "sample_id": 2,
+      "page_key": "submission_tracking",
+      "before_input_chars": 31700,
+      "after_input_chars": 9271
+    },
+    {
+      "sample_id": 2,
+      "page_key": "submission_tracking_operation_2_2",
+      "before_input_chars": 32047,
+      "after_input_chars": 9580
+    },
+    {
+      "sample_id": 2,
+      "page_key": "submission_tracking_operation_3_3",
+      "before_input_chars": 31990,
+      "after_input_chars": 9523
+    },
+    {
+      "sample_id": 2,
+      "page_key": "submission_tracking_operation_4_4",
+      "before_input_chars": 32009,
+      "after_input_chars": 9542
+    },
+    {
+      "sample_id": 2,
+      "page_key": "teacher_grading",
+      "before_input_chars": 31674,
+      "after_input_chars": 9245
+    },
+    {
+      "sample_id": 2,
+      "page_key": "teacher_grading_operation_2_2",
+      "before_input_chars": 31994,
+      "after_input_chars": 9527
+    },
+    {
+      "sample_id": 2,
+      "page_key": "teacher_grading_operation_3_3",
+      "before_input_chars": 31956,
+      "after_input_chars": 9489
+    },
+    {
+      "sample_id": 2,
+      "page_key": "teacher_grading_operation_4_4",
+      "before_input_chars": 31937,
+      "after_input_chars": 9470
+    },
+    {
+      "sample_id": 2,
+      "page_key": "grade_feedback",
+      "before_input_chars": 31697,
+      "after_input_chars": 9268
+    },
+    {
+      "sample_id": 2,
+      "page_key": "grade_feedback_operation_2_2",
+      "before_input_chars": 32026,
+      "after_input_chars": 9559
+    },
+    {
+      "sample_id": 2,
+      "page_key": "grade_feedback_operation_3_3",
+      "before_input_chars": 31957,
+      "after_input_chars": 9490
+    },
+    {
+      "sample_id": 2,
+      "page_key": "grade_feedback_operation_4_4",
+      "before_input_chars": 31976,
+      "after_input_chars": 9509
+    },
+    {
+      "sample_id": 2,
+      "page_key": "mistake_collection",
+      "before_input_chars": 31733,
+      "after_input_chars": 9304
+    },
+    {
+      "sample_id": 2,
+      "page_key": "mistake_collection_operation_2_2",
+      "before_input_chars": 32077,
+      "after_input_chars": 9610
+    },
+    {
+      "sample_id": 2,
+      "page_key": "mistake_collection_operation_3_3",
+      "before_input_chars": 32027,
+      "after_input_chars": 9560
+    },
+    {
+      "sample_id": 2,
+      "page_key": "mistake_collection_operation_4_4",
+      "before_input_chars": 32008,
+      "after_input_chars": 9541
+    },
+    {
+      "sample_id": 2,
+      "page_key": "learning_report",
+      "before_input_chars": 31662,
+      "after_input_chars": 9226
+    },
+    {
+      "sample_id": 2,
+      "page_key": "learning_report_operation_2_2",
+      "before_input_chars": 32003,
+      "after_input_chars": 9529
+    },
+    {
+      "sample_id": 2,
+      "page_key": "learning_report_operation_3_3",
+      "before_input_chars": 31946,
+      "after_input_chars": 9472
+    },
+    {
+      "sample_id": 2,
+      "page_key": "learning_report_operation_4_4",
+      "before_input_chars": 31965,
+      "after_input_chars": 9491
+    },
+    {
+      "sample_id": 2,
+      "page_key": "statistics",
+      "before_input_chars": 28889,
+      "after_input_chars": 7316
+    },
+    {
+      "sample_id": 3,
+      "page_key": "login",
+      "before_input_chars": 30031,
+      "after_input_chars": 8126
+    },
+    {
+      "sample_id": 3,
+      "page_key": "dashboard",
+      "before_input_chars": 29839,
+      "after_input_chars": 7879
+    },
+    {
+      "sample_id": 3,
+      "page_key": "patient_profiles",
+      "before_input_chars": 32697,
+      "after_input_chars": 9881
+    },
+    {
+      "sample_id": 3,
+      "page_key": "patient_profiles_operation_2_2",
+      "before_input_chars": 33080,
+      "after_input_chars": 10226
+    },
+    {
+      "sample_id": 3,
+      "page_key": "patient_profiles_operation_3_3",
+      "before_input_chars": 32982,
+      "after_input_chars": 10128
+    },
+    {
+      "sample_id": 3,
+      "page_key": "patient_profiles_operation_4_4",
+      "before_input_chars": 32963,
+      "after_input_chars": 10109
+    },
+    {
+      "sample_id": 3,
+      "page_key": "patient_risk_assessment",
+      "before_input_chars": 32834,
+      "after_input_chars": 10018
+    },
+    {
+      "sample_id": 3,
+      "page_key": "patient_risk_assessment_operation_2_2",
+      "before_input_chars": 33220,
+      "after_input_chars": 10366
+    },
+    {
+      "sample_id": 3,
+      "page_key": "patient_risk_assessment_operation_3_3",
+      "before_input_chars": 33127,
+      "after_input_chars": 10273
+    },
+    {
+      "sample_id": 3,
+      "page_key": "patient_risk_assessment_operation_4_4",
+      "before_input_chars": 33146,
+      "after_input_chars": 10292
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_plan_design",
+      "before_input_chars": 32725,
+      "after_input_chars": 9909
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_plan_design_operation_2_2",
+      "before_input_chars": 33056,
+      "after_input_chars": 10202
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_plan_design_operation_3_3",
+      "before_input_chars": 33018,
+      "after_input_chars": 10164
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_plan_design_operation_4_4",
+      "before_input_chars": 32999,
+      "after_input_chars": 10145
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_task_assignment",
+      "before_input_chars": 32754,
+      "after_input_chars": 9938
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_task_assignment_operation_2_2",
+      "before_input_chars": 33100,
+      "after_input_chars": 10246
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_task_assignment_operation_3_3",
+      "before_input_chars": 33043,
+      "after_input_chars": 10189
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_task_assignment_operation_4_4",
+      "before_input_chars": 33062,
+      "after_input_chars": 10208
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_execution_records",
+      "before_input_chars": 32820,
+      "after_input_chars": 10004
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_execution_records_operation_2_2",
+      "before_input_chars": 33192,
+      "after_input_chars": 10338
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_execution_records_operation_3_3",
+      "before_input_chars": 33142,
+      "after_input_chars": 10288
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_execution_records_operation_4_4",
+      "before_input_chars": 33123,
+      "after_input_chars": 10269
+    },
+    {
+      "sample_id": 3,
+      "page_key": "health_guidance_tracking",
+      "before_input_chars": 32857,
+      "after_input_chars": 10041
+    },
+    {
+      "sample_id": 3,
+      "page_key": "health_guidance_tracking_operation_2_2",
+      "before_input_chars": 33269,
+      "after_input_chars": 10415
+    },
+    {
+      "sample_id": 3,
+      "page_key": "health_guidance_tracking_operation_3_3",
+      "before_input_chars": 33176,
+      "after_input_chars": 10322
+    },
+    {
+      "sample_id": 3,
+      "page_key": "health_guidance_tracking_operation_4_4",
+      "before_input_chars": 33195,
+      "after_input_chars": 10341
+    },
+    {
+      "sample_id": 3,
+      "page_key": "abnormal_alerts",
+      "before_input_chars": 32689,
+      "after_input_chars": 9873
+    },
+    {
+      "sample_id": 3,
+      "page_key": "abnormal_alerts_operation_2_2",
+      "before_input_chars": 33013,
+      "after_input_chars": 10159
+    },
+    {
+      "sample_id": 3,
+      "page_key": "abnormal_alerts_operation_3_3",
+      "before_input_chars": 32975,
+      "after_input_chars": 10121
+    },
+    {
+      "sample_id": 3,
+      "page_key": "abnormal_alerts_operation_4_4",
+      "before_input_chars": 32956,
+      "after_input_chars": 10102
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_outcome_reports",
+      "before_input_chars": 32820,
+      "after_input_chars": 10004
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_outcome_reports_operation_2_2",
+      "before_input_chars": 33272,
+      "after_input_chars": 10418
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_outcome_reports_operation_3_3",
+      "before_input_chars": 33179,
+      "after_input_chars": 10325
+    },
+    {
+      "sample_id": 3,
+      "page_key": "followup_outcome_reports_operation_4_4",
+      "before_input_chars": 33198,
+      "after_input_chars": 10344
+    },
+    {
+      "sample_id": 3,
+      "page_key": "statistics",
+      "before_input_chars": 29842,
+      "after_input_chars": 7882
+    }
+  ],
+  "results": [
+    {
+      "sample_id": 1,
+      "arm": "before",
+      "page_key": "editing_projects_operation_2_2",
+      "status": "success",
+      "elapsed_seconds": 22.582,
+      "input_chars": 31882,
+      "logical_requests": 1,
+      "reported_usage": {
+        "completion_tokens": 728,
+        "prompt_tokens": 16901,
+        "total_tokens": 17629
+      },
+      "finish_reason": "stop",
+      "attempt": 1
+    },
+    {
+      "sample_id": 1,
+      "arm": "after",
+      "page_key": "editing_projects_operation_2_2",
+      "status": "success",
+      "elapsed_seconds": 36.287,
+      "input_chars": 9542,
+      "logical_requests": 1,
+      "reported_usage": {
+        "completion_tokens": 811,
+        "prompt_tokens": 9183,
+        "total_tokens": 9994
+      },
+      "finish_reason": "stop",
+      "attempt": 1
+    },
+    {
+      "sample_id": 2,
+      "arm": "after",
+      "page_key": "class_course_operation_2_2",
+      "status": "success",
+      "elapsed_seconds": 21.821,
+      "input_chars": 9393,
+      "logical_requests": 1,
+      "reported_usage": {
+        "completion_tokens": 565,
+        "prompt_tokens": 9139,
+        "total_tokens": 9704
+      },
+      "finish_reason": "stop",
+      "attempt": 1
+    },
+    {
+      "sample_id": 2,
+      "arm": "before",
+      "page_key": "class_course_operation_2_2",
+      "status": "success",
+      "elapsed_seconds": 5.678,
+      "input_chars": 31860,
+      "logical_requests": 1,
+      "reported_usage": {
+        "completion_tokens": 509,
+        "prompt_tokens": 43079,
+        "total_tokens": 43588
+      },
+      "finish_reason": "stop",
+      "attempt": 1
+    },
+    {
+      "sample_id": 3,
+      "arm": "before",
+      "page_key": "patient_profiles_operation_2_2",
+      "status": "success",
+      "elapsed_seconds": 26.083,
+      "input_chars": 33080,
+      "logical_requests": 1,
+      "reported_usage": {
+        "completion_tokens": 748,
+        "prompt_tokens": 17376,
+        "total_tokens": 18124
+      },
+      "finish_reason": "stop",
+      "attempt": 1
+    },
+    {
+      "sample_id": 3,
+      "arm": "after",
+      "page_key": "patient_profiles_operation_2_2",
+      "status": "success",
+      "elapsed_seconds": 25.11,
+      "input_chars": 10226,
+      "logical_requests": 1,
+      "reported_usage": {
+        "completion_tokens": 567,
+        "prompt_tokens": 9596,
+        "total_tokens": 10163
+      },
+      "finish_reason": "stop",
+      "attempt": 1
+    }
+  ],
+  "source_sha256": "1e6ad1be838dd9401861c3902c318a8e4c4e506f492e73077b0689b9902d95d4",
+  "status": "complete",
+  "request_size_summary": {
+    "page_count": 97,
+    "before_input_chars": 3103057,
+    "after_input_chars": 922681,
+    "reduction_percent": 70.27
+  },
+  "arm_summary": {
+    "before": {
+      "page_count": 3,
+      "first_pass_successes": 3,
+      "mean_seconds": 18.114
+    },
+    "after": {
+      "page_count": 3,
+      "first_pass_successes": 3,
+      "mean_seconds": 27.739
+    }
+  },
+  "limitations": [
+    "Page requests only; no full package or screenshot acceptance.",
+    "Three paired pages; does not establish overall success rate or speed improvement.",
+    "Before function reconstructed by reverting context compaction and local interaction injection only.",
+    "Character counts are not token usage or API billing. Gateway-reported usage is retained without cost conversion."
+  ]
+}

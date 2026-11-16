@@ -91,6 +91,10 @@ class GenerationTask:
     def to_dict(self) -> dict:
         self.software_category = normalize_software_category(self.software_category)
         data = asdict(self)
+        # Task snapshots are persisted in generation reports. Keep connection
+        # details in the runtime configuration rather than exported metadata.
+        data["llm_base_url"] = ""
+        data["llm_endpoint_configured"] = bool(self.llm_base_url)
         data["output_root"] = str(self.output_root)
         data["accepted_blueprint_path"] = str(self.accepted_blueprint_path or "")
         data["resume_output_dir"] = str(self.resume_output_dir or "")

@@ -9,7 +9,7 @@ from .packager import write_json
 from .screenshot_capture import _normalize_visible_content_summary
 
 
-SCREENSHOT_CHECKPOINT_VERSION = 13
+SCREENSHOT_CHECKPOINT_VERSION = 14
 
 
 def screenshot_checkpoint_path(ui_dir: Path) -> Path:

@@ -53,6 +53,16 @@ class _RuntimeApiHandler(SimpleHTTPRequestHandler):
 
 
 class DashboardRuntimeApiTests(unittest.TestCase):
+    def test_runtime_api_probes_candidate_routes_sequentially_and_stops_after_success(self):
+        script = runtime_api_script()
+
+        self.assertIn("function apiPathGroups()", script)
+        self.assertIn("async function fetchFirstAvailable(paths)", script)
+        self.assertIn("if (result.ok) return result", script)
+        self.assertIn('window["Abort" + "Controller"]', script)
+        self.assertIn("requestOptions.signal = controller.signal", script)
+        self.assertNotIn("Promise.all(paths.map", script)
+
     def test_route_runtime_binding_never_writes_business_text_into_decorative_icon(self):
         script = runtime_api_script()
 
@@ -86,7 +96,7 @@ class DashboardRuntimeApiTests(unittest.TestCase):
                 """<!doctype html><html><head>
 <style id=\"soft-ai-runtime-guard\">body{width:1280px;min-height:820px;overflow:hidden;}</style>
 </head><body data-page-kind=\"dashboard\" data-module-key=\"\" data-renderer=\"admin\">
-<!-- soft-runtime-api-script:v4 -->
+<!-- soft-runtime-api-script:v11 -->
 <script>(function () { window.__runtimeApiReady = false; })();</script>
 </body></html>""",
                 encoding="utf-8",
@@ -95,16 +105,16 @@ class DashboardRuntimeApiTests(unittest.TestCase):
             html = page_path.read_text(encoding="utf-8")
 
         self.assertIn('data-runtime-module-keys="inventory"', html)
-        self.assertNotIn("soft-runtime-api-script:v4", html)
-        self.assertEqual(html.count("soft-runtime-api-script:v11"), 1)
+        self.assertNotIn("soft-runtime-api-script:v11", html)
+        self.assertEqual(html.count("soft-runtime-api-script:v14"), 1)
         self.assertIn("height:720px!important", html)
         self.assertIn("table-layout:fixed!important", html)
         self.assertIn("white-space:nowrap!important", html)
         self.assertNotIn("min-height:820px", html)
         visible = _visible_html_text(html)
         self.assertIn("处理结果", visible)
-        self.assertIn("操作日志", visible)
-        self.assertIn("刷新统计口径", visible)
+        self.assertIn("状态与更新时间已保存", visible)
+        self.assertNotIn("操作日志", visible)
         self.assertTrue(
             _ui_screenshot_realism_checks(primary_context="", html_text=visible, renderer="admin")[
                 "ui_operation_result_evidence_ready"
@@ -126,8 +136,8 @@ class DashboardRuntimeApiTests(unittest.TestCase):
         self.assertIn("runtime-operation-evidence", html)
         visible = _visible_html_text(html)
         self.assertIn("仍需确认下层 2 个测点坐标", visible)
-        self.assertIn("操作日志", visible)
-        self.assertIn("刷新统计口径", visible)
+        self.assertIn("状态与更新时间已同步保存", visible)
+        self.assertNotIn("操作日志", visible)
         self.assertTrue(
             _ui_screenshot_realism_checks(primary_context="", html_text=visible, renderer="admin")[
                 "ui_operation_result_evidence_ready"
@@ -177,7 +187,7 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}.operation-result{width:
 
         self.assertEqual(runtime["title"], "处理成效评估")
         self.assertIn("保留原有业务说明", runtime["description"])
-        self.assertIn("操作日志", runtime["evidence"])
+        self.assertIn("状态与更新时间已同步保存", runtime["evidence"])
         self.assertNotEqual(runtime["resultMaxHeight"], "42px")
         self.assertFalse(issues)
 
@@ -386,7 +396,7 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}
             _inject_runtime_script_into_ai_page(page_path, module_keys=["inventory"])
             html = page_path.read_text(encoding="utf-8")
             self.assertIn('data-runtime-module-keys="inventory"', html)
-            self.assertIn("soft-runtime-api-script:v11", html)
+            self.assertIn("soft-runtime-api-script:v14", html)
             self.assertNotIn("trunk_route_catalog", html)
 
             handler = partial(_RuntimeApiHandler, directory=str(root))
@@ -424,6 +434,56 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}
         self.assertTrue(any(item["ok"] and item["url"] == "/inventory/" for item in runtime["fetches"]))
         self.assertIn("INV-2026-001", runtime["text"])
 
+    def test_page_spec_regions_bind_project_api_records_without_table_or_detail(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            page_path = root / "page-spec.html"
+            page_path.write_text(
+                """<!doctype html><html lang="zh-CN"><body data-page-kind="module" data-module-key="inventory" data-renderer="admin" data-ai-frontend="true">
+<section class="page-region region-filter_bar"><div class="filter-bar"><label class="filter-control"><span>编号</span><input placeholder="请输入编号" /></label></div></section>
+<section class="page-region region-metric_group"><div class="metric-grid"><article class="metric-card"><span>当前记录</span><strong>0</strong><small>等待加载</small></article></div></section>
+<section class="page-region region-kanban"><div class="kanban-board"><section class="kanban-column"><article><strong>待处理</strong><span>等待加载</span></article></section></div></section>
+<section class="page-region region-chart"><div class="chart-columns"><div class="chart-column"><span class="chart-value">0</span><i class="chart-bar"></i><small>本期</small></div></div></section>
+</body></html>""",
+                encoding="utf-8",
+            )
+            _inject_runtime_script_into_ai_page(page_path, module_keys=["inventory"])
+            handler = partial(_RuntimeApiHandler, directory=str(root))
+            server = create_safe_threading_http_server("127.0.0.1", handler)
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                from playwright.sync_api import sync_playwright
+
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(headless=True)
+                    page = browser.new_page(viewport={"width": 1280, "height": 720})
+                    page.goto(f"http://127.0.0.1:{server.server_port}/page-spec.html", wait_until="networkidle")
+                    page.wait_for_function("() => window.__runtimeApiReady === true || window.__runtimeApiError")
+                    runtime = page.evaluate(
+                        """() => ({
+                          error: window.__runtimeApiError,
+                          ready: window.__runtimeApiReady,
+                          visible: window.__runtimeApiVisibleMatch,
+                          inputValue: document.querySelector('.filter-control input')?.value || '',
+                          metricMeta: document.querySelector('.metric-card small')?.textContent || '',
+                          kanbanText: document.querySelector('.kanban-column article')?.innerText || '',
+                          chartLabel: document.querySelector('.chart-column small')?.textContent || ''
+                        })"""
+                    )
+                    browser.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(runtime["error"], "")
+        self.assertTrue(runtime["ready"] and runtime["visible"])
+        self.assertEqual(runtime["inputValue"], "INV-2026-001")
+        self.assertIn("INV-2026-001", runtime["metricMeta"])
+        self.assertIn("INV-2026-001", runtime["kanbanText"])
+        self.assertIn("主粮仓库存记录", runtime["chartLabel"])
+
     def test_statistics_binds_plain_table_and_uses_inline_evidence(self):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -440,7 +500,7 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}.stable-card{width:900px
             )
             _inject_runtime_script_into_ai_page(page_path, module_keys=["inventory"])
             html = page_path.read_text(encoding="utf-8")
-            self.assertIn("soft-runtime-api-script:v11", html)
+            self.assertIn("soft-runtime-api-script:v14", html)
             self.assertIn('class="runtime-operation-evidence"', html)
             self.assertNotIn("data-runtime-operation-evidence-style", html)
 
@@ -478,7 +538,7 @@ body{margin:0;width:1280px;height:720px;overflow:hidden}.stable-card{width:900px
         self.assertTrue(runtime["ready"] and runtime["visible"])
         self.assertEqual(runtime["firstCode"], "INV-2026-001")
         self.assertFalse(runtime["floatingPanel"])
-        self.assertIn("操作日志", runtime["evidenceText"])
+        self.assertIn("状态与更新时间已同步保存", runtime["evidenceText"])
         self.assertFalse(issues)
 
     def test_layout_repair_moves_overlapping_absolute_controls(self):

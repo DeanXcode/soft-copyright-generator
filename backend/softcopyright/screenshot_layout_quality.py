@@ -47,6 +47,10 @@ def _assert_screenshot_content_geometry(image_path: Path, renderer: str, item: U
 def _auto_repair_page_text_layout(page, renderer: str) -> None:
     if renderer in {"mobile_app", "game"}:
         return
+    # PageSpec owns its own wrapping and scroll contract; the legacy repair pass
+    # would otherwise reapply fixed-height ellipsis styles after page CSS loads.
+    if page.locator(".page-spec-root").count():
+        return
     page.evaluate(
         """() => {
           if (document.getElementById("soft-auto-layout-repair")) return;

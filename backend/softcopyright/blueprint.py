@@ -459,7 +459,14 @@ def _module_subject(title: str) -> str:
 
 
 def _semantic_fields(subject: str) -> list[str]:
+    if "班次排班" in subject:
+        return ["员工编号", "班次名称", "排班日期", "上班时间", "下班时间", "适用员工", "排班状态"]
+    if "出勤统计" in subject:
+        return ["统计周期", "员工范围", "班次范围", "正常打卡率", "迟到人数", "请假人数", "生成状态"]
     profiles = [
+        (("打卡", "考勤"), ["员工编号", "考勤日期", "班次名称", "打卡时间", "打卡位置", "考勤状态"]),
+        (("补卡",), ["员工编号", "考勤日期", "缺卡时段", "补卡原因", "证明附件", "申请状态"]),
+        (("请假",), ["员工编号", "请假类型", "开始时间", "结束时间", "请假事由", "申请状态"]),
         (("预约",), ["预约日期", "可用时段", "服务网点", "履约状态"]),
         (("排班", "排程", "计划"), ["计划版本", "执行周期", "资源范围", "冲突状态"]),
         (("核销",), ["核销码", "凭证类型", "有效期限", "核销状态"]),
@@ -638,6 +645,48 @@ def _semantic_operation_definitions(subject: str, module_key: str) -> list[dict[
 
 
 def _specialized_operation_definitions(subject: str, fields: list[str]) -> list[dict[str, object]]:
+    if "上下班打卡" in subject:
+        return [
+            _operation_definition("find_shift", "查询今日班次", "lookup", fields[:3], "尚未加载今日班次", "显示今日上下班时间", "班次名称、上班时间和下班时间"),
+            _operation_definition("clock_in", "上班打卡", "mutation", fields[:5], "上班打卡尚未完成", "上班打卡已完成", "员工编号、打卡时间和打卡位置", confirmation=True),
+            _operation_definition("clock_out", "下班打卡", "mutation", fields[:5], "下班打卡尚未完成", "下班打卡已完成", "员工编号、打卡时间和打卡位置", confirmation=True),
+            _operation_definition("view_attendance", "查看当日考勤", "result", fields[:4], "当日已产生打卡信息", "显示当日考勤结果", "上下班时间、打卡位置和考勤状态"),
+        ]
+    if "补卡申请" in subject:
+        return [
+            _operation_definition("find_missed_punch", "查询缺卡记录", "lookup", fields[:4], "尚未选择考勤日期", "显示可补卡的缺卡记录", "缺卡日期、缺卡时段和当前状态"),
+            _operation_definition("submit_missed_punch", "提交补卡申请", "mutation", fields[:5], "补卡信息尚未提交", "补卡申请已提交", "申请编号、缺卡时段和提交时间", confirmation=True),
+            _operation_definition("withdraw_missed_punch", "撤回补卡申请", "workflow", fields[:3], "补卡申请等待处理", "补卡申请已撤回", "申请编号、撤回时间和当前状态", confirmation=True),
+            _operation_definition("view_missed_punch", "查看补卡结果", "result", fields[:3], "补卡申请已产生处理结果", "显示补卡处理结果", "处理状态、完成时间和考勤结果"),
+        ]
+    if "请假申请" in subject:
+        return [
+            _operation_definition("find_leave", "查询请假记录", "lookup", fields[:4], "尚未选择查询范围", "显示匹配的请假记录", "请假类型、起止时间和申请状态"),
+            _operation_definition("submit_leave", "提交请假申请", "mutation", fields[:5], "请假信息尚未提交", "请假申请已提交", "申请编号、请假时段和提交时间", confirmation=True),
+            _operation_definition("withdraw_leave", "撤回请假申请", "workflow", fields[:3], "请假申请等待处理", "请假申请已撤回", "申请编号、撤回时间和当前状态", confirmation=True),
+            _operation_definition("view_leave", "查看请假结果", "result", fields[:3], "请假申请已产生处理结果", "显示请假处理结果", "处理状态、生效时间和考勤影响"),
+        ]
+    if "异常考勤" in subject:
+        return [
+            _operation_definition("find_exception", "查询异常考勤", "lookup", fields[:4], "尚未选择考勤范围", "显示迟到、早退或缺卡记录", "员工编号、异常类型和发生时间"),
+            _operation_definition("mark_reason", "填写异常原因", "mutation", fields[:4], "异常原因尚未填写", "异常原因已保存", "异常类型、原因说明和更新时间"),
+            _operation_definition("submit_explanation", "提交考勤说明", "workflow", fields[:4], "考勤说明尚未提交", "考勤说明已提交", "说明内容、提交人员和提交时间", confirmation=True),
+            _operation_definition("view_exception_result", "查看处理结果", "result", fields[:3], "异常考勤已完成处理", "显示最新考勤状态", "处理结果、完成时间和考勤状态"),
+        ]
+    if "出勤统计" in subject:
+        return [
+            _operation_definition("find_statistics", "查询出勤统计", "lookup", fields[:3], "尚未选择统计周期", "显示当前周期出勤数据", "统计周期、员工范围和出勤人数"),
+            _operation_definition("analyze_attendance", "分析出勤情况", "analysis", fields[:3], "当前周期已产生考勤数据", "形成出勤率与异常分布", "正常打卡率、迟到人数和请假人数"),
+            _operation_definition("compare_attendance", "对比出勤趋势", "analysis", fields[:3], "已选择两个以上统计周期", "显示周期变化趋势", "出勤率变化、异常变化和对比周期"),
+            _operation_definition("export_attendance", "导出出勤报表", "result", fields[:3], "统计结果已生成", "出勤报表已生成", "文件名称、统计周期和生成时间"),
+        ]
+    if "班次排班" in subject:
+        return [
+            _operation_definition("find_shift_schedule", "查询班次安排", "lookup", fields[:3], "尚未选择排班日期", "显示员工与班次安排", "排班日期、班次名称和员工人数"),
+            _operation_definition("create_shift_schedule", "创建员工排班", "mutation", fields[:4], "员工尚未安排班次", "员工排班已保存", "员工编号、班次名称和生效日期"),
+            _operation_definition("adjust_shift_schedule", "调整员工班次", "workflow", fields[:4], "员工已有生效班次", "新的班次安排已保存", "原班次、新班次和生效时间", confirmation=True),
+            _operation_definition("view_shift_schedule", "查看排班日历", "result", fields[:3], "当前周期已存在排班数据", "显示班次日历与人员分布", "日期范围、班次分布和员工人数"),
+        ]
     if "边缘应用" in subject:
         return [
             _operation_definition("find_edge_app", f"查询{subject}版本", "lookup", fields[:3], "尚未选择应用范围", "显示版本与节点部署状态", "应用版本、目标节点和实例数量"),

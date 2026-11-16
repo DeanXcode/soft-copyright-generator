@@ -10,8 +10,10 @@ from typing import Any, Iterable
 
 from .ai_frontend_codegen import generate_ai_frontend_pages, generate_style_reference_assets
 from .blueprint import FeatureModule, ProductBlueprint
+from .domain_profile import build_domain_profile
 from .llm.provider import LLMProvider
 from .models import GenerationTask
+from .navigation_contract import NAVIGATION_CONTRACT_VERSION, build_local_navigation_contract
 from .operation_coverage import module_operation_coverage, operation_caption, operation_page_title
 from .packager import write_json
 from .screenshot_checkpoint import (
@@ -27,6 +29,7 @@ from .screenshot_capture import (
     _normalize_action_crop_image,
     _normalize_visible_action_label,
     _normalize_visible_content_summary,
+    _navigate_for_screenshot,
     _render_url,
     _wait_for_page_runtime_api,
 )
@@ -210,7 +213,11 @@ def generate_ui_screenshots(
                         continue
                     _emit(emit, 55 + min(5, int(index / max(len(screenshots), 1) * 5)), f"渲染界面截图 {index}/{len(screenshots)}")
                     image_path = ui_dir / f"{item.key}.png"
-                    page.goto(_render_url(item, render_base_url), wait_until="networkidle")
+                    _navigate_for_screenshot(
+                        page,
+                        _render_url(item, render_base_url),
+                        project_server=render_mode == "project-server",
+                    )
                     if render_mode == "project-server":
                         _wait_for_page_runtime_api(page, item)
                     _auto_repair_page_text_layout(page, ui_blueprint.renderer)
@@ -704,6 +711,9 @@ def _write_prototype_manifest(
     experience_spec = design_brief.get("product_experience_spec") if isinstance(design_brief, dict) else {}
     if not isinstance(experience_spec, dict):
         experience_spec = {}
+    visual_identity_spec = design_brief.get("visual_identity_spec") if isinstance(design_brief, dict) else {}
+    if not isinstance(visual_identity_spec, dict):
+        visual_identity_spec = {}
     manifest = {
         "software_name": task.software_name,
         "version": task.version,
@@ -714,6 +724,18 @@ def _write_prototype_manifest(
         "experience_terminal": experience_spec.get("terminal", ""),
         "experience_shell": experience_spec.get("shell", ""),
         "product_experience_spec": experience_spec,
+        "visual_identity_spec": visual_identity_spec,
+        "identity_signature": visual_identity_spec.get("identity_signature", ""),
+        "visual_seed": visual_identity_spec.get("visual_seed", ""),
+        "palette_key": visual_identity_spec.get("palette_key", ""),
+        "layout_variant": visual_identity_spec.get("layout_variant", design_brief.get("layout_variant", "")),
+        "nav_model": visual_identity_spec.get("nav_model", design_brief.get("nav_model", "")),
+        "workspace_shape": visual_identity_spec.get("workspace_shape", design_brief.get("workspace_shape", "")),
+        "login_pattern": visual_identity_spec.get("login_pattern", design_brief.get("login_pattern", "")),
+        "dashboard_pattern": design_brief.get("dashboard_pattern", ""),
+        "module_pattern": design_brief.get("module_pattern", ""),
+        "visual_mood": design_brief.get("visual_mood", ui_blueprint.visual_style),
+        "creative_seed": str(design_brief.get("creative_seed") or task.seed),
         "source": ui_blueprint.source,
         "visual_style": ui_blueprint.visual_style,
         "entry": "index.html",
@@ -846,6 +868,50 @@ def _write_prototype_index(
 </html>
 """
     (prototype_dir / "index.html").write_text(index_html, encoding="utf-8")
+    _inject_prototype_page_navigation(pages, prototype_dir=prototype_dir)
+
+
+def _inject_prototype_page_navigation(pages: list[dict[str, Any]], *, prototype_dir: Path) -> int:
+    page_files = {
+        str(page.get("key") or ""): str(page.get("file") or "")
+        for page in pages
+        if str(page.get("key") or "") and str(page.get("file") or "")
+    }
+    if not page_files:
+        return 0
+    script = f'''<script data-prototype-navigation="v1">
+(() => {{
+  const pageFiles = {json.dumps(page_files, ensure_ascii=False)};
+  document.addEventListener("click", (event) => {{
+    const trigger = event.target.closest("[data-navigation-page-key], [data-navigation-back-target]");
+    if (!trigger) return;
+    const pageKey = trigger.getAttribute("data-navigation-page-key") || trigger.getAttribute("data-navigation-back-target") || "";
+    const target = pageFiles[pageKey];
+    if (!target) return;
+    event.preventDefault();
+    const destination = new URL(target, window.location.href);
+    if (destination.href !== window.location.href) window.location.assign(destination.href);
+  }});
+}})();
+</script>'''
+    injected = 0
+    marker_pattern = re.compile(
+        r'<script data-prototype-navigation="v1">.*?</script>',
+        flags=re.DOTALL,
+    )
+    for page in pages:
+        html_path = prototype_dir / str(page.get("file") or "")
+        if not html_path.exists() or not html_path.is_file():
+            continue
+        html = html_path.read_text(encoding="utf-8")
+        html = marker_pattern.sub("", html)
+        if re.search(r"</body\s*>", html, flags=re.I):
+            html = re.sub(r"</body\s*>", script + "</body>", html, count=1, flags=re.I)
+        else:
+            html += script
+        html_path.write_text(html, encoding="utf-8")
+        injected += 1
+    return injected
 
 
 def _write_prototype_readme(
@@ -906,11 +972,14 @@ def _publish_project_prototype(
         if isinstance(source_info, dict):
             source_info["ui_framework"] = "react"
             source_info["ui_frontend_source_dir"] = published_frontend_source
-    if served_dir.resolve() != prototype_dir.resolve():
-        if served_dir.exists():
-            shutil.rmtree(served_dir)
-        shutil.copytree(prototype_dir, served_dir)
-        _write_static_redirect(served_dir.parent)
+    runtime_served_dirs = _project_runtime_served_dirs(source_dir, served_dir)
+    for runtime_served_dir in runtime_served_dirs:
+        if runtime_served_dir.resolve() == prototype_dir.resolve():
+            continue
+        if runtime_served_dir.exists():
+            shutil.rmtree(runtime_served_dir)
+        shutil.copytree(prototype_dir, runtime_served_dir)
+        _write_static_redirect(runtime_served_dir.parent)
     entry = {
         "entry_file": str(prototype_dir / "index.html"),
         "source_prototype_dir": str(prototype_dir),
@@ -926,13 +995,15 @@ def _publish_project_prototype(
         "frontend_source_dir": published_frontend_source,
     }
     write_json(prototype_dir / "project-entry.json", entry)
-    if served_dir.resolve() != prototype_dir.resolve():
-        write_json(served_dir / "project-entry.json", entry)
+    for runtime_served_dir in runtime_served_dirs:
+        if runtime_served_dir.resolve() != prototype_dir.resolve():
+            write_json(runtime_served_dir / "project-entry.json", entry)
     entry_doc = _write_project_entry_doc(task, source_dir, entry)
     entry["entry_doc"] = str(entry_doc)
     write_json(prototype_dir / "project-entry.json", entry)
-    if served_dir.resolve() != prototype_dir.resolve():
-        write_json(served_dir / "project-entry.json", entry)
+    for runtime_served_dir in runtime_served_dirs:
+        if runtime_served_dir.resolve() != prototype_dir.resolve():
+            write_json(runtime_served_dir / "project-entry.json", entry)
     source_info["ui_project_entry"] = entry
 
 
@@ -942,13 +1013,6 @@ def _project_prototype_target(source_dir: Path) -> dict[str, str]:
             "served_dir": str(source_dir / "gateway-service" / "ui-prototype"),
             "entry_url": "http://127.0.0.1:8080/ui-prototype/index.html",
             "run_command": "node gateway-service/src/server.js",
-            "route_mode": "node-static",
-        }
-    if (source_dir / "web-console" / "src" / "server.js").exists():
-        return {
-            "served_dir": str(source_dir / "web-console" / "ui-prototype"),
-            "entry_url": "http://127.0.0.1:8080/ui-prototype/index.html",
-            "run_command": "node web-console/src/server.js",
             "route_mode": "node-static",
         }
     if (source_dir / "pom.xml").exists():
@@ -965,13 +1029,6 @@ def _project_prototype_target(source_dir: Path) -> dict[str, str]:
             "run_command": "dotnet run --urls http://127.0.0.1:5000",
             "route_mode": "aspnet-static",
         }
-    if (source_dir / "package.json").exists():
-        return {
-            "served_dir": str(source_dir / "ui-prototype"),
-            "entry_url": "http://127.0.0.1:8080/ui-prototype/index.html",
-            "run_command": "node src/server.js",
-            "route_mode": "node-static",
-        }
     if (source_dir / "app" / "main.py").exists():
         return {
             "served_dir": str(source_dir / "ui-prototype"),
@@ -979,12 +1036,43 @@ def _project_prototype_target(source_dir: Path) -> dict[str, str]:
             "run_command": "uvicorn app.main:app --host 127.0.0.1 --port 8080",
             "route_mode": "fastapi-static",
         }
+    if (source_dir / "web-console" / "src" / "server.js").exists():
+        return {
+            "served_dir": str(source_dir / "web-console" / "ui-prototype"),
+            "entry_url": "http://127.0.0.1:8080/ui-prototype/index.html",
+            "run_command": "node web-console/src/server.js",
+            "route_mode": "node-static",
+        }
+    if (source_dir / "package.json").exists():
+        return {
+            "served_dir": str(source_dir / "ui-prototype"),
+            "entry_url": "http://127.0.0.1:8080/ui-prototype/index.html",
+            "run_command": "node src/server.js",
+            "route_mode": "node-static",
+        }
     return {
         "served_dir": str(source_dir / "ui-prototype"),
         "entry_url": "ui-prototype/index.html",
         "run_command": "open ui-prototype/index.html",
         "route_mode": "file",
     }
+
+
+def _project_runtime_served_dirs(source_dir: Path, primary: Path) -> list[Path]:
+    candidates = [primary]
+    for folder in ("web-console", "gateway-service"):
+        runtime_dir = source_dir / folder
+        if (runtime_dir / "src" / "server.js").exists():
+            candidates.append(runtime_dir / "ui-prototype")
+    result: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate.resolve()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(candidate)
+    return result
 
 
 def _write_static_redirect(static_root: Path) -> None:
@@ -1095,13 +1183,22 @@ def _build_pages(task: GenerationTask, blueprint: ProductBlueprint, ui_dir: Path
             start=2,
         ):
             action = operation.action
+            operation_page_key = _module_operation_page_key(module.key, action, operation_index)
             pages.append(
                 _write_page(
                     ui_dir,
-                    _module_operation_page_key(module.key, action, operation_index),
+                    operation_page_key,
                     operation_page_title(module.title, action),
                     operation_caption(module.title, operation),
-                    _module_operation_body(task, blueprint, module, action, design_brief),
+                    _module_operation_body(
+                        task,
+                        blueprint,
+                        module,
+                        action,
+                        design_brief,
+                        page_key=operation_page_key,
+                        interaction_action_key=operation.action_key,
+                    ),
                     renderer="admin",
                     page_kind="operation",
                     module_key=module.key,
@@ -1263,8 +1360,8 @@ def _build_page_specs(task: GenerationTask, blueprint: ProductBlueprint, ui_dir:
 
 
 def _page_kind_from_screen(screen: UiScreenBlueprint) -> str:
-    view_type = str(screen.view_type or "")
-    key = str(screen.key or "")
+    view_type = str(getattr(screen, "view_type", "") or "")
+    key = str(getattr(screen, "key", "") or "")
     if "login" in view_type or key == "login":
         return "login"
     if "dashboard" in view_type or "home" in view_type or key in {"dashboard", "home"}:
@@ -1273,7 +1370,7 @@ def _page_kind_from_screen(screen: UiScreenBlueprint) -> str:
         return "statistics"
     if "detail" in view_type:
         return "detail"
-    return "module" if screen.module_key else "general"
+    return "module" if str(getattr(screen, "module_key", "") or "") else "general"
 
 
 def _screen_caption(screen: UiScreenBlueprint | None, fallback: str) -> str:
@@ -1390,7 +1487,16 @@ def _operation_action_label(operation: str) -> str:
     return str(operation).strip() or "处理"
 
 
-def _module_operation_body(task: GenerationTask, blueprint: ProductBlueprint, module: FeatureModule, action: str, design_brief: dict[str, Any] | None = None) -> str:
+def _module_operation_body(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    module: FeatureModule,
+    action: str,
+    design_brief: dict[str, Any] | None = None,
+    *,
+    page_key: str = "",
+    interaction_action_key: str = "",
+) -> str:
     profile = _profile_for_blueprint(task, blueprint, design_brief)
     profile = dict(profile)
     profile["table_headers"] = _module_table_headers(profile, module)
@@ -1398,7 +1504,19 @@ def _module_operation_body(task: GenerationTask, blueprint: ProductBlueprint, mo
     title = operation_page_title(module.title, action)
     standalone = _operation_standalone_content(profile, blueprint, module, action, fields)
     if standalone:
-        return _layout(task, blueprint, title, standalone, module.title, design_brief)
+        return _layout(
+            task,
+            blueprint,
+            title,
+            standalone,
+            module.title,
+            design_brief,
+            page_key=page_key or f"{module.key}__operation",
+            page_kind="operation",
+            module=module,
+            interaction_action=action,
+            interaction_action_key=interaction_action_key,
+        )
     dialog = _operation_dialog(module, action, title, fields)
     background = _module_content(profile, blueprint, module)
     content = f"""
@@ -1409,7 +1527,19 @@ def _module_operation_body(task: GenerationTask, blueprint: ProductBlueprint, mo
   </div>
 </div>
 """
-    return _layout(task, blueprint, title, content, module.title, design_brief)
+    return _layout(
+        task,
+        blueprint,
+        title,
+        content,
+        module.title,
+        design_brief,
+        page_key=page_key or f"{module.key}__operation",
+        page_kind="operation",
+        module=module,
+        interaction_action=action,
+        interaction_action_key=interaction_action_key,
+    )
 
 
 def _operation_standalone_content(
@@ -1440,7 +1570,7 @@ def _operation_standalone_content(
     if action == "导出":
         return f"""
 <div class="op-export-page">
-  <section class="panel export-config"><h2>{escape(module.title)}导出配置</h2>{_runtime_record_panel(module)}<div class="format-tabs"><span class="active">Excel</span><span>PDF</span><span>CSV</span></div><div class="option-list"><div><span class="check-mark">✓</span>导出当前筛选结果</div><div><span class="check-mark">✓</span>包含处理状态和更新时间</div><div><span class="check-mark muted-check">✓</span>同步生成归档记录</div></div>{_operation_result_bar(module, "导出")}</section>
+  <section class="panel export-config"><h2>{escape(module.title)}导出配置</h2>{_runtime_record_panel(module)}<div class="format-tabs"><span class="active">Excel</span><span>PDF</span><span>CSV</span></div><div class="option-list"><div><span class="check-mark">✓</span>导出当前筛选结果</div><div><span class="check-mark">✓</span>包含处理状态和更新时间</div><div><span class="check-mark muted-check">✓</span>同步生成导出结果</div></div>{_operation_result_bar(module, "导出")}</section>
   <section class="panel export-preview-wide"><h2>导出字段预览</h2>{_table(profile["table_headers"], rows[:5])}</section>
 </div>
 """
@@ -1511,12 +1641,13 @@ def _form_items(module: FeatureModule, fields: list[str]) -> str:
 
 def _query_dialog(module: FeatureModule, title: str, fields: list[str]) -> str:
     query_fields = fields[:4] or ["业务编号", "业务名称", "业务状态", "责任角色"]
+    states = _module_operation_states(module)
     filters = "".join(f"<div class='query-filter'><span>{escape(field)}</span><div>请输入{escape(field)}</div></div>" for field in query_fields)
     rows = "".join(
         "<tr>"
         f"<td data-field='编号'>{escape(_operation_sample_value(module, query_fields[0], index))}</td>"
         f"<td data-field='名称'>{escape(_operation_sample_value(module, query_fields[1] if len(query_fields) > 1 else '名称', index))}</td>"
-        f"<td data-field='状态'><span class='status {'warn' if index % 3 == 1 else ''}'>{'待复核' if index % 3 == 1 else '已处理'}</span></td>"
+        f"<td data-field='状态'><span class='status {'warn' if index % 3 == 1 else ''}'>{escape(states[index % len(states)])}</span></td>"
         f"<td data-field='更新时间'>2026-06-0{index + 3}</td>"
         "</tr>"
         for index in range(4)
@@ -1573,7 +1704,7 @@ def _export_dialog(module: FeatureModule, title: str) -> str:
             <div class="option-list">
               <div><span class="check-mark">✓</span>当前查询结果</div>
               <div><span class="check-mark">✓</span>{escape(module.title)}明细字段</div>
-              <div><span class="check-mark muted-check"> </span>操作日志与审批记录</div>
+              <div><span class="check-mark muted-check"> </span>更新时间与结果信息</div>
             </div>
           </div>
           <div>
@@ -1591,6 +1722,8 @@ def _export_dialog(module: FeatureModule, title: str) -> str:
 
 def _statistics_dialog(module: FeatureModule, title: str) -> str:
     bars = "".join(f"<span style='height:{54 + index * 18}px'></span>" for index in range(6))
+    states = _module_operation_states(module)
+    legend = "".join(f"<span>{escape(state)}</span>" for state in states[:4])
     return f"""
     <section class="dialog statistics-dialog">
       {_dialog_head(title)}
@@ -1602,7 +1735,7 @@ def _statistics_dialog(module: FeatureModule, title: str) -> str:
           <div><span>异常记录</span><strong>72</strong></div>
         </div>
         <div class="dialog-chart">{bars}</div>
-        <div class="legend-row"><span>待处理</span><span>处理中</span><span>已完成</span><span>已归档</span></div>
+        <div class="legend-row">{legend}</div>
         {_operation_result_bar(module, "统计")}
       </div>
       <div class="dialog-footer"><span class="button ghost">导出图表</span><span class="button">查看明细</span></div>
@@ -1622,15 +1755,16 @@ def _warning_dialog(module: FeatureModule, title: str, fields: list[str]) -> str
         {_runtime_record_panel(module)}
         <div class="warning-banner"><strong>{escape(module.title)}预警触发</strong><span>请确认阈值、责任人和处理时限。</span></div>
         <div class="threshold-grid">{rows}</div>
-        <div class="dialog-note">系统根据阈值规则、状态变化和处理时长生成预警，确认后写入待办任务。</div>
+        <div class="dialog-note">系统根据阈值规则、状态变化和处理时长生成预警，确认后生成处理事项。</div>
         {_operation_result_bar(module, "预警")}
       </div>
-      <div class="dialog-footer"><span class="button ghost">暂不处理</span><span class="button">生成待办</span></div>
+      <div class="dialog-footer"><span class="button ghost">暂不处理</span><span class="button">生成事项</span></div>
     </section>
 """
 
 
 def _review_dialog(module: FeatureModule, action: str, title: str, fields: list[str]) -> str:
+    role = _module_operation_role(module, action)
     return f"""
     <section class="dialog review-dialog">
       {_dialog_head(title)}
@@ -1638,9 +1772,9 @@ def _review_dialog(module: FeatureModule, action: str, title: str, fields: list[
         {_runtime_record_panel(module)}
         <div class="detail-grid">{_field_rows(module, fields[:4])}</div>
         <div class="approval-panel">
-          <div class="approval-step done"><b>提交</b><span>系统管理员 10:12</span></div>
+          <div class="approval-step done"><b>提交</b><span>{escape(role)} 10:12</span></div>
           <div class="approval-step active"><b>{escape(action)}</b><span>等待当前用户处理</span></div>
-          <div class="approval-step"><b>归档</b><span>处理完成后自动进入</span></div>
+          <div class="approval-step"><b>完成</b><span>确认后更新状态与结果</span></div>
         </div>
         <div class="opinion-box">请输入{escape(action)}意见或处理说明</div>
         {_operation_result_bar(module, action)}
@@ -1651,7 +1785,7 @@ def _review_dialog(module: FeatureModule, action: str, title: str, fields: list[
 
 
 def _confirm_dialog(module: FeatureModule, action: str) -> str:
-    note = f"窗口要求用户确认{action}原因，系统提交前校验权限范围并记录操作日志。"
+    note = f"窗口要求用户确认{action}原因，系统提交前校验权限范围并保存处理结果。"
     return f"""
     <section class="dialog confirm-dialog">
       {_dialog_head("信息")}
@@ -1671,6 +1805,9 @@ def _confirm_dialog(module: FeatureModule, action: str) -> str:
 
 def _detail_dialog(module: FeatureModule, action: str, title: str, fields: list[str]) -> str:
     note = f"窗口用于查看{module.title}的基础信息、处理轨迹、状态变化和关联记录，便于用户核对业务结果。"
+    role = _module_operation_role(module, action)
+    pre_state, post_state = _module_operation_transition(module, action)
+    evidence = _module_result_evidence(module, action)
     return f"""
     <section class="dialog detail-dialog">
       {_dialog_head(title)}
@@ -1678,8 +1815,8 @@ def _detail_dialog(module: FeatureModule, action: str, title: str, fields: list[
         {_runtime_record_panel(module)}
         <div class="detail-grid">{_field_rows(module, fields)}</div>
         <div class="track-list">
-          <div><b>{escape(action)}记录</b><span>提交人：系统管理员　时间：2026-06-08 10:30</span></div>
-          <div><b>状态变化</b><span>待处理 → 处理中，已写入操作日志</span></div>
+          <div><b>{escape(action)}记录</b><span>提交人：{escape(role)}　时间：2026-06-08 10:30</span></div>
+          <div><b>状态变化</b><span>{escape(pre_state)} → {escape(post_state)}，{escape(evidence)}已保存</span></div>
           <div><b>关联说明</b><span>{escape(note)}</span></div>
         </div>
         {_operation_result_bar(module, action)}
@@ -1708,23 +1845,26 @@ def _form_dialog(module: FeatureModule, action: str, title: str, fields: list[st
 
 def _operation_result_bar(module: FeatureModule, action: str) -> str:
     code = _operation_sample_value(module, "编号", 0)
-    status = _operation_sample_value(module, "状态", 0)
+    subject = _module_business_subject(module)
+    status = _module_operation_result_status(module, action)
+    evidence = _module_result_evidence(module, action)
     return (
         f"<div class='operation-result' data-action='{escape(action)}'>"
-        f"{escape(action)}结果：记录 {escape(code)} 已进入“{escape(status)}”状态，系统同步写入操作日志并刷新统计口径。"
+        f"{escape(action)}结果：{escape(subject)} {escape(code)} 已进入“{escape(status)}”状态，{escape(evidence)}已保存。"
         "</div>"
     )
 
 
 def _runtime_record_panel(module: FeatureModule) -> str:
+    subject = _module_business_subject(module)
     code = _operation_sample_value(module, "编号", 0)
     name = _operation_sample_value(module, "名称", 0)
     scope = _operation_sample_value(module, "服务范围", 0)
     status = _operation_sample_value(module, "状态", 0)
     return f"""
         <div class="runtime-record-panel">
-          <div><span>当前记录编号</span><b data-runtime-field="code">{escape(code)}</b></div>
-          <div><span>当前记录名称</span><b data-runtime-field="name">{escape(name)}</b></div>
+          <div><span>{escape(subject)}编号</span><b data-runtime-field="code">{escape(code)}</b></div>
+          <div><span>{escape(subject)}名称</span><b data-runtime-field="name">{escape(name)}</b></div>
           <div><span>服务/覆盖范围</span><b data-runtime-field="scope">{escape(scope)}</b></div>
           <div><span>处理状态</span><b data-runtime-field="status">{escape(status)}</b></div>
         </div>
@@ -1734,10 +1874,37 @@ def _runtime_record_panel(module: FeatureModule) -> str:
 def _operation_sample_value(module: FeatureModule, field: str, index: int) -> str:
     label = str(field or "")
     title = str(getattr(module, "title", "") or "")
+    attendance = _ui_attendance_module(module)
     code = f"{_business_code_prefix(module)}-{1001 + index}"
     names = _business_record_names_for_ui(module)
     name = names[index % len(names)]
     transport = _ui_transport_module(module)
+    if attendance:
+        attendance_values = (
+            (r"员工编号", f"EMP-{1001 + index}"),
+            (r"班次名称|原班次|新班次", ["早班 09:00-18:00", "晚班 13:00-22:00", "弹性班次", "周末值班"][index % 4]),
+            (r"排班日期|考勤日期", f"2026-06-{24 + (index % 4):02d}"),
+            (r"上班时间", "09:00"),
+            (r"下班时间", "18:00"),
+            (r"打卡时间", f"2026-06-{24 + (index % 4):02d} 09:{2 + index:02d}"),
+            (r"打卡位置", ["总部办公区东门", "研发中心前台", "园区南门考勤点", "客户现场考勤点"][index % 4]),
+            (r"缺卡时段", ["上班打卡", "下班打卡"][index % 2]),
+            (r"补卡原因", "外勤返回后补录打卡"),
+            (r"证明附件", "外勤任务单.pdf"),
+            (r"请假类型", ["年假", "事假", "病假", "调休"][index % 4]),
+            (r"请假事由", "个人事务请假"),
+            (r"统计周期", "2026年6月"),
+            (r"统计口径", "按员工与班次统计"),
+            (r"员工范围|适用员工", ["研发中心全员", "市场一组", "客服中心", "总部全员"][index % 4]),
+            (r"班次范围", "全部生效班次"),
+            (r"对比范围", "本月与上月"),
+            (r"正常打卡率", "96.8%"),
+            (r"迟到人数", "3人"),
+            (r"请假人数", "5人"),
+        )
+        for pattern, value in attendance_values:
+            if re.search(pattern, label):
+                return value
     if re.search(r"编号|编码|单号|代码|ID", label, re.I):
         return code
     if re.search(r"名称|标题|线路|路径|方案|节点", label):
@@ -1751,21 +1918,30 @@ def _operation_sample_value(module: FeatureModule, field: str, index: int) -> st
             return ["浦东东区至临港片区", "虹桥枢纽至南环货运带", "机场枢纽至东部接驳区", "港区集疏运服务圈"][index % 4]
         return f"{title}服务区域{index + 1}"
     if re.search(r"状态|进度", label):
-        return ["已启用", "待复核", "处理中", "已完成"][index % 4]
+        states = _module_operation_states(module)
+        return states[index % len(states)]
     if re.search(r"单位|部门|责任|角色|人员", label):
-        return "线路管理员" if transport else "业务操作员"
+        return "线路管理员" if transport else _module_operation_role(module)
     if re.search(r"时间|日期|更新|生效|闭环", label):
         return f"2026-06-{24 + (index % 4):02d} 15:{20 + index % 4:02d}"
     if re.search(r"等级|适配|优先级", label):
-        return ["一级适配", "二级适配", "重点复核", "冲突校验"][index % 4]
+        return ["一级适配", "二级适配", "重点关注", "冲突校验"][index % 4]
     if re.search(r"结果|结论|说明|备注|意见", label):
-        return f"{title}已完成{['建档', '复核', '匹配', '归档'][index % 4]}"
-    values = [code, name, "已启用", "线路管理员" if transport else "业务操作员", "2026-06-24 15:20", f"{title}业务数据已完成校验"]
+        actions = _module_semantic_actions(module, limit=4) or ["更新", "确认", "处理", "完成"]
+        return f"{title}已完成{actions[index % len(actions)]}"
+    states = _module_operation_states(module)
+    values = [code, name, states[index % len(states)], "线路管理员" if transport else _module_operation_role(module), "2026-06-24 15:20", f"{title}数据已完成校验"]
     return values[index % len(values)]
 
 
 def _business_record_names_for_ui(module: FeatureModule) -> list[str]:
     title = str(getattr(module, "title", "") or "业务记录")
+    if _ui_attendance_module(module):
+        if "统计" in title:
+            return ["本月出勤汇总", "部门出勤对比", "异常考勤趋势", "班次出勤分析"]
+        if "排班" in title:
+            return ["研发中心六月排班", "市场一组周排班", "客服中心晚班安排", "总部周末值班"]
+        return [f"{title}{suffix}" for suffix in ["当日记录", "申请明细", "处理结果", "历史记录"]]
     if "干线" in title:
         return ["沪杭干线北向联络线", "城际货运南环干线", "机场枢纽快速干线", "港区集疏运主干线"]
     if "支线" in title:
@@ -1782,7 +1958,7 @@ def _business_record_names_for_ui(module: FeatureModule) -> list[str]:
         return ["临港干支线适配方案", "机场枢纽接驳发布单", "港区集疏运生效方案", "城际线路换乘方案"]
     if "统计" in title or "报表" in title:
         return ["日运行适配汇总", "区域衔接效率报表", "规则命中趋势分析", "问题闭环统计清单"]
-    return [f"{title}{suffix}" for suffix in ["待办", "明细", "复核单", "归档单"]]
+    return [f"{title}{suffix}" for suffix in ["事项", "明细", "任务", "结果"]]
 
 
 def _ui_transport_module(module: FeatureModule) -> bool:
@@ -1793,7 +1969,19 @@ def _ui_transport_module(module: FeatureModule) -> bool:
             " ".join(str(item) for item in (getattr(module, "data_fields", []) or [])),
         ]
     )
-    return bool(re.search(r"交通|运输|线路|干线|支线|接驳|换乘|站点|车站|枢纽|班次|运力", text))
+    return build_domain_profile(context_text=text).requires_route_topology
+
+
+def _ui_attendance_module(module: FeatureModule) -> bool:
+    text = " ".join(
+        [
+            str(getattr(module, "key", "") or ""),
+            str(getattr(module, "title", "") or ""),
+            str(getattr(module, "description", "") or ""),
+            " ".join(str(item) for item in (getattr(module, "data_fields", []) or [])),
+        ]
+    )
+    return bool(re.search(r"clock_in_out|missed_punch|leave_request|attendance|shift_schedule|考勤|打卡|补卡|请假|班次排班|出勤统计", text, re.I))
 
 
 def _business_code_prefix(module: FeatureModule) -> str:
@@ -1854,13 +2042,24 @@ def _build_mobile_app_pages(task: GenerationTask, blueprint: ProductBlueprint, u
         ):
             action = operation.action
             caption = operation_caption(module.title, operation)
+            operation_page_key = _module_operation_page_key(module.key, action, operation_index)
             pages.append(
                 _write_page(
                     ui_dir,
-                    _module_operation_page_key(module.key, action, operation_index),
+                    operation_page_key,
                     operation_page_title(module.title, action, mobile=True),
                     caption,
-                    _mobile_operation_body(task, blueprint, module, action, caption, operation.mode, design_brief),
+                    _mobile_operation_body(
+                        task,
+                        blueprint,
+                        module,
+                        action,
+                        caption,
+                        operation.mode,
+                        design_brief,
+                        page_key=operation_page_key,
+                        interaction_action_key=operation.action_key,
+                    ),
                     renderer="mobile_app",
                     page_kind="operation",
                     module_key=module.key,
@@ -1889,6 +2088,9 @@ def _mobile_operation_body(
     caption: str,
     mode: str,
     design_brief: dict[str, Any] | None = None,
+    *,
+    page_key: str = "",
+    interaction_action_key: str = "",
 ) -> str:
     fields = list(module.data_fields[:4] or ["业务编号", "处理状态", "更新时间", "责任人"])
     if mode == "query":
@@ -1912,7 +2114,19 @@ def _mobile_operation_body(
         <section class="mobile-panel compact"><b>处理结果</b><small>{escape(action)}已完成，当前状态已同步更新</small></section>
         <div class="mobile-primary">{escape(action)}</div>
         """
-    return _mobile_shell(task, blueprint, f"{module.title}-{action}", content, active="发现", design_brief=design_brief)
+    return _mobile_shell(
+        task,
+        blueprint,
+        f"{module.title}-{action}",
+        content,
+        active="发现",
+        design_brief=design_brief,
+        page_key=page_key or f"{module.key}__operation",
+        page_kind="operation",
+        module=module,
+        interaction_action=action,
+        interaction_action_key=interaction_action_key,
+    )
 
 
 def _mobile_body_from_screen(
@@ -1942,21 +2156,89 @@ def _mobile_shell(
     content: str,
     active: str = "首页",
     design_brief: dict[str, Any] | None = None,
+    show_header: bool = True,
+    show_nav: bool = True,
+    page_key: str = "dashboard",
+    page_kind: str = "dashboard",
+    module: FeatureModule | None = None,
+    interaction_action: str = "",
+    interaction_action_key: str = "",
 ) -> str:
-    nav = ["首页", "发现", "收藏", "我的"]
-    nav_html = "".join(f"<span class='{'active' if item == active else ''}'>{escape(item)}</span>" for item in nav)
+    contract = build_local_navigation_contract(
+        task,
+        blueprint,
+        page_key=page_key,
+        title=title,
+        page_kind=page_kind,
+        module=module,
+        interaction_action=interaction_action,
+        interaction_action_key=interaction_action_key,
+        renderer="mobile_app",
+        nav_model="phone_tabs",
+    )
+    primary_items = list(contract.get("primary_items") or [])
+    active_primary_key = str(contract.get("active_primary_key") or "")
+    nav_html = "".join(
+        f"<span class='{'active' if str(item.get('key') or '') == active_primary_key else ''}' "
+        f"data-navigation-primary-item='{escape(str(item.get('key') or ''))}' "
+        f"data-navigation-page-key='{escape(str(item.get('page_key') or ''))}'>"
+        f"{escape(str(item.get('label') or '功能'))}</span>"
+        for item in primary_items
+    )
+    breadcrumb_html = "<i>/</i>".join(
+        f"<span data-navigation-breadcrumb-item='{escape(str(item.get('key') or ''))}' "
+        f"data-navigation-page-key='{escape(str(item.get('page_key') or ''))}'>{escape(str(item.get('label') or ''))}</span>"
+        for item in list(contract.get("breadcrumb") or [])
+        if str(item.get("label") or "").strip()
+    )
+    back_target = contract.get("back_target") if isinstance(contract.get("back_target"), dict) else {}
+    back_html = ""
+    if back_target and str(back_target.get("page_key") or ""):
+        back_html = (
+            f"<span class='mobile-navigation-back' data-navigation-back-target='{escape(str(back_target.get('page_key') or ''))}'>"
+            f"← {escape(str(back_target.get('label') or '返回'))}</span>"
+        )
+    secondary_items = list(contract.get("secondary_items") or [])
+    active_secondary_key = str(contract.get("active_secondary_key") or "")
+    secondary_html = "".join(
+        f"<span class='{'active' if str(item.get('key') or '') == active_secondary_key else ''}' "
+        f"data-navigation-secondary-item='{escape(str(item.get('key') or ''))}' "
+        f"data-navigation-page-key='{escape(str(item.get('page_key') or ''))}'>"
+        f"{escape(_clip(str(item.get('label') or '功能'), 8))}</span>"
+        for item in secondary_items
+    )
+    header_html = (
+        f'<div class="mobile-header"><div class="mobile-navigation-context">{back_html}<div class="mobile-breadcrumb">{breadcrumb_html}</div></div><strong>{escape(title)}</strong><small>{escape(task.software_name)}</small></div>'
+        if show_header
+        else ""
+    )
+    secondary_block = (
+        f'<nav class="mobile-secondary mobile-secondary-{escape(str(contract.get("secondary_style") or "segmented"))}">{secondary_html}</nav>'
+        if show_nav and secondary_html
+        else ""
+    )
+    nav_block = f'<nav class="mobile-nav">{nav_html}</nav>' if show_nav else ""
     profile = _profile_for_blueprint(task, blueprint, design_brief)
     classes = _identity_classes_from_brief(design_brief)
     style = _identity_style_vars(profile)
+    navigation_attrs = ""
+    if show_nav and page_kind != "login":
+        navigation_attrs = (
+            f'data-navigation-contract="{escape(str(contract.get("schema_version") or NAVIGATION_CONTRACT_VERSION))}" '
+            f'data-navigation-ready="{"true" if contract.get("ready") else "false"}" '
+            f'data-navigation-level="{escape(str(contract.get("level") or ""))}" '
+            f'data-navigation-signature="{escape(str(contract.get("hierarchy_signature") or ""))}" '
+            f'data-navigation-active-primary="{escape(active_primary_key)}" '
+            f'data-navigation-active-secondary="{escape(active_secondary_key)}" '
+            f'data-navigation-back-target="{escape(str(back_target.get("page_key") or ""))}"'
+        )
     return f"""
-<div class="mobile-screen {escape(classes)}" style="{style}">
+<div class="mobile-screen {escape(classes)}" style="{style}" {navigation_attrs}>
   <div class="mobile-status"><span>9:41</span><span>5G 100%</span></div>
-  <div class="mobile-header">
-    <strong>{escape(title)}</strong>
-    <small>{escape(task.software_name)}</small>
-  </div>
+  {header_html}
+  {secondary_block}
   <main class="mobile-content">{content}</main>
-  <nav class="mobile-nav">{nav_html}</nav>
+  {nav_block}
 </div>
 """
 
@@ -1975,7 +2257,18 @@ def _mobile_login_body(task: GenerationTask, blueprint: ProductBlueprint, screen
       <small>已阅读并同意用户协议与隐私政策</small>
     </section>
 """
-    return _mobile_shell(task, blueprint, screen.title, content, active="我的", design_brief=design_brief)
+    return _mobile_shell(
+        task,
+        blueprint,
+        screen.title,
+        content,
+        active="我的",
+        design_brief=design_brief,
+        show_header=False,
+        show_nav=False,
+        page_key=str(getattr(screen, "key", "") or "login"),
+        page_kind="login",
+    )
 
 
 def _mobile_home_body(
@@ -1997,7 +2290,17 @@ def _mobile_home_body(
     <div class="mobile-chip-row">{chips}</div>
     <section class="mobile-list">{cards}</section>
 """
-    return _mobile_shell(task, blueprint, screen.title, content, active="首页", design_brief=design_brief)
+    return _mobile_shell(
+        task,
+        blueprint,
+        screen.title,
+        content,
+        active="首页",
+        design_brief=design_brief,
+        page_key=str(getattr(screen, "key", "") or "dashboard"),
+        page_kind=_page_kind_from_screen(screen),
+        module=module,
+    )
 
 
 def _mobile_player_body(
@@ -2019,7 +2322,17 @@ def _mobile_player_body(
     </section>
     <section class="mobile-panel compact"><b>相关推荐</b><small>{escape('、'.join(screen.components[:4]))}</small></section>
 """
-    return _mobile_shell(task, blueprint, screen.title, content, active="发现", design_brief=design_brief)
+    return _mobile_shell(
+        task,
+        blueprint,
+        screen.title,
+        content,
+        active="发现",
+        design_brief=design_brief,
+        page_key=str(getattr(screen, "key", "") or (module.key if module else "player")),
+        page_kind=_page_kind_from_screen(screen),
+        module=module,
+    )
 
 
 def _mobile_search_body(
@@ -2035,7 +2348,17 @@ def _mobile_search_body(
     <div class="mobile-chip-row"><span>综合</span><span>最新</span><span>收藏</span><span>离线</span></div>
     <section class="mobile-result-list">{rows}</section>
 """
-    return _mobile_shell(task, blueprint, screen.title, content, active="发现", design_brief=design_brief)
+    return _mobile_shell(
+        task,
+        blueprint,
+        screen.title,
+        content,
+        active="发现",
+        design_brief=design_brief,
+        page_key=str(getattr(screen, "key", "") or (module.key if module else "search")),
+        page_kind=_page_kind_from_screen(screen),
+        module=module,
+    )
 
 
 def _mobile_detail_body(
@@ -2056,7 +2379,17 @@ def _mobile_detail_body(
     <section class="mobile-detail-list">{rows}</section>
     <div class="mobile-primary">继续使用</div>
 """
-    return _mobile_shell(task, blueprint, screen.title, content, active="首页", design_brief=design_brief)
+    return _mobile_shell(
+        task,
+        blueprint,
+        screen.title,
+        content,
+        active="首页",
+        design_brief=design_brief,
+        page_key=str(getattr(screen, "key", "") or (module.key if module else "detail")),
+        page_kind=_page_kind_from_screen(screen),
+        module=module,
+    )
 
 
 def _mobile_profile_body(
@@ -2065,13 +2398,27 @@ def _mobile_profile_body(
     screen: UiScreenBlueprint,
     design_brief: dict[str, Any] | None = None,
 ) -> str:
-    items = screen.components[:5] or ["用户资料", "收藏记录", "下载缓存", "会员权益", "应用设置"]
+    attendance_app = str(getattr(blueprint, "industry_subtype_key", "") or "") == "workforce_attendance"
+    items = list(screen.components[:5])
+    if attendance_app:
+        items = ["员工资料", "考勤设置", "打卡记录", "请假补卡记录", "应用设置"]
+    elif not items or any(re.search(r"会员权益|收藏记录|下载缓存", str(item)) for item in items):
+        items = ["用户资料", "使用记录", "消息设置", "隐私与安全", "应用设置"]
     rows = "".join(f"<div><b>{escape(item)}</b><small>已同步</small></div>" for item in items)
     content = f"""
-    <section class="mobile-user"><div class="mobile-avatar">用户</div><b>体验用户</b><small>{escape(task.software_name)} 个人中心</small></section>
+    <section class="mobile-user"><div class="mobile-avatar">用户</div><b>{escape((blueprint.roles or ['用户'])[0])}</b><small>{escape(task.software_name)} 个人中心</small></section>
     <section class="mobile-result-list">{rows}</section>
 """
-    return _mobile_shell(task, blueprint, screen.title, content, active="我的", design_brief=design_brief)
+    return _mobile_shell(
+        task,
+        blueprint,
+        screen.title,
+        content,
+        active="我的",
+        design_brief=design_brief,
+        page_key=str(getattr(screen, "key", "") or "statistics"),
+        page_kind="statistics",
+    )
 
 
 def _build_game_pages(task: GenerationTask, blueprint: ProductBlueprint, ui_dir: Path, ui_blueprint: UiBlueprint) -> list[UiScreenshot]:
@@ -2207,6 +2554,7 @@ def _page_shell(
     .sidebar-subtitle {{ margin: -12px 0 18px; color: rgba(220,231,247,.76); font-size: 12px; line-height: 1.45; }}
     .nav {{ display: grid; gap: 8px; }}
     .nav span {{ display: block; padding: 10px 12px; border-radius: 6px; background: rgba(255,255,255,.06); font-size: 13px; border: 1px solid rgba(255,255,255,.04); overflow: hidden; text-overflow: ellipsis; }}
+    [data-navigation-page-key]:not([data-navigation-page-key=""]), [data-navigation-back-target]:not([data-navigation-back-target=""]) {{ cursor: pointer; }}
     .nav span.active {{ background: var(--accent, #2f6fed); color: white; box-shadow: 0 10px 22px rgba(0,0,0,.14); }}
     .topbar {{ min-height: 96px; display: grid; grid-template-columns: minmax(260px, 330px) minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 14px 24px; background: var(--sidebar, #1f314f); color: #dce7f7; }}
     .topbar .brand-block {{ min-width: 0; align-self: stretch; display: grid; align-content: center; gap: 5px; }}
@@ -2226,17 +2574,26 @@ def _page_shell(
     .app.nav-rail .sidebar-subtitle {{ display: none; }}
     .app.nav-rail .nav span {{ min-height: 48px; display: grid; place-items: center; padding: 6px; font-size: 12px; text-align: center; }}
     .main {{ min-width: 0; height: 100vh; padding: 18px 22px 16px; overflow: hidden; }}
-    .top {{ min-height: 78px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 12px 16px; background: white; border: 1px solid #d6e0ec; border-radius: 8px; margin-bottom: 10px; box-shadow: 0 8px 24px rgba(15,23,42,.06); }}
+    .top {{ min-height: 78px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(190px, 270px); align-items: center; gap: 16px; padding: 12px 16px; background: white; border: 1px solid #d6e0ec; border-radius: 8px; margin-bottom: 10px; box-shadow: 0 8px 24px rgba(15,23,42,.06); }}
     .top-main {{ min-width: 0; }}
-    .breadcrumb {{ margin-bottom: 5px; color: #7b8798; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .navigation-context {{ min-width: 0; display: flex; align-items: center; gap: 9px; margin-bottom: 5px; }}
+    .navigation-back {{ flex: 0 0 auto; display: inline-flex; align-items: center; height: 24px; padding: 0 8px; border: 1px solid color-mix(in srgb,var(--accent,#2f6fed) 34%,#fff); border-radius: 5px; background: var(--accent-soft,#eef6ff); color: var(--accent,#2f6fed); font-size: 11px; font-weight: 700; }}
+    .breadcrumb {{ min-width: 0; display: flex; align-items: center; gap: 6px; color: #7b8798; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .breadcrumb span {{ min-width: 0; overflow: hidden; text-overflow: ellipsis; }}
+    .breadcrumb span:last-child {{ color: #334155; font-weight: 700; }}
+    .breadcrumb i {{ color: #b3bfce; font-style: normal; }}
     .title {{ font-size: 21px; font-weight: 800; line-height: 1.22; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-    .top-tools {{ display: flex; align-items: center; gap: 8px; color: #52637a; font-size: 12px; white-space: nowrap; }}
+    .top-tools {{ min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; overflow: hidden; color: #52637a; font-size: 12px; white-space: nowrap; }}
     .top-tools span, .env-chip {{ height: 28px; display: inline-flex; align-items: center; padding: 0 9px; border: 1px solid #dce5ef; border-radius: 999px; background: #f8fafc; }}
-    .top-tools b {{ height: 32px; display: inline-flex; align-items: center; padding: 0 11px; border-radius: 999px; background: var(--accent-soft, #eef6ff); color: var(--accent, #2f6fed); }}
+    .top-tools b {{ min-width: 0; max-width: 120px; height: 32px; display: inline-flex; align-items: center; padding: 0 11px; overflow: hidden; border-radius: 999px; background: var(--accent-soft, #eef6ff); color: var(--accent, #2f6fed); text-overflow: ellipsis; }}
     .workspace-ribbon {{ height: 42px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 12px; margin-bottom: 12px; background: #ffffff; border: 1px solid #dce5ef; border-radius: 8px; }}
     .workspace-ribbon .tabs {{ min-width: 0; display: flex; gap: 6px; overflow: hidden; }}
     .workspace-ribbon .tabs span {{ height: 28px; display: inline-flex; align-items: center; padding: 0 10px; border-radius: 6px; color: #52637a; font-size: 12px; font-weight: 700; }}
     .workspace-ribbon .tabs span.active {{ background: var(--accent, #2f6fed); color: #ffffff; }}
+    .workspace-ribbon.navigation-secondary-segmented .tabs {{ gap: 0; padding: 2px; border-radius: 7px; background: #edf2f7; }}
+    .workspace-ribbon.navigation-secondary-segmented .tabs span {{ border-radius: 5px; }}
+    .workspace-ribbon.navigation-secondary-segmented .tabs span.active {{ background: #ffffff; color: var(--accent,#2f6fed); box-shadow: 0 2px 6px rgba(15,23,42,.12); }}
+    .workspace-ribbon.navigation-secondary-rail .tabs {{ padding-left: 8px; border-left: 3px solid var(--accent,#2f6fed); }}
     .workspace-ribbon .ops {{ min-width: 0; display: flex; gap: 8px; color: #64748b; font-size: 12px; overflow: hidden; white-space: nowrap; }}
     .workspace-ribbon .ops span {{ overflow: hidden; text-overflow: ellipsis; }}
     .muted {{ color: #64748b; font-size: 13px; }}
@@ -2642,9 +2999,19 @@ def _page_shell(
     body.mobile {{ width: 720px; min-height: 1280px; overflow: hidden; background: #f4f6fb; }}
     .mobile-screen {{ width: 720px; height: 1280px; overflow: hidden; display: flex; flex-direction: column; background: linear-gradient(180deg, #f9fbff 0%, #edf3f8 100%); color: #172033; }}
     .mobile-status {{ height: 42px; padding: 12px 30px 0; display: flex; justify-content: space-between; color: #29364a; font-size: 15px; font-weight: 800; }}
-    .mobile-header {{ min-height: 112px; padding: 26px 34px 18px; display: grid; gap: 8px; }}
+    .mobile-header {{ min-height: 132px; padding: 18px 34px 16px; display: grid; gap: 7px; }}
+    .mobile-navigation-context {{ min-width: 0; display: flex; align-items: center; gap: 10px; }}
+    .mobile-navigation-back {{ flex: 0 0 auto; height: 28px; display: inline-flex; align-items: center; padding: 0 10px; border: 1px solid color-mix(in srgb,var(--accent,#172033) 30%,#fff); border-radius: 14px; background: var(--accent-soft,#eef6ff); color: var(--accent,#172033); font-size: 14px; font-weight: 800; }}
+    .mobile-breadcrumb {{ min-width: 0; display: flex; align-items: center; gap: 6px; color: #708197; font-size: 14px; overflow: hidden; white-space: nowrap; }}
+    .mobile-breadcrumb span {{ min-width: 0; overflow: hidden; text-overflow: ellipsis; }}
+    .mobile-breadcrumb span:last-child {{ color: #334155; font-weight: 800; }}
+    .mobile-breadcrumb i {{ color: #b4c0cf; font-style: normal; }}
     .mobile-header strong {{ font-size: 34px; line-height: 1.18; color: #172033; }}
     .mobile-header small {{ color: #66758a; font-size: 18px; }}
+    .mobile-secondary {{ min-height: 62px; margin: 0 30px 16px; padding: 6px; display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 5px; border-radius: 18px; background: #e8eef5; overflow: hidden; }}
+    .mobile-secondary span {{ min-width: 0; display: grid; place-items: center; padding: 0 7px; border-radius: 13px; color: #66758a; font-size: 16px; font-weight: 800; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .mobile-secondary span.active {{ background: #ffffff; color: var(--accent,#172033); box-shadow: 0 4px 12px rgba(15,23,42,.12); }}
+    .mobile-secondary-rail {{ border-left: 5px solid var(--accent,#172033); border-radius: 8px; }}
     .mobile-content {{ flex: 1; min-height: 0; overflow: hidden; padding: 0 30px 22px; display: grid; align-content: start; gap: 18px; }}
     .mobile-nav {{ height: 92px; padding: 10px 34px 22px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; background: rgba(255,255,255,.86); border-top: 1px solid #dfe7f1; }}
     .mobile-nav span {{ display: grid; place-items: center; border-radius: 18px; color: #708197; font-size: 18px; font-weight: 800; }}
@@ -2835,6 +3202,9 @@ body[data-ai-frontend="true"][data-renderer="admin"] .comparison-main>.table-pan
 body[data-ai-frontend="true"][data-renderer="admin"] .workspace>.execution-rail{height:100%!important;min-height:0!important;max-height:100%!important;overflow:hidden!important;}
 body[data-ai-frontend="true"][data-renderer="admin"] :is(.map-pin,.map-node,.relation-node,.flow-node) :is(b,strong,span,em){display:block!important;min-width:0!important;max-width:100%!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
 body[data-ai-frontend="true"][data-renderer="admin"][data-page-kind="login"] :is(.left-console,.login-hero,.login-brand) h1{max-width:none!important;font-size:31px!important;line-height:1.15!important;white-space:nowrap!important;word-break:keep-all!important;overflow:hidden!important;text-overflow:ellipsis!important;}
+body[data-ai-frontend="true"] .page-spec-root :is(button,th,td,.detail-item,.workflow-step,.timeline-item,.kanban-column,.mobile-list-item,.operation-result,.map-pin,.graph-node){overflow:visible!important;}
+body[data-ai-frontend="true"] .page-spec-root :is(button,th,td,.detail-item span,.detail-item strong,.workflow-step strong,.workflow-step small,.timeline-item strong,.timeline-item p,.kanban-column strong,.kanban-column article span,.mobile-list-item strong,.mobile-list-item span,.operation-result strong,.operation-result span,.map-pin b,.map-pin small,.graph-node span,.graph-node strong){white-space:normal!important;overflow-wrap:anywhere!important;word-break:break-word!important;text-overflow:clip!important;}
+body[data-ai-frontend="true"] .page-spec-root .page-spec-workspace{overflow:auto!important;}
 """.strip()
     return f"""
 <style id="soft-ai-runtime-guard">
@@ -2932,7 +3302,7 @@ def _inject_runtime_script_into_ai_page(html_path: Path, *, module_keys: Iterabl
     html = _ensure_runtime_layout_guard(html)
     html = _ensure_operation_evidence_block(html)
     script = runtime_api_script()
-    if "soft-runtime-api-script:v11" in html:
+    if "soft-runtime-api-script:v13" in html:
         html_path.write_text(_sanitize_formal_ui_html(html), encoding="utf-8")
         return
     if "__runtimeApiReady" in html:
@@ -2984,7 +3354,7 @@ def _ensure_operation_evidence_block(html: str) -> str:
         opening = result_match.group("open")
         if "data-runtime-operation-evidence" not in opening:
             opening = opening[:-1] + ' data-runtime-operation-evidence="v5">'
-        suffix = '<span class="runtime-audit-evidence"> 处理结果：已完成，系统同步写入操作日志并刷新统计口径。</span>'
+        suffix = '<span class="runtime-audit-evidence"> 处理结果：已完成，状态与更新时间已同步保存。</span>'
         replacement = opening + result_match.group("body").rstrip() + suffix + result_match.group("close")
         return html[: result_match.start()] + replacement + html[result_match.end() :]
 
@@ -2995,7 +3365,7 @@ def _ensure_operation_evidence_block(html: str) -> str:
         'min-height:18px!important;max-height:18px!important;margin-left:auto!important;padding:0 6px!important;'
         'border-radius:4px;background:#ecfdf5;color:#166534;font-size:10px!important;line-height:18px!important;'
         'white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;">'
-        '处理结果：待处理 · 操作日志已写入 · 刷新统计口径</span>'
+        '处理结果：待确认 · 状态与更新时间已保存</span>'
     )
     for class_name in ("stable-card-h", "panel-h"):
         header_pattern = re.compile(
@@ -3022,8 +3392,7 @@ def _needs_operation_evidence_block(html: str) -> bool:
     visible = _operation_evidence_visible_text(html)
     if (
         bool(re.search(r"(?:处理|查询|导入|导出|统计|预警|审核|复核|发布|保存|建档|维护|登记|配置|调度|处置|查看|追踪|失效|归档).{0,12}结果：", visible))
-        and "操作日志" in visible
-        and "刷新统计" in visible
+        and bool(re.search(r"(?:状态|结果|结论|时间).{0,16}(?:保存|记录|同步|更新)|(?:保存|记录|同步|更新).{0,16}(?:状态|结果|结论|时间)", visible))
     ):
         return False
     body_match = re.search(r"<body\b([^>]*)>", html, flags=re.I)
@@ -3072,8 +3441,10 @@ def _set_body_attribute(html: str, name: str, value: str) -> str:
 
 
 def runtime_api_script() -> str:
+    # Route candidates are probed one at a time; failed aliases cannot accumulate
+    # across the many pages captured in one browser session.
     return r"""
-<!-- soft-runtime-api-script:v11 -->
+<!-- soft-runtime-api-script:v13 -->
 <script>
 (function () {
   const body = document.body;
@@ -3090,9 +3461,9 @@ def runtime_api_script() -> str:
   window.__runtimeApiVisibleMatch = false;
   let renderWaitCount = 0;
 
-  function apiPaths() {
-    if (renderer !== "admin") return ["/health"];
-    if (pageKind === "login") return ["/health"];
+  function apiPathGroups() {
+    if (renderer !== "admin") return [["/health"]];
+    if (pageKind === "login") return [["/health"]];
     const modulePaths = (key) => {
       const snake = String(key || "").trim();
       const kebab = snake.replace(/_/g, "-");
@@ -3105,14 +3476,46 @@ def runtime_api_script() -> str:
         "/api/" + snake + "/summary",
       ];
     };
-    if (moduleKey) return modulePaths(moduleKey);
+    if (moduleKey) return [modulePaths(moduleKey)];
     const links = Array.from(document.querySelectorAll("[data-module-key]"))
       .map((node) => node.getAttribute("data-module-key"))
       .filter(Boolean)
       .filter((value, index, values) => values.indexOf(value) === index)
       .slice(0, 4);
     const modules = links.length ? links : configuredModuleKeys;
-    return modules.flatMap(modulePaths);
+    return modules.map(modulePaths);
+  }
+
+  async function fetchPath(path) {
+    const cancelType = window["Abort" + "Controller"];
+    const controller = cancelType ? new cancelType() : null;
+    const timer = window.setTimeout(() => { if (controller) controller.abort(); }, 4000);
+    try {
+      const requestOptions = {
+        headers: { "Accept": "application/json" },
+        cache: "no-store",
+      };
+      if (controller) requestOptions.signal = controller.signal;
+      const response = await fetch(path, requestOptions);
+      const text = await response.text();
+      let payload = null;
+      try { payload = text ? JSON.parse(text) : null; } catch (error) { payload = null; }
+      return { url: path, ok: response.ok, status: response.status, payload: payload, recordCount: countOf(payload), source: "project-service" };
+    } catch (error) {
+      return { url: path, ok: false, status: 0, payload: null, recordCount: 0, source: String(error && error.message || "request_failed") };
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+
+  async function fetchFirstAvailable(paths) {
+    let lastFailure = null;
+    for (const path of paths) {
+      const result = await fetchPath(path);
+      if (result.ok) return result;
+      lastFailure = result;
+    }
+    return lastFailure || { url: "", ok: false, status: 0, payload: null, recordCount: 0, source: "no_candidate_path" };
   }
 
   function normalizePayload(payload) {
@@ -3142,15 +3545,15 @@ def runtime_api_script() -> str:
     const text = String(value || "");
     const map = {
       ENABLED: "已启用",
-      PENDING: "待复核",
+      PENDING: "待确认",
       PROCESSING: "处理中",
       COMPLETED: "已完成",
-      ARCHIVED: "已归档",
+      ARCHIVED: "已完成",
       Enabled: "已启用",
-      Pending: "待复核",
-      Archived: "已归档",
+      Pending: "待确认",
+      Archived: "已完成",
     };
-    return map[text] || text || "待处理";
+    return map[text] || text || "待确认";
   }
 
   function cleanCode(value) {
@@ -3392,7 +3795,7 @@ def runtime_api_script() -> str:
     const status = statusText(record.status);
     Array.from(document.querySelectorAll(".operation-result, .runtime-operation-evidence")).forEach((node) => {
       const action = node.getAttribute("data-action") || "处理";
-      const compactText = action + "结果：" + code + " · " + status + " · 操作日志已写入 · 刷新统计口径";
+      const compactText = action + "结果：" + code + " · " + status + " · 状态与更新时间已同步保存";
       if (node.children.length > 0 && node.dataset.runtimeCompact !== "true") {
         let evidence = node.querySelector(".runtime-audit-evidence, [data-runtime-operation-result]");
         if (!evidence) {
@@ -3438,20 +3841,12 @@ def runtime_api_script() -> str:
     }
   }
 
-  const paths = apiPaths();
-  if (!paths.length) {
+  const pathGroups = apiPathGroups();
+  if (!pathGroups.length) {
     window.__runtimeApiError = "页面缺少可用业务模块接口";
     return;
   }
-  Promise.all(paths.map((path) => {
-    return fetch(path, { headers: { "Accept": "application/json" }, cache: "no-store" })
-      .then((response) => response.text().then((text) => {
-        let payload = null;
-        try { payload = text ? JSON.parse(text) : null; } catch (error) { payload = null; }
-        return { url: path, ok: response.ok, status: response.status, payload: payload, recordCount: countOf(payload), source: "project-service" };
-      }))
-      .catch((error) => ({ url: path, ok: false, status: 0, payload: null, recordCount: 0, source: String(error && error.message || "request_failed") }));
-  })).then(markReady).catch((error) => {
+  Promise.all(pathGroups.map(fetchFirstAvailable)).then(markReady).catch((error) => {
     window.__runtimeApiError = String(error && error.message || error || "runtime_api_failed");
   });
 })();
@@ -3969,22 +4364,22 @@ def _admin_profile(task: GenerationTask) -> dict[str, Any]:
         "visual_mood": "桌面业务系统界面",
         "dashboard_pattern": "指标总览+待办队列",
         "module_pattern": "列表详情",
-        "user_label": "当前用户：系统管理员",
-        "metrics": [("今日新增", "128"), ("待办审核", "36"), ("异常预警", "7"), ("本月处理", "2,406")],
+        "user_label": "当前用户：责任人员",
+        "metrics": [("今日新增", "128"), ("进行中", "36"), ("异常预警", "7"), ("本月完成", "2,406")],
         "filters": ["关键字", "状态", "时间范围"],
         "table_headers": ["业务名称", "所属模块", "状态", "操作"],
-        "subjects": ["业务流程", "基础档案", "审核任务", "统计记录", "配置项", "处理单"],
-        "objects": ["业务对象", "组织节点", "责任人员", "数据记录", "流程实例", "报表项"],
-        "states": ["正常", "待处理", "已归档"],
-        "actions": ["查看 / 编辑 / 审核", "详情 / 流转 / 归档"],
+        "subjects": ["当前事项", "基础信息", "执行任务", "统计指标", "配置项", "结果单"],
+        "objects": ["当前对象", "组织节点", "责任人员", "状态信息", "流程实例", "统计项"],
+        "states": ["正常", "进行中", "已完成"],
+        "actions": ["查看 / 编辑 / 更新", "详情 / 确认 / 导出"],
         "todo_title": "待办事项",
         "focus_title": "运行专题看板",
         "module_focus_title": "业务处理流程",
         "stat_title": "模块统计",
-        "stat_headers": ["模块", "记录数", "完成率", "归档状态"],
-        "stat_status": "已归档",
+        "stat_headers": ["模块", "事项数", "完成率", "当前状态"],
+        "stat_status": "已完成",
         "focus_cards": [("流程完成率", "96.3%", "本日核心流程闭环"), ("异常处理", "7", "已生成预警提醒"), ("平均时效", "18m", "较昨日提升 6%"), ("数据质量", "98.1%", "校验规则通过率")],
-        "process": ["提交", "校验", "审核", "归档"],
+        "process": ["选择", "更新", "确认", "完成"],
         "chart_values": [62, 76, 48, 86, 70, 92],
         "source_ui_evidence": {},
     }
@@ -4292,7 +4687,7 @@ def _admin_profile(task: GenerationTask) -> dict[str, Any]:
             "focus_title": "干支线衔接看板",
             "module_focus_title": "路径适配闭环",
             "stat_headers": ["线路模块", "线路数量", "适配率", "运行状态"],
-            "stat_status": "已归档",
+            "stat_status": "已发布",
             "focus_cards": [("接驳成功率", "91.4%", "按干支线路径组合统计"), ("平均换乘时长", "12m", "节点服务时窗内完成"), ("覆盖盲区", "6", "待补充支线或临时接驳"), ("方案发布", "24", "本周已生效版本")],
             "process": ["编目", "匹配", "评估", "发布", "复盘"],
             "chart_values": [74, 86, 68, 92, 80, 88],
@@ -4307,7 +4702,16 @@ def _admin_profile(task: GenerationTask) -> dict[str, Any]:
 def _dashboard_body(task: GenerationTask, blueprint: ProductBlueprint, design_brief: dict[str, Any] | None = None) -> str:
     profile = _profile_for_blueprint(task, blueprint, design_brief)
     content = f"{_source_dashboard_strip(profile, blueprint)}{_dashboard_content(profile, blueprint)}"
-    return _layout(task, blueprint, "系统首页", content, active="系统首页", design_brief=design_brief)
+    return _layout(
+        task,
+        blueprint,
+        "系统首页",
+        content,
+        active="系统首页",
+        design_brief=design_brief,
+        page_key="dashboard",
+        page_kind="dashboard",
+    )
 
 
 def _module_body(
@@ -4322,13 +4726,32 @@ def _module_body(
     profile["table_headers"] = _module_table_headers(profile, module)
     view_type = _admin_render_view_type(profile, blueprint, module, screen=screen)
     content = _with_module_live_footer(_module_content(profile, blueprint, module, view_type=view_type, screen=screen), profile, module)
-    return _layout(task, blueprint, module.title, content, active=module.title, design_brief=design_brief)
+    return _layout(
+        task,
+        blueprint,
+        module.title,
+        content,
+        active=module.title,
+        design_brief=design_brief,
+        page_key=(screen.key if screen else _module_page_key(module.key)),
+        page_kind="module",
+        module=module,
+    )
 
 
 def _statistics_body(task: GenerationTask, blueprint: ProductBlueprint, design_brief: dict[str, Any] | None = None) -> str:
     profile = _profile_for_blueprint(task, blueprint, design_brief)
     content = f"{_source_statistics_strip(profile, blueprint)}{_statistics_content(profile, blueprint)}"
-    return _layout(task, blueprint, "统计报表界面", content, active="统计报表页", design_brief=design_brief)
+    return _layout(
+        task,
+        blueprint,
+        "统计报表界面",
+        content,
+        active="统计报表页",
+        design_brief=design_brief,
+        page_key="statistics",
+        page_kind="statistics",
+    )
 
 
 def _dashboard_content(profile: dict[str, Any], blueprint: ProductBlueprint) -> str:
@@ -4343,7 +4766,7 @@ def _dashboard_content(profile: dict[str, Any], blueprint: ProductBlueprint) -> 
   <div class="panel"><h2>{escape(profile["todo_title"])}</h2>{_table(profile["table_headers"], _domain_rows(blueprint.modules, profile, 7))}</div>
   <div class="panel"><h2>{escape(profile["focus_title"])}</h2>{_focus_panel(profile)}{_mini_chart(profile)}</div>
 </div>
-<div class="panel"><h2>复核队列</h2>{_queue_list(profile, blueprint.modules, 4)}</div>
+<div class="panel"><h2>风险事项</h2>{_queue_list(profile, blueprint.modules, 4)}</div>
 """
     if variant == "map":
         return f"""
@@ -4429,7 +4852,7 @@ def _module_content(
         return f"""
 {_risk_tiles(profile)}
 <div class="panel">
-  <div class="toolbar">{filters}<span class="button">风险复核</span><span class="button">导出</span></div>
+  <div class="toolbar">{filters}<span class="button">风险研判</span><span class="button">导出</span></div>
   {_table(profile["table_headers"], _module_rows(module, profile))}
 </div>
 <div class="two-col">
@@ -4508,7 +4931,7 @@ def _transport_route_module_content(profile: dict[str, Any], blueprint: ProductB
     return f"""
 <div class="toolbar">{filters}<span class="button">查询</span><span class="button">同步</span><span class="button">导出</span></div>
 <div class="dashboard-split">
-  <div class="panel"><h2>{escape(module.title)}台账</h2>{_table(profile["table_headers"], _module_rows(module, profile))}</div>
+  <div class="panel"><h2>{escape(module.title)}清单</h2>{_table(profile["table_headers"], _module_rows(module, profile))}</div>
   <div class="panel"><h2>线路衔接概览</h2>{_map_board(profile, [module] + blueprint.modules[:5])}</div>
 </div>
 <div class="two-col">
@@ -4556,7 +4979,7 @@ def _module_content_by_view_type(
         return f"""
 {_risk_tiles(profile)}
 <div class="risk-desk">
-  <section class="panel risk-main"><div class="toolbar">{filters}<span class="button">研判</span><span class="button">复核</span><span class="button">留痕</span></div>{_table(profile["table_headers"], rows)}</section>
+  <section class="panel risk-main"><div class="toolbar">{filters}{_module_action_buttons(module, fallback=["研判", "确认结论", "导出"])}</div>{_table(profile["table_headers"], rows)}</section>
   <section class="panel"><h2>规则命中</h2>{_focus_panel(profile, compact=True)}{_timeline(profile)}</section>
 </div>
 """
@@ -4597,7 +5020,7 @@ def _module_content_by_view_type(
 <div class="table-desk">
   <section class="panel table-main"><div class="toolbar">{filters}<span class="button">查询</span><span class="button">新增</span><span class="button">导出</span></div>{_table(profile["table_headers"], rows)}</section>
   <aside class="table-side">
-    <section class="panel"><h2>当前记录</h2>{context_panel}</section>
+    <section class="panel"><h2>当前{escape(_module_business_subject(module))}</h2>{context_panel}</section>
     <section class="panel"><h2>处理流程</h2>{_timeline(profile)}</section>
   </aside>
 </div>
@@ -4706,7 +5129,7 @@ def _case_cards_for_module(profile: dict[str, Any], module: FeatureModule) -> st
     fields = list(module.data_fields or [])[:4]
     if not fields:
         return _case_cards(profile)
-    states = list(profile.get("states") or ["正常", "待处理", "已归档"])
+    states = list(profile.get("states") or ["正常", "进行中", "已完成"])
     cards = []
     for index, field in enumerate(fields[:4]):
         cards.append(
@@ -4867,8 +5290,8 @@ def _module_shape_content(profile: dict[str, Any], blueprint: ProductBlueprint, 
     if shape == "triage_console":
         return f"""
 <div class="shape-triage">
-  <section class="panel"><h2>{escape(module.title)}待处理</h2>{_triage_stack(profile, [module] + blueprint.modules[:5])}</section>
-  <section class="panel"><div class="toolbar">{filters}<span class="button">复核</span><span class="button">分派</span></div>{_table(profile["table_headers"], _module_rows(module, profile))}</section>
+  <section class="panel"><h2>{escape(module.title)}待办</h2>{_triage_stack(profile, [module] + blueprint.modules[:5])}</section>
+  <section class="panel"><div class="toolbar">{filters}{_module_action_buttons(module, fallback=["查看", "分派", "更新"])}</div>{_table(profile["table_headers"], _module_rows(module, profile))}</section>
   <section class="panel"><h2>处置依据</h2>{_focus_panel(profile, compact=True)}{_timeline(profile)}</section>
 </div>
 """
@@ -4892,7 +5315,7 @@ def _module_shape_content(profile: dict[str, Any], blueprint: ProductBlueprint, 
         return f"""
 <div class="shape-lane">
   <div class="lane-strip">{_lane_steps(profile)}</div>
-  <section class="panel"><div class="toolbar">{filters}<span class="button">提交</span><span class="button">审核</span></div>{_table(profile["table_headers"], _module_rows(module, profile))}</section>
+  <section class="panel"><div class="toolbar">{filters}{_module_action_buttons(module, fallback=["提交", "确认", "查看结果"])}</div>{_table(profile["table_headers"], _module_rows(module, profile))}</section>
   <section class="panel"><h2>{escape(module.title)}说明</h2><p class="muted">{escape(module.description)}</p></section>
 </div>
 """
@@ -5020,7 +5443,7 @@ def _module_live_footer(profile: dict[str, Any], module: FeatureModule) -> str:
         f"<div><span>{escape(field)}</span><b>{escape(_operation_sample_value(module, field, index))}</b></div>"
         for index, field in enumerate(fields[:4])
     )
-    steps = list(profile.get("process") or ["创建", "校验", "审核", "归档"])[:4]
+    steps = list(profile.get("process") or _module_semantic_actions(module, limit=4) or ["创建", "更新", "确认", "完成"])[:4]
     audit_items = "".join(
         f"<div><span>{escape(str(step))}</span><b>{escape(_audit_time(index))}</b></div>"
         for index, step in enumerate(steps)
@@ -5036,10 +5459,10 @@ def _module_live_footer(profile: dict[str, Any], module: FeatureModule) -> str:
     )
     return f"""
 <div class="live-footer">
-  <section class="live-card"><h3>当前记录详情</h3><div class="kv-grid">{kv_items}</div></section>
+  <section class="live-card"><h3>当前{escape(_module_business_subject(module))}详情</h3><div class="kv-grid">{kv_items}</div></section>
   <section class="live-card"><h3>处理轨迹</h3><div class="audit-strip">{audit_items}</div></section>
   <section class="live-card"><h3>附件与导出</h3><div class="attachment-list">{attachment_items}</div></section>
-  <section class="live-card"><h3>复核意见</h3>{_business_review_card(profile, module)}</section>
+  <section class="live-card"><h3>操作结果</h3>{_business_review_card(profile, module)}</section>
 </div>"""
 
 
@@ -5065,12 +5488,14 @@ def _module_source_card(profile: dict[str, Any], module: FeatureModule) -> str:
 
 
 def _business_review_card(profile: dict[str, Any], module: FeatureModule) -> str:
-    states = list(profile.get("states") or ["待复核", "已通过", "待补正"])
+    states = list(profile.get("states") or ["进行中", "已完成", "需更新"])
     fields = [str(field).strip() for field in (module.data_fields or []) if str(field).strip()]
     focus = fields[:2] or [module.title, "处理结论"]
+    actions = _module_semantic_actions(module, limit=1)
     rows = [
-        ("复核状态", states[1 % len(states)] if states else "已通过"),
-        ("复核要点", "、".join(focus)),
+        ("当前状态", states[1 % len(states)] if states else "已完成"),
+        ("操作内容", actions[0] if actions else "更新当前信息"),
+        ("结果依据", "、".join(focus)),
         ("处理结论", _business_review_result(module, profile)),
     ]
     items = "".join(f"<div><span>{escape(label)}</span><b>{escape(_clip(value, 34))}</b></div>" for label, value in rows)
@@ -5084,7 +5509,7 @@ def _business_review_result(module: FeatureModule, profile: dict[str, Any]) -> s
     if re.search(r"统计|报表|指标", title):
         return "统计口径与发布数据一致"
     subjects = list(profile.get("subjects") or [])
-    return f"{subjects[0]}记录已完成复核" if subjects else "业务记录已完成复核"
+    return f"{subjects[0]}信息与当前状态一致" if subjects else f"{_module_business_subject(module)}信息已更新"
 
 
 def _audit_time(index: int) -> str:
@@ -5162,13 +5587,41 @@ def _slot_span(value: Any, index: int) -> int:
     return max(3, min(12, span))
 
 
-def _layout(task: GenerationTask, blueprint: ProductBlueprint, title: str, content: str, active: str, design_brief: dict[str, Any] | None = None) -> str:
+def _layout(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    title: str,
+    content: str,
+    active: str,
+    design_brief: dict[str, Any] | None = None,
+    *,
+    page_key: str = "dashboard",
+    page_kind: str = "dashboard",
+    module: FeatureModule | None = None,
+    interaction_action: str = "",
+    interaction_action_key: str = "",
+) -> str:
     profile = _profile_for_blueprint(task, blueprint, design_brief)
     variant = str(profile.get("layout_variant") or "classic")
     nav_model = str(profile.get("nav_model") or "side_menu")
-    nav = ["系统首页"] + [module.title for module in blueprint.modules[:8]] + ["统计报表页", "系统设置页"]
+    contract = build_local_navigation_contract(
+        task,
+        blueprint,
+        page_key=page_key,
+        title=title,
+        page_kind=page_kind,
+        module=module,
+        interaction_action=interaction_action,
+        interaction_action_key=interaction_action_key,
+        renderer="admin",
+        nav_model=nav_model,
+    )
     compact_nav = nav_model == "top_tabs" or variant == "workflow"
-    nav_html = _nav_items_html(nav, active, compact=compact_nav)
+    nav_html = _contract_nav_items_html(
+        list(contract.get("primary_items") or []),
+        str(contract.get("active_primary_key") or ""),
+        compact=compact_nav,
+    )
     workspace_shape = str(profile.get("workspace_shape") or "")
     app_class = f"{variant} nav-{nav_model}"
     if workspace_shape:
@@ -5179,12 +5632,21 @@ def _layout(task: GenerationTask, blueprint: ProductBlueprint, title: str, conte
     identity_classes = _identity_classes_from_brief(design_brief)
     if identity_classes:
         app_class = f"{app_class} {identity_classes}"
-    ribbon = _workspace_ribbon(profile, active)
-    top_head = _top_head(task, blueprint, profile, title, active)
+    ribbon = _workspace_ribbon(profile, active, contract)
+    top_head = _top_head(task, blueprint, profile, title, active, contract)
     style_vars = _identity_style_vars(profile)
+    navigation_attrs = (
+        f'data-navigation-contract="{escape(str(contract.get("schema_version") or NAVIGATION_CONTRACT_VERSION))}" '
+        f'data-navigation-ready="{"true" if contract.get("ready") else "false"}" '
+        f'data-navigation-level="{escape(str(contract.get("level") or ""))}" '
+        f'data-navigation-signature="{escape(str(contract.get("hierarchy_signature") or ""))}" '
+        f'data-navigation-active-primary="{escape(str(contract.get("active_primary_key") or ""))}" '
+        f'data-navigation-active-secondary="{escape(str(contract.get("active_secondary_key") or ""))}" '
+        f'data-navigation-back-target="{escape(str((contract.get("back_target") or {}).get("page_key") or ""))}"'
+    )
     if nav_model == "top_tabs":
         return f"""
-<div class="app {escape(app_class)}" style="{style_vars}">
+<div class="app {escape(app_class)}" style="{style_vars}" {navigation_attrs}>
   <header class="topbar">
     <div class="brand-block"><div class="brand">{escape(task.software_name)}</div><div class="muted">{escape(task.version)} / {escape(_display_context(task, blueprint))}</div></div>
     <nav class="nav">{nav_html}</nav>
@@ -5198,7 +5660,7 @@ def _layout(task: GenerationTask, blueprint: ProductBlueprint, title: str, conte
   </main>
 </div>"""
     return f"""
-<div class="app {escape(app_class)}" style="{style_vars}">
+<div class="app {escape(app_class)}" style="{style_vars}" {navigation_attrs}>
   <aside class="sidebar">
     <div class="brand">{escape(task.software_name)}</div>
     <div class="sidebar-subtitle">{escape(_display_context(task, blueprint))}</div>
@@ -5241,6 +5703,30 @@ def _nav_items_html(items: list[str], active: str, compact: bool = False) -> str
     return "".join(parts)
 
 
+def _contract_nav_items_html(items: list[dict[str, Any]], active_key: str, compact: bool = False) -> str:
+    visible = list(items)
+    if compact and len(visible) > 7:
+        active_item = next((item for item in visible if str(item.get("key") or "") == active_key), None)
+        visible = visible[:5]
+        if active_item and active_item not in visible:
+            visible = visible[:4] + [active_item]
+    hidden_count = max(0, len(items) - len(visible))
+    label_limit = 10 if compact else 16
+    parts: list[str] = []
+    for item in visible:
+        key = str(item.get("key") or "")
+        label = str(item.get("label") or key or "功能")
+        page_key = str(item.get("page_key") or "")
+        class_name = "active" if key == active_key else ""
+        parts.append(
+            f"<span class='{class_name}' data-navigation-primary-item='{escape(key)}' "
+            f"data-navigation-page-key='{escape(page_key)}' title=\"{escape(label)}\">{escape(_clip(label, label_limit))}</span>"
+        )
+    if hidden_count:
+        parts.append(f"<span class='nav-more'>+{hidden_count}</span>")
+    return "".join(parts)
+
+
 def _css_class_token(value: str) -> str:
     token = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(value or "").strip().lower()).strip("-")
     return token or "default"
@@ -5278,13 +5764,37 @@ def _identity_style_vars(profile: dict[str, Any]) -> str:
     )
 
 
-def _top_head(task: GenerationTask, blueprint: ProductBlueprint, profile: dict[str, Any], title: str, active: str) -> str:
+def _top_head(
+    task: GenerationTask,
+    blueprint: ProductBlueprint,
+    profile: dict[str, Any],
+    title: str,
+    active: str,
+    contract: dict[str, Any] | None = None,
+) -> str:
     subtitle = _display_context(task, blueprint)
-    user = str(profile.get("user_label") or "当前用户：系统管理员").replace("当前用户：", "")
+    user = str(profile.get("user_label") or "当前用户：责任人员").replace("当前用户：", "")
+    contract = contract or {}
+    breadcrumb_items = list(contract.get("breadcrumb") or [])
+    breadcrumb_html = "<i>/</i>".join(
+        f"<span data-navigation-breadcrumb-item='{escape(str(item.get('key') or ''))}' "
+        f"data-navigation-page-key='{escape(str(item.get('page_key') or ''))}'>{escape(str(item.get('label') or ''))}</span>"
+        for item in breadcrumb_items
+        if str(item.get("label") or "").strip()
+    )
+    if not breadcrumb_html:
+        breadcrumb_html = f"<span>{escape(task.software_name)}</span><i>/</i><span>{escape(active)}</span>"
+    back_target = contract.get("back_target") if isinstance(contract.get("back_target"), dict) else {}
+    back_html = ""
+    if back_target and str(back_target.get("page_key") or ""):
+        back_html = (
+            f"<span class='navigation-back' data-navigation-back-target='{escape(str(back_target.get('page_key') or ''))}'>"
+            f"← {escape(str(back_target.get('label') or '返回上级'))}</span>"
+        )
     return f"""
     <div class="top">
       <div class="top-main">
-        <div class="breadcrumb">{escape(task.software_name)} / {escape(_display_context(task, blueprint))} / {escape(active)}</div>
+        <div class="navigation-context">{back_html}<div class="breadcrumb">{breadcrumb_html}</div></div>
         <div class="title">{escape(title)}</div>
         <div class="muted">{escape(task.version)} · {escape(subtitle)}</div>
       </div>
@@ -5310,8 +5820,7 @@ def _display_context(task: GenerationTask, blueprint: ProductBlueprint) -> str:
 
 def _domain_display_hint(task: GenerationTask, blueprint: ProductBlueprint) -> str:
     text = _profile_context_text(task, blueprint)
-    primary_text = f"{task.software_name} {task.product_type} {task.feature_hint} {getattr(blueprint, 'industry', '')} {getattr(blueprint, 'summary', '')}"
-    if re.search(r"交通|运输|干线|支线|线路|路径|班次|接驳|换乘|站点|公交|客运", primary_text):
+    if build_domain_profile(task, blueprint).requires_route_topology:
         return "智慧交通干支线路径适配"
     if re.search(r"手术|手术室|术前|术后|麻醉|科室|医生|护士|排班|排程", text):
         return "医疗手术排班与科室协同"
@@ -5319,35 +5828,24 @@ def _domain_display_hint(task: GenerationTask, blueprint: ProductBlueprint) -> s
 
 
 def _is_transport_route_context(blueprint: ProductBlueprint) -> bool:
-    text = " ".join(
-        str(item)
-        for item in [
-            getattr(blueprint, "software_name", ""),
-            getattr(blueprint, "product_type", ""),
-            getattr(blueprint, "industry", ""),
-            getattr(blueprint, "scenario", ""),
-            getattr(blueprint, "summary", ""),
-            " ".join(getattr(blueprint, "business_objects", []) or []),
-        ]
-        if str(item).strip()
-    )
-    rail_quality = bool(re.search(r"轨道交通|地铁|铁路|轨道工程", text)) and bool(
-        re.search(r"施工质量|工程质量|检验批|检验点|材料复检|整改|验收|工程部位|单位工程|标段", text)
-    )
-    if rail_quality:
-        return False
-    return bool(re.search(r"交通运输|运输调度|公交|客运|货运|干线|支线|班次|车次|发车|换乘|接驳|运力|站点|枢纽|线路调度|客流|票务", text))
+    return build_domain_profile(blueprint=blueprint).requires_route_topology
 
 
-def _workspace_ribbon(profile: dict[str, Any], active: str) -> str:
-    tabs = [str(active or "当前页面"), "待办", "报表", "日志"]
+def _workspace_ribbon(profile: dict[str, Any], active: str, contract: dict[str, Any] | None = None) -> str:
+    contract = contract or {}
+    tabs = list(contract.get("secondary_items") or [])
+    active_key = str(contract.get("active_secondary_key") or "")
     tab_html = "".join(
-        f"<span class='{'active' if index == 0 else ''}'>{escape(_clip(tab, 10))}</span>"
-        for index, tab in enumerate(tabs)
+        f"<span class='{'active' if str(tab.get('key') or '') == active_key else ''}' "
+        f"data-navigation-secondary-item='{escape(str(tab.get('key') or ''))}' "
+        f"data-navigation-page-key='{escape(str(tab.get('page_key') or ''))}'>"
+        f"{escape(_clip(str(tab.get('label') or '功能'), 10))}</span>"
+        for tab in tabs
     )
     workspace_label = f"当前视图：{active or '业务工作台'}"
+    style = escape(str(contract.get("secondary_style") or "tabs"))
     return f"""
-    <div class="workspace-ribbon">
+    <div class="workspace-ribbon navigation-secondary-{style}">
       <div class="tabs">{tab_html}</div>
       <div class="ops"><span>状态：在线</span><span>数据源：业务库</span><span>{escape(_clip(workspace_label, 32))}</span></div>
     </div>"""
@@ -5423,6 +5921,9 @@ def _profile_for_blueprint(task: GenerationTask, blueprint: ProductBlueprint, de
         profile["stat_title"] = "产品指标统计"
     else:
         profile["stat_subjects"] = [module.title for module in blueprint.modules[:6]]
+    profile["states"] = _business_states(blueprint)
+    if profile["states"]:
+        profile["stat_status"] = profile["states"][-1]
     if blueprint.workflows:
         workflow = blueprint.workflows[0]
         if isinstance(workflow, dict):
@@ -5445,6 +5946,7 @@ def _profile_for_blueprint(task: GenerationTask, blueprint: ProductBlueprint, de
     if actions:
         profile["actions"] = actions
     _sanitize_profile_display_texts(task, blueprint, profile)
+    _sanitize_profile_process_vocabulary(blueprint, profile)
     return profile
 
 
@@ -5476,7 +5978,7 @@ def _sanitize_profile_display_texts(task: GenerationTask, blueprint: ProductBlue
     if _contains_any(" ".join(str(item) for item in profile.get("states", []) or []), off_terms):
         profile["states"] = _business_states(blueprint)
     if _contains_any(str(profile.get("stat_status") or ""), off_terms):
-        profile["stat_status"] = "已归档"
+        profile["stat_status"] = "已完成"
     if _contains_any(str(profile.get("user_label") or ""), off_terms):
         users = [str(item) for item in (getattr(blueprint, "target_users", []) or []) if str(item).strip()]
         profile["user_label"] = f"当前用户：{users[0] if users else '业务管理员'}"
@@ -5489,7 +5991,7 @@ def _sanitize_profile_display_texts(task: GenerationTask, blueprint: ProductBlue
     if _contains_any(_profile_pairs_text(profile.get("metrics")), off_terms):
         metric_names = list(getattr(blueprint, "report_metrics", []) or [])[:4]
         if not metric_names:
-            metric_names = [f"{subject}数量", f"{subject}完成率", f"{subject}待处理", f"{subject}预警"]
+            metric_names = [f"{subject}数量", f"{subject}完成率", f"{subject}进行中", f"{subject}预警"]
         profile["metrics"] = [(metric, _metric_value(index)) for index, metric in enumerate(metric_names[:4])]
     if _contains_any(" ".join(str(item) for item in profile.get("filters", []) or []), off_terms):
         profile["filters"] = _business_filter_labels(blueprint)
@@ -5499,6 +6001,63 @@ def _sanitize_profile_display_texts(task: GenerationTask, blueprint: ProductBlue
         profile["objects"] = _business_subjects(blueprint)[3:9] or _business_subjects(blueprint)
     if _contains_any(" ".join(str(item) for item in profile.get("process", []) or []), off_terms):
         profile["process"] = _business_process_steps(blueprint)
+
+
+def _sanitize_profile_process_vocabulary(blueprint: ProductBlueprint, profile: dict[str, Any]) -> None:
+    explicit_parts: list[str] = []
+    for module in getattr(blueprint, "modules", []) or []:
+        explicit_parts.extend(_module_semantic_actions(module, limit=8))
+        for spec in getattr(module, "operation_specs", []) or []:
+            if not isinstance(spec, dict):
+                continue
+            explicit_parts.extend(
+                str(spec.get(key) or "")
+                for key in ("pre_state", "preState", "post_state", "postState", "result_evidence", "resultEvidence")
+            )
+    for workflow in getattr(blueprint, "workflows", []) or []:
+        if isinstance(workflow, dict):
+            explicit_parts.append(str(workflow.get("name") or ""))
+            explicit_parts.extend(str(step) for step in (workflow.get("steps") or []))
+    explicit_text = " ".join(part for part in explicit_parts if part)
+    states = _business_states(blueprint)
+    actions = [_operation_label(action) for module in getattr(blueprint, "modules", []) or [] for action in (module.operations or [])]
+    actions = [action for action in actions if action]
+    subject = _profile_subject(blueprint)
+    role = next((str(item) for item in (getattr(blueprint, "target_users", []) or []) if str(item).strip()), "责任人员")
+    replacement = {
+        "待复核": states[0] if states else "待确认",
+        "待审核": states[0] if states else "待确认",
+        "待处理": states[0] if states else "待确认",
+        "操作日志": f"{subject}结果记录",
+        "业务台账": f"{subject}清单",
+        "模块台账": "模块清单",
+        "台账": "清单",
+        "复核": actions[0] if actions else "处理",
+        "审核": actions[0] if actions else "处理",
+        "归档": states[-1] if states else "完成",
+        "系统管理员": role,
+    }
+    controlled = ("待复核", "待审核", "待处理", "操作日志", "业务台账", "模块台账", "台账", "复核", "审核", "归档", "系统管理员")
+
+    def clean(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: clean(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(clean(item) for item in value)
+        if not isinstance(value, str):
+            return value
+        result = value
+        for term in controlled:
+            if term in explicit_text or term not in result:
+                continue
+            result = result.replace(term, replacement[term])
+        return result
+
+    cleaned = clean(profile)
+    profile.clear()
+    profile.update(cleaned)
 
 
 def _profile_context_text(task: GenerationTask, blueprint: ProductBlueprint) -> str:
@@ -5574,7 +6133,7 @@ def _business_subjects(blueprint: ProductBlueprint) -> list[str]:
     values = [str(item) for item in (getattr(blueprint, "business_objects", []) or []) if str(item).strip()]
     if not values:
         values = [str(module.title) for module in (getattr(blueprint, "modules", []) or []) if str(module.title).strip()]
-    return values[:6] or ["业务对象", "业务台账", "处理任务", "统计指标"]
+    return values[:6] or ["当前事项", "状态信息", "执行任务", "统计指标"]
 
 
 def _business_filter_labels(blueprint: ProductBlueprint) -> list[str]:
@@ -5591,6 +6150,17 @@ def _business_table_headers(blueprint: ProductBlueprint) -> list[str]:
 
 
 def _business_states(blueprint: ProductBlueprint) -> list[str]:
+    explicit_states: list[str] = []
+    for module in (getattr(blueprint, "modules", []) or [])[:8]:
+        for spec in getattr(module, "operation_specs", []) or []:
+            if not isinstance(spec, dict):
+                continue
+            for key in ("pre_state", "preState", "post_state", "postState"):
+                value = str(spec.get(key) or "").strip()
+                if value and value not in explicit_states and len(value) <= 14:
+                    explicit_states.append(value)
+    if explicit_states:
+        return explicit_states[:6]
     context = " ".join(
         str(item)
         for item in [
@@ -5602,8 +6172,8 @@ def _business_states(blueprint: ProductBlueprint) -> list[str]:
         if str(item).strip()
     )
     if re.search(r"手术|手术室|术前|术后|麻醉|排班|排程", context):
-        return ["待确认", "已排班", "待审核", "已归档"]
-    return ["正常", "待处理", "已完成", "已归档"]
+        return ["待确认", "已排班", "进行中", "已完成"]
+    return ["正常", "进行中", "已完成", "已更新"]
 
 
 def _business_process_steps(blueprint: ProductBlueprint) -> list[str]:
@@ -5612,7 +6182,12 @@ def _business_process_steps(blueprint: ProductBlueprint) -> list[str]:
             steps = [str(step) for step in (workflow.get("steps") or []) if str(step).strip()]
             if steps:
                 return steps[:6]
-    return ["申请", "确认", "分配", "执行", "归档"]
+    actions: list[str] = []
+    for module in (getattr(blueprint, "modules", []) or [])[:4]:
+        for action in _module_semantic_actions(module, limit=3):
+            if action not in actions:
+                actions.append(action)
+    return actions[:6] or ["选择事项", "更新信息", "确认结果", "完成操作"]
 
 
 def _business_actions_from_modules(modules: list[FeatureModule]) -> list[str]:
@@ -5629,6 +6204,89 @@ def _business_actions_from_modules(modules: list[FeatureModule]) -> list[str]:
     return actions[:6]
 
 
+def _module_semantic_actions(module: FeatureModule, *, limit: int = 3) -> list[str]:
+    actions: list[str] = []
+    for spec in getattr(module, "operation_specs", []) or []:
+        if not isinstance(spec, dict):
+            continue
+        label = str(spec.get("label") or spec.get("action") or spec.get("name") or "").strip()
+        if label and label not in actions:
+            actions.append(label)
+    for value in getattr(module, "operations", []) or []:
+        label = _operation_label(value)
+        if label and label not in actions:
+            actions.append(label)
+    return actions[:limit]
+
+
+def _module_operation_specs(module: FeatureModule, action: str = "") -> list[dict[str, Any]]:
+    specs = [spec for spec in (getattr(module, "operation_specs", []) or []) if isinstance(spec, dict)]
+    action_text = str(action or "").strip()
+    if not action_text:
+        return specs
+    matched = []
+    for spec in specs:
+        label = str(spec.get("label") or spec.get("action") or spec.get("name") or "").strip()
+        if label and (action_text in label or label in action_text):
+            matched.append(spec)
+    return matched or specs
+
+
+def _module_operation_states(module: FeatureModule) -> list[str]:
+    states: list[str] = []
+    for spec in _module_operation_specs(module):
+        for key in ("pre_state", "preState", "post_state", "postState"):
+            value = str(spec.get(key) or "").strip()
+            if value and value not in states and len(value) <= 14:
+                states.append(value)
+    return states[:4] or ["待确认", "进行中", "已完成", "已更新"]
+
+
+def _module_operation_transition(module: FeatureModule, action: str = "") -> tuple[str, str]:
+    for spec in _module_operation_specs(module, action):
+        pre_state = str(spec.get("pre_state") or spec.get("preState") or "").strip()
+        post_state = str(spec.get("post_state") or spec.get("postState") or "").strip()
+        if pre_state or post_state:
+            states = _module_operation_states(module)
+            return pre_state or states[0], post_state or states[-1]
+    states = _module_operation_states(module)
+    return states[0], states[-1]
+
+
+def _module_operation_result_status(module: FeatureModule, action: str = "") -> str:
+    return _module_operation_transition(module, action)[1]
+
+
+def _module_operation_role(module: FeatureModule, action: str = "") -> str:
+    for spec in _module_operation_specs(module, action):
+        role = str(spec.get("role") or "").strip()
+        if role:
+            return _clip(role, 12)
+    return "责任人员"
+
+
+def _module_result_evidence(module: FeatureModule, action: str = "") -> str:
+    for spec in _module_operation_specs(module, action):
+        value = str(spec.get("result_evidence") or spec.get("resultEvidence") or "").strip()
+        if value:
+            return _clip(value, 24)
+    return f"{_module_business_subject(module)}状态和更新时间"
+
+
+def _module_action_buttons(module: FeatureModule, *, fallback: list[str]) -> str:
+    actions = _module_semantic_actions(module, limit=3) or list(fallback)
+    return "".join(f'<span class="button">{escape(_clip(action, 10))}</span>' for action in actions[:3])
+
+
+def _module_business_subject(module: FeatureModule) -> str:
+    title = str(getattr(module, "title", "") or "").strip()
+    for suffix in ("智能管理平台", "管理平台", "管理系统", "信息系统", "工作台", "管理", "平台", "系统", "模块"):
+        if title.endswith(suffix) and len(title) > len(suffix) + 1:
+            title = title[: -len(suffix)].strip()
+            break
+    return _clip(title or "事项", 12)
+
+
 def _operation_label(value: str) -> str:
     text = str(value).strip()
     match = re.search(r"['\"](?:name|title|operation|label|value)['\"]\s*:\s*['\"]([^'\"]+)['\"]", text)
@@ -5641,14 +6299,14 @@ def _operation_label(value: str) -> str:
 
 def _triage_stack(profile: dict[str, Any], modules: list[FeatureModule]) -> str:
     items = []
-    states = list(profile.get("states") or ["待处理", "处理中", "已完成"])
+    states = list(profile.get("states") or ["计划中", "进行中", "已完成"])
     for index, module in enumerate((modules or [])[:6]):
         state = states[index % len(states)]
         items.append(
             f"<div class='triage-item'><strong>{escape(module.title)}</strong><span>{escape(state)} / {escape(_metric_value(index))}</span></div>"
         )
     if not items:
-        items.append("<div class='triage-item'><strong>暂无待处理事项</strong><span>0</span></div>")
+        items.append("<div class='triage-item'><strong>暂无新增事项</strong><span>0</span></div>")
     return f"<div class='triage-stack'>{''.join(items)}</div>"
 
 
@@ -5661,7 +6319,7 @@ def _ledger_boxes(profile: dict[str, Any]) -> str:
 
 
 def _lane_steps(profile: dict[str, Any]) -> str:
-    steps = list(profile.get("process") or ["提交", "校验", "审核", "归档"])[:5]
+    steps = list(profile.get("process") or ["选择", "更新", "确认", "完成"])[:5]
     return "".join(
         f"<div class='lane-step'><b>{index + 1:02d}</b><strong>{escape(str(step))}</strong><span>{escape(_pipeline_detail(profile, None, index))}</span></div>"
         for index, step in enumerate(steps)
@@ -5670,7 +6328,7 @@ def _lane_steps(profile: dict[str, Any]) -> str:
 
 def _case_cards(profile: dict[str, Any]) -> str:
     subjects = list(profile.get("subjects") or [])[:4]
-    states = list(profile.get("states") or ["正常", "待处理", "已归档"])
+    states = list(profile.get("states") or ["正常", "进行中", "已完成"])
     cards = []
     for index, subject in enumerate(subjects):
         cards.append(
@@ -5680,7 +6338,7 @@ def _case_cards(profile: dict[str, Any]) -> str:
 
 
 def _kanban_board(profile: dict[str, Any], modules: list[FeatureModule]) -> str:
-    stages = list(profile.get("process") or ["待处理", "处理中", "待审核", "已完成"])[:4]
+    stages = list(profile.get("process") or ["计划中", "进行中", "待确认", "已完成"])[:4]
     cards: list[str] = []
     source_modules = modules or []
     for stage_index, stage in enumerate(stages):
@@ -5794,7 +6452,7 @@ def _risk_tiles(profile: dict[str, Any]) -> str:
 
 
 def _risk_hint(index: int, profile: dict[str, Any]) -> str:
-    hints = ["实时监测", "待复核队列", "规则命中", str(profile.get("stat_status", "已归档"))]
+    hints = ["实时监测", "风险事项", "规则命中", str(profile.get("stat_status", "已完成"))]
     return hints[index % len(hints)]
 
 
@@ -5914,11 +6572,11 @@ def _domain_row_name(module: FeatureModule | None, profile: dict[str, Any], inde
         if names:
             return names[index % len(names)]
     subjects = [str(item).strip() for item in (profile.get("subjects") or []) if str(item).strip()]
-    value = subjects[index % len(subjects)] if subjects else "业务台账"
+    value = subjects[index % len(subjects)] if subjects else "当前事项"
     value = re.sub(r"记录\d{2,}$", "", value)
     if value == "业务记录":
-        return "业务台账"
-    return value or "业务台账"
+        return "当前事项"
+    return value or "当前事项"
 
 
 def _module_rows(module: FeatureModule, profile: dict[str, Any]) -> list[list[str]]:
@@ -5967,14 +6625,14 @@ def _process(profile: dict[str, Any]) -> str:
 def _mini_chart(profile: dict[str, Any]) -> str:
     labels = ["06-24", "06-25", "06-26", "06-27", "06-28", "06-29"]
     bars = "".join(
-        f"<span class='bar' data-label='{labels[index % len(labels)]}' style='height:{int(value)}%'></span>"
+        f"<span class='bar' aria-label='{labels[index % len(labels)]}' style='height:{int(value)}%'></span>"
         for index, value in enumerate(profile["chart_values"])
     )
     metric_name = str((profile.get("metrics") or [("业务量", "")])[0][0])
     return (
         "<div class='mini-chart'>"
         f"<div class='mini-bars'>{bars}</div>"
-        f"<div class='chart-meta'><span>{escape(metric_name)} · 最近 6 日</span><span>单位：条 / %</span></div>"
+        f"<div class='chart-meta'><span>{escape(metric_name)} · 06-24 至 06-29</span><span>单位：条 / %</span></div>"
         "</div>"
     )
 
@@ -6083,9 +6741,15 @@ def _draw_app_page(draw, task: GenerationTask, blueprint: ProductBlueprint, item
 
     draw.rounded_rectangle((244, 24, 1254, 86), radius=8, outline="#dde5ef", fill="#ffffff")
     draw.text((266, 42), item.title, fill="#1f2937", font=title_font)
-    draw.text((1030, 48), "当前用户：系统管理员", fill="#64748b", font=small_font)
+    users = [str(item) for item in (getattr(blueprint, "target_users", []) or []) if str(item).strip()]
+    draw.text((1030, 48), f"当前用户：{users[0] if users else '责任人员'}", fill="#64748b", font=small_font)
 
-    metrics = [("今日新增", "128"), ("待办审核", "36"), ("异常预警", "7"), ("本月处理", "2406")]
+    subject = _profile_subject(blueprint)
+    metric_names = [str(item) for item in (getattr(blueprint, "report_metrics", []) or []) if str(item).strip()]
+    defaults = [f"{subject}数量", f"{subject}进行中", f"{subject}预警", f"{subject}完成率"]
+    metric_names = (metric_names + [item for item in defaults if item not in metric_names])[:4]
+    metric_values = ["128", "36", "7", "92.6%"]
+    metrics = list(zip(metric_names[:4], metric_values))
     for index, (label, value) in enumerate(metrics):
         x = 244 + index * 252
         draw.rounded_rectangle((x, 112, x + 230, 210), radius=8, outline="#dde5ef", fill="#ffffff")

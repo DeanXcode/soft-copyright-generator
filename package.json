@@ -1,6 +1,6 @@
 {
   "name": "soft-copyright-generator-desktop",
-  "version": "0.2.0",
+  "version": "0.2.3",
   "private": true,
   "type": "module",
   "main": "desktop/electron/main.cjs",
@@ -14,7 +14,7 @@
     "pack:dir": "npm run prepare:runtime && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --dir",
     "pack:win": "npm run prepare:runtime && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ npm run build && cross-env ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/ electron-builder --win nsis",
     "pack:win:customer": "powershell -ExecutionPolicy Bypass -File scripts\\package-customer-nsis.ps1",
-    "prepare:playwright": "cross-env PLAYWRIGHT_BROWSERS_PATH=ms-playwright python -m playwright install chromium",
+    "prepare:playwright": "cross-env PLAYWRIGHT_BROWSERS_PATH=ms-playwright python -m playwright install --only-shell chromium",
     "prepare:python": "powershell -ExecutionPolicy Bypass -File scripts\\prepare-python-runtime.ps1",
     "prepare:libreoffice": "powershell -ExecutionPolicy Bypass -File scripts\\prepare-libreoffice-runtime.ps1",
     "prepare:runtime": "npm run prepare:playwright && npm run prepare:python",
@@ -62,7 +62,11 @@
       },
       {
         "from": "ms-playwright",
-        "to": "ms-playwright"
+        "to": "ms-playwright",
+        "filter": [
+          "**/*",
+          "!chromium-*/**"
+        ]
       },
       {
         "from": "python-runtime",

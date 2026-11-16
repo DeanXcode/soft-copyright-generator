@@ -7,6 +7,7 @@ from .page_spec import (
     page_spec_cache_key,
 )
 from .page_spec_renderer import render_page_spec
+from .page_composition import PAGE_COMPOSITION_VERSION, build_page_composition_contract
 
 __all__ = [
     "COMPONENT_LIBRARY_VERSION",
@@ -16,4 +17,6 @@ __all__ = [
     "normalize_page_spec",
     "page_spec_cache_key",
     "render_page_spec",
+    "PAGE_COMPOSITION_VERSION",
+    "build_page_composition_contract",
 ]

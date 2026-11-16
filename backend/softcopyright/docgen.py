@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
 import re
 import shutil
@@ -614,7 +615,7 @@ def generate_manual_docx(
             if _module_paragraphs_conflict_with_ui(module_paragraphs, ui_context, module):
                 module_paragraphs = None
             module_paragraphs = module_paragraphs or _module_intro_paragraphs(blueprint, module, ui_context)
-        for text in _expand_paragraphs(module_paragraphs, min_count=1, max_count=2):
+        for text in _expand_paragraphs(module_paragraphs, min_count=1, max_count=2, context=module.title):
             document.add_paragraph(_customer_manual_text(text))
         _add_module_operation_sections(document, module, index, ui_screenshots, design_brief, ui_context)
 
@@ -651,7 +652,7 @@ def generate_manual_docx(
         design_brief=design_brief,
     )
 
-    _add_heading(document, "六、权限与安全")
+    _start_manual_security_section(document, "六、权限与安全")
     security_paragraphs = _content_paragraphs(
         manual_content,
         "security",
@@ -665,6 +666,7 @@ def generate_manual_docx(
         min_count=3,
     )
     security_paragraphs = _manual_paragraphs_for_renderer(security_paragraphs, design_brief)
+    security_paragraphs = _extend_security_paragraphs(blueprint, security_paragraphs, target_count=6)
     for text in security_paragraphs:
         document.add_paragraph(_customer_manual_text(text))
 
@@ -694,6 +696,12 @@ def _start_manual_closing_section(document, title: str) -> None:
     _add_heading(document, title)
 
 
+def _start_manual_security_section(document, title: str) -> None:
+    """Keep the security chapter together instead of leaving a sparse continuation page."""
+    document.add_page_break()
+    _add_heading(document, title)
+
+
 def analyze_manual_density(docx_path: Path | None) -> dict:
     if not docx_path or not docx_path.exists():
         return {
@@ -707,6 +715,11 @@ def analyze_manual_density(docx_path: Path | None) -> dict:
             "manual_result_note_count": 0,
             "manual_average_chars_per_paragraph": 0,
             "manual_operation_density_ready": False,
+            "manual_generic_sentence_count": 0,
+            "manual_generic_sentence_ratio": 0,
+            "manual_semantic_anchor_count": 0,
+            "manual_semantic_anchor_ratio": 0,
+            "manual_template_risk_level": "unknown",
         }
     try:
         from docx import Document
@@ -718,6 +731,11 @@ def analyze_manual_density(docx_path: Path | None) -> dict:
             "manual_density_checked": False,
             "manual_density_error": str(exc),
             "manual_operation_density_ready": False,
+            "manual_generic_sentence_count": 0,
+            "manual_generic_sentence_ratio": 0,
+            "manual_semantic_anchor_count": 0,
+            "manual_semantic_anchor_ratio": 0,
+            "manual_template_risk_level": "unknown",
         }
     texts = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
     table_texts = [
@@ -737,7 +755,18 @@ def analyze_manual_density(docx_path: Path | None) -> dict:
     result_count = sum(1 for text in texts if _manual_result_note_text(text))
     mechanical_label_count = _manual_mechanical_label_count(texts)
     repeated_phrase_count = _manual_repeated_phrase_count(joined)
+    generic_sentence_count = _manual_generic_sentence_count(texts)
+    semantic_anchor_count = _manual_semantic_anchor_count(texts)
     average_chars = round(character_count / max(paragraph_count, 1), 2)
+    generic_sentence_ratio = round(generic_sentence_count / max(paragraph_count, 1), 3)
+    semantic_anchor_ratio = round(semantic_anchor_count / max(paragraph_count, 1), 3)
+    template_risk_level = _manual_template_risk_level(
+        generic_sentence_count,
+        generic_sentence_ratio,
+        repeated_phrase_count,
+        paragraph_count,
+        semantic_anchor_ratio,
+    )
     figure_paragraphs = [
         paragraph
         for paragraph in document.paragraphs
@@ -779,6 +808,11 @@ def analyze_manual_density(docx_path: Path | None) -> dict:
         "manual_result_note_count": result_count,
         "manual_mechanical_label_count": mechanical_label_count,
         "manual_repeated_phrase_count": repeated_phrase_count,
+        "manual_generic_sentence_count": generic_sentence_count,
+        "manual_generic_sentence_ratio": generic_sentence_ratio,
+        "manual_semantic_anchor_count": semantic_anchor_count,
+        "manual_semantic_anchor_ratio": semantic_anchor_ratio,
+        "manual_template_risk_level": template_risk_level,
         "manual_layout_profile": "global-adaptive-v1",
         "manual_figure_paragraph_count": len(figure_paragraphs),
         "manual_guarded_figure_count": guarded_figure_count,
@@ -949,7 +983,10 @@ def analyze_manual_ui_consistency(
                 visible_reference = str(visible_reference or "").strip()
                 if len(_manual_ui_token(manual_reference)) < 2:
                     continue
-                if manual_reference in manual_semantic_text and not _manual_semantic_term_covered(visible_reference, visible_token):
+                if _manual_reference_requires_visible_match(
+                    manual_reference,
+                    manual_semantic_text,
+                ) and not _manual_semantic_term_covered(visible_reference, visible_token):
                     missing_references.append(manual_reference)
             if missing_references:
                 semantic_mismatches.append(
@@ -999,6 +1036,25 @@ def analyze_manual_ui_consistency(
     }
 
 
+def _manual_reference_requires_visible_match(reference: str, manual_text: str) -> bool:
+    if reference not in manual_text:
+        return False
+    # Workflow preconditions may legitimately describe records as already
+    # archived or printable without claiming that the current screenshot has
+    # an archive/print control.  Only explicit UI-action wording should make
+    # these generic verbs part of the visible-page consistency gate.
+    if reference in {"归档", "打印"}:
+        escaped = re.escape(reference)
+        return bool(
+            re.search(
+                rf"(?:点击|选择|执行|使用|通过)[^。；\n]{{0,12}}{escaped}|"
+                rf"【{escaped}】|{escaped}(?:按钮|入口|操作)",
+                manual_text,
+            )
+        )
+    return True
+
+
 def _manual_paragraph_action_labels(paragraph) -> list[str]:
     labels: list[str] = []
     try:
@@ -1043,6 +1099,11 @@ def _manual_semantic_term_covered(term: str, manual_token: str) -> bool:
         "来源计划版本": ("来源版本", "计划版本"),
         "预测范围": ("影响范围", "预测周期"),
         "生产工单进度": ("订单完工进度", "生产进度"),
+        # "状态条件" is a generic instruction-manual phrase.  Mobile
+        # screens commonly name the concrete status by business object, such
+        # as "会话状态" or "下载状态".  Treat those labels as equivalent
+        # while retaining the visible-page check for unrelated terms.
+        "状态条件": ("会话状态", "任务状态", "下载状态", "解析状态", "传输状态"),
     }
     for alias in semantic_aliases.get(str(term or "").strip(), ()):
         alias_token = _manual_ui_token(alias)
@@ -1115,6 +1176,52 @@ def _manual_repeated_phrase_count(text: str) -> int:
         "新增、编辑、审核、导出、日志、校验、权限联动",
     )
     return sum(max(0, str(text or "").count(phrase) - 1) for phrase in phrases)
+
+
+def _manual_generic_sentence_count(texts: list[str]) -> int:
+    """Count repeated generic openings without treating normal business wording as a failure."""
+    openings: dict[str, int] = {}
+    generic_prefixes = ("页面", "本页", "系统", "用户", "该界面", "相关数据", "此页面", "功能")
+    strong_anchor = re.compile(r"(字段|指标|状态|记录|对象|条件|范围|角色|权限|筛选|查询|搜索|保存|提交|确认|审核|导出|下载|刷新|返回|进入|填写|编号|名称)")
+    for text in texts:
+        value = re.sub(r"\s+", "", str(text or "").strip())
+        if len(value) < 12 or not value.startswith(generic_prefixes) or strong_anchor.search(value):
+            continue
+        opening = value[:6]
+        openings[opening] = openings.get(opening, 0) + 1
+    repeated_openings = sum(max(0, count - 2) for count in openings.values())
+    prefix_count = sum(
+        1
+        for text in texts
+        if (
+            re.sub(r"\s+", "", str(text or "").strip()).startswith(generic_prefixes)
+            and not strong_anchor.search(re.sub(r"\s+", "", str(text or "").strip()))
+        )
+    )
+    return max(repeated_openings, prefix_count // 4)
+
+
+def _manual_semantic_anchor_count(texts: list[str]) -> int:
+    anchor_pattern = re.compile(
+        r"(字段|指标|状态|记录|对象|条件|范围|角色|权限|按钮|筛选|查询|搜索|保存|提交|确认|审核|导出|下载|刷新|返回|进入|填写|选择|结果|日志|时间|编号|名称)"
+    )
+    return sum(1 for text in texts if anchor_pattern.search(str(text or "")))
+
+
+def _manual_template_risk_level(
+    generic_count: int,
+    generic_ratio: float,
+    repeated_count: int,
+    paragraph_count: int,
+    semantic_anchor_ratio: float,
+) -> str:
+    if paragraph_count <= 0:
+        return "unknown"
+    if (generic_ratio >= 0.55 and semantic_anchor_ratio < 0.55) or repeated_count >= 10:
+        return "high"
+    if generic_ratio >= 0.35 or repeated_count >= 5 or semantic_anchor_ratio < 0.45:
+        return "medium"
+    return "low"
 
 
 def generate_source_docx(task: GenerationTask, source_dir: Path, output_dir: Path) -> tuple[Path, dict]:
@@ -2542,30 +2649,76 @@ def _figure_note_templates(title: str, caption: str) -> list[str]:
             "页面会按照当前用户权限展示可访问模块和统计范围。",
             "切换菜单或筛选条件后，系统会刷新指标、列表和最近处理记录。",
         ]
-    return [
-        f"用户可从功能菜单进入{title}，系统会保留当前角色的数据范围和最近一次筛选条件。",
-        f"{title}在提交前会检查必填字段、状态流转和关联记录，避免无效数据进入后续流程。",
-        f"{title}的查询、保存、导出和状态变更均会写入操作日志，便于后续审计追踪。",
-        f"不同岗位进入{title}后，看到的菜单、按钮和数据范围会按角色授权自动控制。",
+    variants = [
+        [
+            f"用户可从功能菜单进入{title}，系统会保留当前角色的数据范围和最近一次筛选条件。",
+            f"{title}在提交前会检查必填字段、状态流转和关联记录，避免无效数据进入后续流程。",
+            f"{title}的查询、保存、导出和状态变更均会写入操作日志，便于后续审计追踪。",
+            f"不同岗位进入{title}后，看到的菜单、按钮和数据范围会按角色授权自动控制。",
+        ],
+        [
+            f"进入{title}后，可先按业务范围定位记录，再根据当前状态选择后续处理动作。",
+            f"填写或调整{title}中的业务字段时，页面会同步校验必填项、关联关系和状态顺序。",
+            f"查询结果、保存记录和状态变化都会留下操作时间与处理人员，方便后续复核。",
+            f"页面显示的功能入口会随岗位权限变化，用户只会看到授权范围内的数据和操作。",
+        ],
+        [
+            f"{title}把查询条件、业务记录和处理入口放在同一工作区，便于连续完成当前任务。",
+            f"提交{title}相关信息前，应核对编号、名称、状态和关联记录，避免把不完整数据带入流程。",
+            f"完成查询、保存或导出后，可通过处理时间、操作人员和最新状态确认结果是否已经落库。",
+            f"不同角色进入{title}时，系统按数据范围和菜单授权调整可见内容。",
+        ],
     ]
+    selected = _stable_manual_variant(f"{title_text}|{caption}", len(variants))
+    return variants[selected]
 
 
-def _expand_paragraphs(paragraphs: list[str], min_count: int, max_count: int | None = None) -> list[str]:
+def _expand_paragraphs(
+    paragraphs: list[str],
+    min_count: int,
+    max_count: int | None = None,
+    *,
+    context: str = "",
+) -> list[str]:
     result = [_natural_manual_note(text) for text in paragraphs if str(text).strip()]
     if max_count:
         result = result[:max_count]
-    templates = [
-        "系统在处理该部分业务时，会同步记录创建时间、更新时间、处理状态和操作人员，方便后续追溯。",
-        "页面提供条件筛选、列表展示、详情查看、状态维护和导出等常用操作，满足日常管理需要。",
-        "当用户提交数据后，系统会执行字段校验和业务规则校验，避免重复、缺失或状态异常的数据进入流程。",
-        "相关数据可进入统计分析模块，为管理人员进行趋势判断和工作安排提供依据。",
-        "该功能与角色权限联动，不同岗位只能访问授权范围内的数据和操作按钮。",
+    templates_by_variant = [
+        [
+            "系统在处理该部分业务时，会同步记录创建时间、更新时间、处理状态和操作人员，方便后续追溯。",
+            "页面提供条件筛选、列表展示、详情查看、状态维护和导出等常用操作，满足日常管理需要。",
+            "当用户提交数据后，系统会执行字段校验和业务规则校验，避免重复、缺失或状态异常的数据进入流程。",
+            "相关数据可进入统计分析模块，为管理人员进行趋势判断和工作安排提供依据。",
+            "该功能与角色权限联动，不同岗位只能访问授权范围内的数据和操作按钮。",
+        ],
+        [
+            "处理过程中会保留创建时间、更新时间、当前状态和操作人员，后续可以按记录追溯处理经过。",
+            "用户可先缩小查询范围，再打开详情、维护状态或导出结果，减少在无关记录之间切换。",
+            "提交前页面会检查必填字段、重复数据和状态顺序，校验通过后才进入下一步流程。",
+            "完成本模块处理后，相关记录可在统计分析中按时间、组织和状态进行汇总。",
+            "菜单入口与数据范围跟随岗位授权变化，未授权用户不会看到受限记录或操作按钮。",
+        ],
+        [
+            "页面会把处理时间、当前状态和经办人员留在业务记录中，便于后续查看和复核。",
+            "从筛选条件开始定位目标记录，再进入详情或编辑区域完成当前业务动作。",
+            "保存或提交时，系统同时核对字段完整性、关联记录和状态流转，避免异常数据继续向下传递。",
+            "模块形成的结果可以进入统计页面，用于判断处理进度、完成情况和异常分布。",
+            "不同岗位按照各自的数据权限使用本功能，菜单、按钮和可见记录会相应调整。",
+        ],
     ]
+    templates = templates_by_variant[_stable_manual_variant(context or "manual", len(templates_by_variant))]
     index = 0
     while len(result) < min_count:
         result.append(_natural_manual_note(templates[index % len(templates)]))
         index += 1
     return result[:max_count] if max_count else result
+
+
+def _stable_manual_variant(seed: str, count: int) -> int:
+    if count <= 1:
+        return 0
+    digest = hashlib.sha1(str(seed or "manual").encode("utf-8", errors="ignore")).hexdigest()
+    return int(digest[:8], 16) % count
 
 
 def _natural_manual_note(text: str, *, title: str = "", caption: str = "") -> str:
@@ -2896,14 +3049,27 @@ def _login_visible_labels(item, candidates: tuple[str, ...], limit: int = 6) -> 
     return labels
 
 
+def _login_credential_labels(item) -> list[str]:
+    # Preserve captured account names; omit help text and changing captcha values.
+    labels = [
+        label
+        for label in _manual_visible_field_labels(_visible_content_values(item, "fields", 20), limit=20)
+        if re.search(r"账号|账户|用户名|手机号|手机号码|邮箱|工号|密码|验证码", label)
+        and not re.search(r"记住|显示|刷新|忘记|找回|自动登录", label)
+    ]
+    if labels:
+        return labels[:6]
+    return _login_visible_labels(
+        item,
+        ("生产运营账号", "登录账号", "用户账号", "用户名", "手机号", "工号", "登录密码", "密码", "图形验证码", "短信验证码", "验证码"),
+    )
+
+
 def _visible_content_caption(item, fallback: str = "") -> str:
     if not _visible_content_summary_ready(item):
         return fallback
     if str(getattr(item, "page_kind", "") or "") == "login":
-        credentials = _login_visible_labels(
-            item,
-            ("生产运营账号", "登录账号", "用户账号", "用户名", "手机号", "工号", "登录密码", "密码", "图形验证码", "短信验证码", "验证码"),
-        )
+        credentials = _login_credential_labels(item)
         contexts = _login_visible_labels(item, ("工厂运行环境", "运行环境", "岗位身份", "用户角色", "登录角色"))
         return f"页面展示身份认证入口，并包含{_join_items([*credentials, *contexts]) or '账号、密码、验证码和身份选择'}等当前可见登录信息。"
     headings = _visible_content_values(item, "headings", 3)
@@ -2912,10 +3078,17 @@ def _visible_content_caption(item, fallback: str = "") -> str:
     statuses = _visible_content_values(item, "statuses", 3)
     primary = headings or metrics or fields
     secondary = metrics if headings else fields if metrics else statuses
+    seed = f"{getattr(item, 'key', '')}|{getattr(item, 'title', '')}|{fallback}"
     if primary and secondary:
-        return f"页面展示{_join_items(primary)}，并呈现{_join_items(secondary)}等当前可见业务信息。"
+        if _stable_manual_variant(seed, 3) == 0:
+            return f"页面展示{_join_items(primary)}，并呈现{_join_items(secondary)}等当前可见业务信息。"
+        if _stable_manual_variant(seed, 3) == 1:
+            return f"围绕{_join_items(primary)}，页面同时给出{_join_items(secondary)}，便于核对当前业务进展。"
+        return f"进入{str(getattr(item, 'title', '') or fallback or '本页')}后，可从{_join_items(primary)}定位记录，并结合{_join_items(secondary)}判断处理结果。"
     if primary:
-        return f"页面展示{_join_items(primary)}等当前可见业务信息和处理入口。"
+        if _stable_manual_variant(seed, 2) == 0:
+            return f"页面展示{_join_items(primary)}等当前可见业务信息和处理入口。"
+        return f"本页围绕{_join_items(primary)}组织内容，并保留继续处理所需的业务入口。"
     return fallback
 
 
@@ -2929,10 +3102,7 @@ def _visible_content_operation_notes(item, title: str, *, main_page: bool = Fals
     filters = _visible_content_values(item, "filters", 5)
     actions = _visible_content_action_labels(item, limit=6)
     if str(getattr(item, "page_kind", "") or "") == "login":
-        credentials = _login_visible_labels(
-            item,
-            ("生产运营账号", "登录账号", "用户账号", "用户名", "手机号", "工号", "登录密码", "密码", "图形验证码", "短信验证码", "验证码"),
-        )
+        credentials = _login_credential_labels(item)
         contexts = _login_visible_labels(item, ("工厂运行环境", "运行环境", "岗位身份", "用户角色", "登录角色"))
         primary = next((label for label in actions if label.startswith(("进入", "登录", "提交"))), "登录按钮")
         notes = [
@@ -3133,10 +3303,7 @@ def _visible_content_intro_paragraphs(item, title: str) -> list[str]:
     filters = _visible_content_values(item, "filters", 4)
     actions = _visible_content_action_labels(item)
     if str(getattr(item, "page_kind", "") or "") == "login":
-        credential_fields = _login_visible_labels(
-            item,
-            ("生产运营账号", "登录账号", "用户账号", "用户名", "工号", "登录密码", "密码", "图形验证码", "验证码"),
-        )
+        credential_fields = _login_credential_labels(item)
         contexts = _login_visible_labels(item, ("工厂运行环境", "运行环境", "岗位身份", "用户角色", "登录角色"))
         primary = next((label for label in actions if label.startswith(("进入", "登录", "提交"))), "登录按钮")
         paragraphs = [
@@ -3148,16 +3315,27 @@ def _visible_content_intro_paragraphs(item, title: str) -> list[str]:
         return paragraphs
     paragraphs: list[str] = []
     if headings:
-        paragraphs.append(f"{title}围绕{_join_items(headings)}组织页面内容，各区域共同呈现当前业务记录和处理结果。")
+        if _stable_manual_variant(f"{getattr(item, 'key', '')}|{title}", 3) == 0:
+            paragraphs.append(f"{title}围绕{_join_items(headings)}组织页面内容，各区域共同呈现当前业务记录和处理结果。")
+        elif _stable_manual_variant(f"{getattr(item, 'key', '')}|{title}", 3) == 1:
+            paragraphs.append(f"进入{title}后，可从{_join_items(headings)}定位当前记录，并在同一工作区查看处理结果。")
+        else:
+            paragraphs.append(f"{title}把{_join_items(headings)}放在同一业务工作区，便于用户连续核对记录和状态。")
     elif metrics or fields:
-        paragraphs.append(f"{title}主要展示{_join_items(metrics or fields)}，便于用户核对当前业务情况。")
+        if _stable_manual_variant(f"{getattr(item, 'key', '')}|{title}", 2) == 0:
+            paragraphs.append(f"{title}主要展示{_join_items(metrics or fields)}，便于用户核对当前业务情况。")
+        else:
+            paragraphs.append(f"在{title}中，可直接查看{_join_items(metrics or fields)}并判断当前业务进展。")
     if filters or actions:
         parts: list[str] = []
         if filters:
             parts.append(f"通过{_join_items(filters)}调整查看范围")
         if actions:
             parts.append(f"使用{_join_items(actions)}继续处理")
-        paragraphs.append("用户可" + "，并".join(parts) + "，页面会显示对应的状态和结果。")
+        if _stable_manual_variant(f"{getattr(item, 'key', '')}|{title}|actions", 2) == 0:
+            paragraphs.append("用户可" + "，并".join(parts) + "，页面会显示对应的状态和结果。")
+        else:
+            paragraphs.append("先" + "，再".join(parts) + "；完成后可在页面中核对最新状态和处理结果。")
     return paragraphs[:2]
 
 
@@ -3985,8 +4163,13 @@ def _content_paragraphs(
     if manual_content:
         paragraphs = manual_content.get(key)
         if isinstance(paragraphs, list) and paragraphs:
-            return _expand_paragraphs([str(item) for item in paragraphs], min_count=min_count, max_count=max(min_count, 3))
-    return _expand_paragraphs(fallback, min_count=min_count)
+            return _expand_paragraphs(
+                [str(item) for item in paragraphs],
+                min_count=min_count,
+                max_count=max(min_count, 3),
+                context=key,
+            )
+    return _expand_paragraphs(fallback, min_count=min_count, context=key)
 
 
 def _module_content_paragraphs(manual_content: dict | None, module_key: str) -> list[str] | None:
@@ -4066,6 +4249,34 @@ def _extend_faq_paragraphs(
         "页面中的图片、附件或预览内容无法显示时，应先确认文件仍在有效期内，并检查浏览器是否允许加载和下载。重新进入详情页后仍无内容时，可根据业务编号核对附件记录和上传状态。",
         "统计结果与业务台账不一致时，应确认两处使用的组织范围、统计时间、状态口径和数据版本相同。完成条件校准后重新统计，并通过明细列表抽查异常记录的处理轨迹。",
         "发现同一业务对象可能被重复登记时，应先使用业务编号、名称和发生时间进行检索。已有记录尚在处理中时，应进入原记录继续办理；确认属于重复数据后，再按权限执行撤回或作废。",
+    ]
+    for candidate in candidates:
+        if len(result) >= max(3, int(target_count or 0)):
+            break
+        if candidate not in result:
+            result.append(candidate)
+    return result
+
+
+def _extend_security_paragraphs(
+    blueprint: ProductBlueprint,
+    paragraphs: list[str],
+    target_count: int = 6,
+) -> list[str]:
+    result = [str(item).strip() for item in paragraphs if str(item).strip()]
+    roles = _join_items(blueprint.target_users or blueprint.roles) or "业务管理员、审核人员和普通用户"
+    module_titles = [str(module.title or "").strip() for module in blueprint.modules if str(module.title or "").strip()]
+    primary_modules = _join_items(module_titles[:4]) or "核心业务模块"
+    quality_rules = [_clean_rule_text(item) for item in (blueprint.quality_rules or []) if _clean_rule_text(item)]
+    first_rule = quality_rules[0] if quality_rules else "关键字段完整、业务状态有效且关联对象处于可操作范围"
+    relation_text = _join_items(blueprint.data_relations[:4]) or "业务记录、处理状态与操作日志"
+    candidates = [
+        f"系统按照最小权限原则为{roles}分配菜单、按钮和数据范围。用户进入{primary_modules}时，页面仅展示当前岗位可查看和可处理的对象，未授权入口保持隐藏，直接访问受限地址时系统拒绝请求并记录拦截原因。",
+        f"新增、修改、审核、撤销和关闭等状态变更操作在提交前必须校验当前记录版本、操作者权限和业务前置条件；其中{first_rule}，校验失败时不写入业务结果。",
+        f"系统围绕{relation_text}保存审计链路，记录操作账号、所属岗位、发生时间、变更前后状态、处理原因和请求追踪号，便于管理员按业务编号复核完整过程。审计记录只允许查询和留存，不随业务记录编辑而覆盖。",
+        "登录会话超过有效期、账号被停用或岗位权限发生变化时，系统要求重新认证并刷新权限快照。连续认证失败和异常访问会写入安全日志，避免旧会话继续执行敏感操作。",
+        "查询、统计、导出和打印均沿用当前账号的数据范围与脱敏规则。导出文件记录筛选条件、生成时间和操作人员，敏感字段按岗位权限隐藏，下载失败不会改变原业务记录，相关结果可供后续复核。",
+        "管理员应定期复核异常登录、高频失败、重复提交、越权拦截和高风险状态变更。发现异常后可按审计记录定位关联对象，并通过停用账号、撤销权限或关闭风险任务完成处置。",
     ]
     for candidate in candidates:
         if len(result) >= max(3, int(target_count or 0)):

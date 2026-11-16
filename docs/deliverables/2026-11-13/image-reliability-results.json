@@ -1,0 +1,2859 @@
+{
+  "updated_at": "2026-11-13T14:52:20.858326+08:00",
+  "scope": "copied education output, real API resume, same seed and client config; not a fresh first-pass sample",
+  "prior_first_pass_success": "1/3",
+  "prior_first_pass_results_unchanged": true,
+  "config_files_unchanged": true,
+  "channel_diagnosis": {
+    "started_at": "2026-11-13T14:34:52.585223+08:00",
+    "config_files_unchanged": true,
+    "image_model": "gpt-image-2",
+    "image_key_configured": true,
+    "image_and_text_endpoint_same": true,
+    "requests": [
+      {
+        "label": "image_models_authenticated",
+        "http_status": 200,
+        "content_type": "application/json",
+        "target_model_listed": true,
+        "elapsed_seconds": 1.146
+      },
+      {
+        "label": "image_models_without_key",
+        "http_status": 401,
+        "content_type": "application/json",
+        "error": "{\"code\":\"API_KEY_REQUIRED\",\"message\":\"API key is required in Authorization header (Bearer [已隐藏]), x-api-key header, or x-goog-api-key header\"}",
+        "elapsed_seconds": 1.16
+      }
+    ],
+    "finished_at": "2026-11-13T14:34:54.891537+08:00"
+  },
+  "education_recovery": {
+    "passed": true,
+    "exit_code": 0,
+    "timed_out": false,
+    "elapsed_seconds": 585.13,
+    "ready_for_delivery": true,
+    "zip_integrity_ok": true,
+    "zip_file_count": 5,
+    "prompt_cache_reused": true,
+    "text_success_count": 35,
+    "event_counts": {
+      "ai_visual_prompt_reused": 1,
+      "provider_image_request_begin": 1,
+      "provider_image_request_success": 1,
+      "ai_frontend_provider_config": 1,
+      "ai_frontend_reference_contract_ready": 1,
+      "page_spec_request_context": 35,
+      "provider_request_begin": 35,
+      "provider_request_success": 35
+    },
+    "backend_sources_unchanged": true
+  },
+  "image_attempts": 1,
+  "image_events": [
+    {
+      "attempt": 1,
+      "event": "provider_image_request_begin",
+      "label": "ui_visual_reference:style_reference",
+      "model": "gpt-image-2",
+      "prompt_chars": 860,
+      "provider": "custom",
+      "size": "1280x720",
+      "slow_failure_limit": 2,
+      "slow_failure_seconds": 60,
+      "timeout": 220,
+      "total_attempts": 4,
+      "ts": "2026-11-13T14:42:13.015+08:00"
+    },
+    {
+      "attempt": 1,
+      "bytes": 962795,
+      "elapsed_seconds": 44.735,
+      "event": "provider_image_request_success",
+      "label": "ui_visual_reference:style_reference",
+      "model": "gpt-image-2",
+      "source": "b64_json",
+      "status_code": 200,
+      "total_elapsed_seconds": 44.735,
+      "ts": "2026-11-13T14:42:57.746+08:00"
+    }
+  ],
+  "checks": {
+    "generation_quality_profile": "balanced",
+    "blueprint_quality_target": 86,
+    "auto_feature_hint": false,
+    "feature_hint_profile": "resume-stage-cache",
+    "feature_hint_source": "resume-stage-cache",
+    "stage_cache_enabled": true,
+    "stage_cache_key": "31aa9cacdca29a066f8c1b12",
+    "stage_cache_hits": [
+      "blueprint",
+      "technical_architecture",
+      "manual_content",
+      "ui_blueprint"
+    ],
+    "accepted_blueprint_configured": false,
+    "accepted_blueprint_ready": false,
+    "blueprint_cache_previous_quality_score": 100,
+    "blueprint_cache_normalized": true,
+    "blueprint_cache_normalized_quality_score": 100,
+    "blueprint_cache_quality_warnings": [],
+    "blueprint_operation_contract_ready": true,
+    "blueprint_operation_contract_issues": [],
+    "blueprint_operation_contract_quality_warnings": [],
+    "blueprint_operation_contract_repair_actions": [],
+    "blueprint_structured_operation_count": 24,
+    "blueprint_request_count": 0,
+    "blueprint_task_domain_ready": true,
+    "blueprint_task_domain_issues": [],
+    "blueprint_source": "llm",
+    "software_category": "应用软件",
+    "technical_architecture": "数据分析服务与 Web 管理架构",
+    "technical_architecture_source": "llm",
+    "technical_architecture_key": "data_ai_service",
+    "source_strategy": "python_with_web_console",
+    "source_language": "Python/JavaScript/SQL",
+    "blueprint_quality_score": 100,
+    "blueprint_fingerprint": "aa4ad4d3470642c1",
+    "blueprint_business_object_count": 11,
+    "blueprint_workflow_count": 4,
+    "blueprint_metric_count": 11,
+    "blueprint_module_detail_ready": true,
+    "ui_visual_reference_before_source_ready": true,
+    "source_visual_reference_contract": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\image-reliability-20261113-143452\\education\\output\\校园作业批改与学情分析软件-real-run-192936-2\\generated_source\\ui-visual-reference-contract.json",
+    "source_persistence_required": true,
+    "source_persistence_engine": "sqlite",
+    "source_persistence_ready": true,
+    "source_repository_file_count": 9,
+    "source_migration_file_count": 1,
+    "source_test_file_count": 2,
+    "page_engine_cache_migrated": false,
+    "page_engine_previous_version": "",
+    "page_engine_invalidated_file_count": 0,
+    "ui_screenshot_count": 35,
+    "ui_visible_content_summary_count": 35,
+    "ui_visible_content_summary_ready": true,
+    "ui_navigation_contract_version": "navigation-contract-v1",
+    "ui_navigation_contract_count": 34,
+    "ui_navigation_level_count": 4,
+    "ui_navigation_levels": [
+      "action",
+      "analysis",
+      "module",
+      "root"
+    ],
+    "ui_secondary_navigation_page_count": 34,
+    "ui_back_navigation_page_count": 33,
+    "ui_navigation_contract_issues": [],
+    "ui_navigation_contract_ready": true,
+    "ui_instant_interaction_count": 0,
+    "ui_confirmation_interaction_count": 0,
+    "ui_blueprint_source": "llm",
+    "ui_ai_frontend_enabled": true,
+    "ui_ai_frontend_ready": true,
+    "ui_ai_frontend_source": "gpt-style-reference-image2-to-pagespec-react-vite",
+    "ui_frontend_framework": "react",
+    "ui_frontend_build_tool": "vite",
+    "ui_frontend_source_dir": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\image-reliability-20261113-143452\\education\\output\\校园作业批改与学情分析软件-real-run-192936-2\\generated_source\\frontend-app",
+    "ui_ai_frontend_page_count": 35,
+    "page_spec_count": 35,
+    "legacy_react_page_count": 0,
+    "model_generated_react_page_count": 0,
+    "frontend_generation_mode": "pagespec-hybrid",
+    "frontend_effective_workers": 2,
+    "frontend_final_worker_limit": 2,
+    "frontend_concurrency_recoveries": 0,
+    "frontend_concurrency_degraded": false,
+    "frontend_concurrency_degrade_reason": "",
+    "frontend_cancelled_page_count": 0,
+    "frontend_page_request_timing": {
+      "count": 35,
+      "min_seconds": 6.97,
+      "max_seconds": 50.662,
+      "avg_seconds": 28.039,
+      "p95_seconds": 42.64
+    },
+    "provider_retry_summary": {
+      "logical_requests": 35,
+      "request_attempts": 35,
+      "provider_retries": 0,
+      "error_categories": {},
+      "stop_reasons": {}
+    },
+    "ui_shared_confirmation_contract": "shared-confirm-dialog-v1",
+    "ui_shared_confirmation_page_count": 0,
+    "ui_shared_confirmation_ready": true,
+    "ui_visual_prompt_ready": true,
+    "ui_visual_reference_ready": true,
+    "ui_visual_reference_mode": "style_reference",
+    "ui_visual_reference_source": "gpt-style-reference-prompt+image2",
+    "ui_visual_reference_count": 1,
+    "ui_visual_reference_target_count": 1,
+    "ui_visual_reference_page_count": 35,
+    "ui_visual_reference_applies_to_page_count": 35,
+    "ui_visual_style_reference_ready": true,
+    "ui_visual_reference_image_model": "gpt-image-2",
+    "ui_visual_reference_retry_count": 3,
+    "ui_visual_reference_failed_page": "",
+    "ui_visual_reference_error": "",
+    "ui_visual_reference_directory": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\image-reliability-20261113-143452\\education\\output\\校园作业批改与学情分析软件-real-run-192936-2\\generated_source\\ui-prototype\\visual-references",
+    "ui_visual_reference_to_code_ready": true,
+    "ui_renderer": "admin",
+    "ui_layout_variant": "kanban",
+    "ui_software_category": "应用软件",
+    "ui_product_type": "教育软件",
+    "ui_experience_shape": "education_lms",
+    "ui_terminal": "teaching_workstation",
+    "ui_experience_shell": "education_lms_console",
+    "ui_family": "education_workflow",
+    "ui_viewport_mode": "landscape_1280x820",
+    "ui_experience_match_ready": true,
+    "ui_industry_subtype": "K12在线教学平台",
+    "ui_nav_model": "top_tabs",
+    "ui_visual_mood": "教务高密度管理界面",
+    "ui_dashboard_pattern": "流程看板与状态泳道",
+    "ui_module_pattern": "风险研判 / 业务台账 / 指标矩阵",
+    "ui_workspace_shape": "freeform_grid",
+    "ui_login_pattern": "split_brand",
+    "ui_visual_identity_signature": "1d1f417be408309a2ee1",
+    "ui_visual_seed": "ed6a100f860b1ffdfc70447a",
+    "ui_creative_seed": "real-run-192936-2",
+    "ui_palette_key": "civic_blue",
+    "ui_table_density": "regular",
+    "ui_chart_style": "line",
+    "ui_surface_style": "outlined",
+    "ui_component_rhythm": "compact",
+    "ui_similarity_gate_ready": true,
+    "ui_similarity_max_score": 0.0,
+    "ui_similarity_attempts": 1,
+    "ui_similarity_nearest_hash": "",
+    "ui_layout_role_count": 6,
+    "ui_package_page_max_similarity": 0.7854,
+    "ui_similarity_reason": "no_history_baseline",
+    "ui_page_composition_version": "page-composition-v1",
+    "ui_page_composition_ready": true,
+    "ui_page_composition_count": 35,
+    "ui_page_composition_family_count": 6,
+    "ui_page_composition_variant_count": 6,
+    "ui_page_composition_signature_count": 31,
+    "ui_page_composition_diversity_score": 0.9257,
+    "ui_page_composition_families": [
+      "analysis",
+      "authentication",
+      "entry-detail",
+      "kanban",
+      "records",
+      "result"
+    ],
+    "ui_page_composition_variants": [
+      "analysis-matrix",
+      "asymmetric-left",
+      "asymmetric-right",
+      "balanced-grid",
+      "detail-rail",
+      "workflow-focus"
+    ],
+    "ui_page_composition_sequence": [
+      "detail-rail",
+      "balanced-grid",
+      "asymmetric-right",
+      "detail-rail",
+      "detail-rail",
+      "balanced-grid",
+      "analysis-matrix",
+      "detail-rail",
+      "asymmetric-left",
+      "asymmetric-left",
+      "balanced-grid",
+      "detail-rail",
+      "detail-rail",
+      "asymmetric-left",
+      "asymmetric-right",
+      "analysis-matrix",
+      "asymmetric-left",
+      "workflow-focus",
+      "asymmetric-right",
+      "balanced-grid",
+      "asymmetric-left",
+      "detail-rail",
+      "detail-rail",
+      "asymmetric-left",
+      "asymmetric-left",
+      "workflow-focus",
+      "asymmetric-left",
+      "detail-rail",
+      "workflow-focus",
+      "balanced-grid",
+      "balanced-grid",
+      "asymmetric-right",
+      "balanced-grid",
+      "asymmetric-left",
+      "asymmetric-right"
+    ],
+    "ui_page_composition_duplicate_groups": [
+      [
+        "class_course_operation_3_3",
+        "student_submission_operation_3_3"
+      ],
+      [
+        "assignment_publish_operation_2_2",
+        "student_submission_operation_2_2"
+      ],
+      [
+        "assignment_publish_operation_4_4",
+        "learning_report_operation_4_4"
+      ],
+      [
+        "student_submission_operation_4_4",
+        "grade_feedback_operation_3_3"
+      ]
+    ],
+    "ui_page_composition_issues": [],
+    "ui_structure_id": "b4430a17df15dc99",
+    "ui_domain_bias": "learning",
+    "ui_layout_signature": "k12_teaching:workflow:side_menu:freeform_grid:portal_grid:学习路径+批改队列:课程配置表单:查询",
+    "ui_secondary_mix": "查询、审核、统计、详情、导出",
+    "ui_role_signature": "446f3faeca5dce97",
+    "ui_role_count": 7,
+    "ui_role_screen_count": 11,
+    "ui_role_module_screen_count": 2,
+    "ui_role_has_login": true,
+    "ui_role_has_dashboard": true,
+    "ui_role_has_statistics": true,
+    "ui_software_type_match_raw": true,
+    "ui_software_type_match_deferred_for_resume": false,
+    "ui_software_type_match": true,
+    "ui_domain_terms_clean": true,
+    "ui_off_domain_term_hits": "",
+    "ui_module_keys_semantic": true,
+    "ui_placeholder_module_keys": "",
+    "ui_business_facing_screenshots": true,
+    "ui_screenshot_tech_leak_hits": "",
+    "ui_visible_text_clean": true,
+    "ui_visible_text_placeholder_hits": "",
+    "ui_visible_text_placeholder_details": "",
+    "ui_domain_profile_key": "general_business",
+    "ui_domain_profile_confidence": 0.6,
+    "ui_domain_profile_source": "generic-fallback",
+    "ui_domain_profile_evidence": "",
+    "ui_domain_profile_weak_evidence": "",
+    "ui_domain_profile_excluded_evidence": "",
+    "ui_domain_gate_keys": "",
+    "ui_domain_gate_reasons": "未启用交通线路拓扑门禁：当前领域不要求干线、支线接驳和服务时窗证据。",
+    "ui_transport_related": false,
+    "ui_route_topology_required": false,
+    "ui_operation_result_evidence_ready": true,
+    "ui_chart_context_ready": true,
+    "ui_route_topology_ready": true,
+    "ui_realism_missing_evidence": "",
+    "ui_secondary_screenshot_count": 24,
+    "ui_secondary_module_count": 8,
+    "ui_secondary_screenshot_ready": true,
+    "ui_operation_coverage_required_per_module": 3,
+    "ui_operation_coverage_module_count": 8,
+    "ui_operation_coverage_min_count": 3,
+    "ui_operation_coverage": {
+      "class_course": {
+        "module_title": "班级与课程",
+        "count": 3,
+        "required": 3,
+        "categories": [
+          "lookup",
+          "workflow",
+          "mutation"
+        ],
+        "ready": true
+      },
+      "assignment_publish": {
+        "module_title": "作业编排与布置",
+        "count": 3,
+        "required": 3,
+        "categories": [
+          "lookup",
+          "mutation",
+          "workflow"
+        ],
+        "ready": true
+      },
+      "student_submission": {
+        "module_title": "学生作答与提交",
+        "count": 3,
+        "required": 3,
+        "categories": [
+          "lookup",
+          "workflow",
+          "mutation"
+        ],
+        "ready": true
+      },
+      "submission_tracking": {
+        "module_title": "作业收交跟踪",
+        "count": 3,
+        "required": 3,
+        "categories": [
+          "lookup",
+          "mutation",
+          "workflow"
+        ],
+        "ready": true
+      },
+      "teacher_grading": {
+        "module_title": "教师逐题批改",
+        "count": 3,
+        "required": 3,
+        "categories": [
+          "lookup",
+          "workflow",
+          "mutation"
+        ],
+        "ready": true
+      },
+      "grade_feedback": {
+        "module_title": "成绩发布与反馈",
+        "count": 3,
+        "required": 3,
+        "categories": [
+          "lookup",
+          "mutation",
+          "workflow"
+        ],
+        "ready": true
+      },
+      "mistake_collection": {
+        "module_title": "错题归集与订正",
+        "count": 3,
+        "required": 3,
+        "categories": [
+          "lookup",
+          "workflow",
+          "mutation"
+        ],
+        "ready": true
+      },
+      "learning_report": {
+        "module_title": "学情报告编制",
+        "count": 3,
+        "required": 3,
+        "categories": [
+          "lookup",
+          "mutation",
+          "workflow"
+        ],
+        "ready": true
+      }
+    },
+    "ui_operation_coverage_missing": [],
+    "ui_operation_coverage_ready": true,
+    "ui_project_entry_exists": true,
+    "ui_project_entry_doc_exists": true,
+    "ui_project_served_dir_exists": true,
+    "ui_project_served_index_exists": true,
+    "ui_project_entry_url": "[URL]",
+    "ui_project_run_command": "uvicorn app.main:app --host 127.0.0.1 --port 8080",
+    "ui_screenshot_render_mode": "project-server",
+    "ui_screenshot_base_url": "[URL]",
+    "ui_project_server_started": true,
+    "ui_project_runtime_screenshot_ready": true,
+    "ui_project_server_url": "[URL]",
+    "ui_project_runtime_route_mode": "node-static",
+    "ui_project_runtime_command": "node web-console/src/server.js（包内 Python 缺少 FastAPI/Uvicorn 时使用生成项目备用入口）",
+    "ui_runtime_probe_ready": true,
+    "ui_runtime_probe_count": 4,
+    "ui_runtime_api_ready": true,
+    "ui_runtime_api_page_count": 35,
+    "ui_runtime_api_fetch_count": 41,
+    "ui_runtime_api_ok_fetch_count": 41,
+    "ui_source_evidence_ready": true,
+    "ui_source_evidence_module_count": 8,
+    "ui_source_evidence_file_hits": 80,
+    "ui_source_evidence_route_hits": 56,
+    "ui_source_evidence_service_hits": 32,
+    "ui_source_evidence_module_keys": "class_course、assignment_publish、student_submission、submission_tracking、teacher_grading、grade_feedback、mistake_collection、learning_report",
+    "ui_screenshot_aspect_ratio": "desktop",
+    "ui_admin_desktop_match": false,
+    "ui_industry_profile": "教育软件",
+    "manual_density_checked": true,
+    "manual_paragraph_count": 333,
+    "manual_character_count": 15277,
+    "manual_figure_count": 124,
+    "manual_figure_caption_count": 35,
+    "manual_operation_note_count": 5,
+    "manual_field_note_count": 65,
+    "manual_result_note_count": 40,
+    "manual_mechanical_label_count": 0,
+    "manual_repeated_phrase_count": 0,
+    "manual_generic_sentence_count": 0,
+    "manual_generic_sentence_ratio": 0.0,
+    "manual_semantic_anchor_count": 254,
+    "manual_semantic_anchor_ratio": 0.763,
+    "manual_template_risk_level": "low",
+    "manual_layout_profile": "global-adaptive-v1",
+    "manual_figure_paragraph_count": 35,
+    "manual_guarded_figure_count": 35,
+    "manual_guarded_caption_count": 35,
+    "manual_guarded_heading_count": 50,
+    "manual_numbered_step_count": 203,
+    "manual_pagination_constraints_ready": true,
+    "manual_numbered_steps_ready": true,
+    "manual_toc_ready": true,
+    "manual_natural_style_ready": true,
+    "manual_average_chars_per_paragraph": 45.88,
+    "manual_operation_density_ready": false,
+    "manual_ui_consistency_checked": true,
+    "manual_ui_consistency_ready": true,
+    "manual_ui_expected_figure_count": 35,
+    "manual_ui_actual_figure_count": 35,
+    "manual_ui_title_mismatch_count": 0,
+    "manual_ui_title_mismatches": [],
+    "manual_ui_button_mismatch_count": 0,
+    "manual_ui_button_mismatches": [],
+    "manual_ui_missing_button_coverage_count": 0,
+    "manual_ui_missing_button_coverage": [],
+    "manual_ui_semantic_checked_count": 35,
+    "manual_ui_semantic_mismatch_count": 0,
+    "manual_ui_semantic_mismatches": [],
+    "manual_ui_semantic_coverage_missing_count": 0,
+    "manual_ui_semantic_coverage_missing": [],
+    "manual_ui_semantic_ready": true,
+    "manual_ui_expected_renderer": "admin",
+    "manual_ui_renderer_mismatch_count": 0,
+    "manual_ui_renderer_mismatches": [],
+    "manual_docx_layout_checked": true,
+    "manual_docx_page_width_cm": 21.0,
+    "manual_docx_page_height_cm": 29.7,
+    "manual_docx_is_portrait": true,
+    "manual_docx_is_a4": true,
+    "manual_docx_header_page_number_field": true,
+    "manual_docx_header_page_number_right": true,
+    "manual_docx_header_bottom_border": true,
+    "manual_docx_footer_page_number_field": false,
+    "source_total_lines": 7400,
+    "source_total_pages": 148,
+    "source_selected_pages": 60,
+    "lines_per_page": 50,
+    "source_font_size_pt": 9,
+    "source_line_spacing_pt": 15.1,
+    "source_line_numbers_enabled": false,
+    "source_lines_per_page_exact_match": true,
+    "source_page_fill_strategy": "exact-50-lines-a4-physical-page-width-fitted",
+    "selection_mode": "first_30_last_30_continuous",
+    "source_material_order_manifest_used": true,
+    "source_material_order_strategy": "front-core-middle-support-tail-core",
+    "source_material_order_file_count": 85,
+    "source_presentation_filter_enabled": false,
+    "source_low_information_line_count": 164,
+    "source_low_information_line_ratio": 0.0547,
+    "source_accessor_boilerplate_line_count": 55,
+    "source_accessor_boilerplate_line_ratio": 0.0183,
+    "source_business_logic_line_count": 809,
+    "source_business_logic_line_ratio": 0.2697,
+    "source_candidate_low_information_line_ratio": 0.0547,
+    "source_selected_unique_file_count": 41,
+    "source_front_unique_file_count": 12,
+    "source_tail_unique_file_count": 29,
+    "source_max_selected_file_ratio": 0.089,
+    "source_unique_line_ratio": 0.2963,
+    "source_material_diversity_ready": true,
+    "source_continuous_selection": true,
+    "source_material_filler_line_count": 0,
+    "source_material_filler_line_ratio": 0,
+    "source_docx_layout_checked": true,
+    "source_docx_page_width_cm": 21.0,
+    "source_docx_page_height_cm": 29.7,
+    "source_docx_is_portrait": true,
+    "source_docx_is_a4": true,
+    "source_docx_header_page_number_field": true,
+    "source_docx_header_page_number_right": true,
+    "source_docx_header_bottom_border": true,
+    "source_docx_footer_page_number_field": false,
+    "manual_toc_page_numbers_ready": true,
+    "manual_toc_page_number_count": 15,
+    "manual_toc_missing_entries": [],
+    "manual_toc_page_numbers": {
+      "一、软件概述": 3,
+      "二、运行环境": 3,
+      "三、登录与主界面": 4,
+      "四、功能操作说明": 5,
+      "4.1 班级与课程": 5,
+      "4.2 作业编排与布置": 8,
+      "4.3 学生作答与提交": 11,
+      "4.4 作业收交跟踪": 14,
+      "4.5 教师逐题批改": 17,
+      "4.6 成绩发布与反馈": 20,
+      "4.7 错题归集与订正": 23,
+      "4.8 学情报告编制": 26,
+      "五、统计分析": 29,
+      "六、权限与安全": 30,
+      "七、常见问题处理": 31
+    },
+    "manual_pdf_layout_checked": true,
+    "manual_pdf_exists": true,
+    "manual_pdf_page_count": 31,
+    "manual_pdf_page_width_cm": 21.0,
+    "manual_pdf_page_height_cm": 29.7,
+    "manual_pdf_is_portrait": true,
+    "manual_pdf_is_a4": true,
+    "manual_pdf_text_density_checked": true,
+    "manual_pdf_text_density_ready": true,
+    "manual_pdf_minimum_lines_per_text_page": 30,
+    "manual_pdf_text_density_page_count": 8,
+    "manual_pdf_low_text_density_page_count": 0,
+    "manual_pdf_low_text_density_pages": [],
+    "manual_pdf_text_density_soft_pass_count": 2,
+    "manual_pdf_text_density_soft_pass_pages": [
+      {
+        "page": 3,
+        "line_count": 29,
+        "character_count": 858,
+        "reason": "near_threshold"
+      },
+      {
+        "page": 30,
+        "line_count": 27,
+        "character_count": 957,
+        "reason": "content_sufficient_page"
+      }
+    ],
+    "manual_pdf_text_density_figure_pass_count": 0,
+    "manual_pdf_text_density_figure_pass_pages": [],
+    "manual_pdf_line_requirement_risk_count": 2,
+    "manual_pdf_line_requirement_risk_pages": [
+      {
+        "page": 3,
+        "line_count": 29,
+        "character_count": 858
+      },
+      {
+        "page": 30,
+        "line_count": 27,
+        "character_count": 957
+      }
+    ],
+    "manual_pdf_line_requirement_warning": true,
+    "manual_pdf_min_text_page_line_count": 27,
+    "manual_pdf_average_text_page_line_count": 30.88,
+    "source_pdf_layout_checked": true,
+    "source_pdf_exists": true,
+    "source_pdf_page_count": 60,
+    "source_pdf_page_width_cm": 21.0,
+    "source_pdf_page_height_cm": 29.7,
+    "source_pdf_is_portrait": true,
+    "source_pdf_is_a4": true,
+    "pdf_conversion_method": "libreoffice",
+    "pdf_official_conversion_ready": true,
+    "software_name_consistent": true,
+    "version_consistent": true,
+    "source_line_target_met": true,
+    "docx_available": true,
+    "material_manual_text_source": "llm-content",
+    "material_ui_text_source": "llm",
+    "material_module_title_hits": 8,
+    "material_ui_module_title_hits": 8,
+    "material_manual_module_title_hits": 8,
+    "material_business_object_hits": 0,
+    "material_metric_hits": 0,
+    "material_domain_term_hits": 0,
+    "material_source_module_key_hits": 8,
+    "material_source_module_title_hits": 8,
+    "material_consistency_ready": false,
+    "authenticity_score": 85,
+    "authenticity_ready": true,
+    "normative_score": 100,
+    "normative_ready": true,
+    "validation_ready_for_delivery": true,
+    "validation_finding_count": 0,
+    "validation_source_file_count": 284,
+    "validation_source_hash": "242000838b8359a1a0c8e4321788a9602fae76a597bb2972206e399bb4c1c07e",
+    "validation_blueprint_operation_contract_required": true,
+    "validation_blueprint_operation_contract_ready": true,
+    "validation_blueprint_operation_contract_issues": [],
+    "validation_blueprint_structured_operation_count": 24,
+    "validation_blueprint_task_domain_ready": true,
+    "validation_blueprint_task_domain_issues": [],
+    "validation_zip_entries_match_deliverables": true,
+    "validation_placeholder_hit_count": 0,
+    "validation_ui_project_server_started": true,
+    "validation_ui_project_runtime_route_mode": "node-static",
+    "validation_ui_project_runtime_command": "node web-console/src/server.js（包内 Python 缺少 FastAPI/Uvicorn 时使用生成项目备用入口）",
+    "validation_ui_runtime_probe_ready": true,
+    "validation_ui_source_evidence_ready": true,
+    "validation_ui_screenshot_render_mode": "project-server",
+    "validation_ui_business_facing_screenshots": true,
+    "validation_ui_visible_content_summary_ready": true,
+    "validation_ui_visible_content_summary_count": 35,
+    "validation_ui_navigation_contract_ready": true,
+    "validation_ui_navigation_contract_version": "navigation-contract-v1",
+    "validation_ui_navigation_contract_count": 34,
+    "validation_ui_navigation_level_count": 4,
+    "validation_ui_secondary_navigation_page_count": 34,
+    "validation_ui_back_navigation_page_count": 33,
+    "validation_ui_operation_result_evidence_ready": true,
+    "validation_ui_operation_coverage_ready": true,
+    "validation_ui_operation_coverage_required_per_module": 3,
+    "validation_ui_operation_coverage_min_count": 3,
+    "validation_ui_chart_context_ready": true,
+    "validation_ui_route_topology_ready": true,
+    "validation_ui_route_topology_required": false,
+    "validation_ui_domain_profile_key": "general_business",
+    "validation_ui_domain_profile_confidence": 0.6,
+    "validation_ui_domain_profile_source": "generic-fallback",
+    "validation_ui_domain_profile_evidence": "",
+    "validation_ui_domain_profile_weak_evidence": "",
+    "validation_ui_domain_profile_excluded_evidence": "",
+    "validation_ui_domain_gate_keys": "",
+    "validation_ui_domain_gate_reasons": "未启用交通线路拓扑门禁：当前领域不要求干线、支线接驳和服务时窗证据。",
+    "validation_ui_realism_missing_evidence": "",
+    "validation_ui_visual_identity_signature": "1d1f417be408309a2ee1",
+    "validation_ui_similarity_gate_ready": true,
+    "validation_ui_similarity_max_score": 0.0,
+    "validation_ui_similarity_attempts": 1,
+    "validation_ui_layout_role_count": 6,
+    "validation_ui_similarity_nearest_hash": "",
+    "validation_ui_page_composition_version": "page-composition-v1",
+    "validation_ui_page_composition_ready": true,
+    "validation_ui_page_composition_count": 35,
+    "validation_ui_page_composition_family_count": 6,
+    "validation_ui_page_composition_variant_count": 6,
+    "validation_ui_page_composition_signature_count": 31,
+    "validation_ui_page_composition_diversity_score": 0.9257,
+    "validation_ui_shared_confirmation_contract": "shared-confirm-dialog-v1",
+    "validation_ui_shared_confirmation_page_count": 0,
+    "validation_ui_shared_confirmation_ready": true,
+    "validation_ui_visual_prompt_ready": true,
+    "validation_ui_visual_reference_ready": true,
+    "validation_ui_visual_reference_mode": "style_reference",
+    "validation_ui_visual_style_reference_ready": true,
+    "validation_ui_visual_reference_count": 1,
+    "validation_ui_visual_reference_source": "gpt-style-reference-prompt+image2",
+    "validation_ui_visual_reference_image_model": "gpt-image-2",
+    "validation_ui_visual_reference_failed_page": "",
+    "validation_ui_visual_reference_to_code_ready": true,
+    "validation_ui_visual_reference_before_source_ready": true,
+    "validation_source_visual_reference_contract": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\image-reliability-20261113-143452\\education\\output\\校园作业批改与学情分析软件-real-run-192936-2\\generated_source\\ui-visual-reference-contract.json",
+    "validation_source_persistence_required": true,
+    "validation_source_persistence_engine": "sqlite",
+    "validation_source_persistence_ready": true,
+    "validation_source_repository_file_count": 9,
+    "validation_source_migration_file_count": 1,
+    "validation_source_test_file_count": 2,
+    "source_pdf_page_count_match": true,
+    "ui_similarity_history_recorded": true,
+    "total_seconds": 584.63
+  },
+  "warnings": [
+    "说明书截图后的操作步骤密度偏低，建议复核截图页是否紧跟入口、字段、保存结果和后续处理说明。",
+    "说明书部分正文页的 PDF 可提取文本少于 30 行，已按字符量和业务操作内容综合判定通过；提交前建议人工复核版面。"
+  ],
+  "validation": {
+    "version": "2026-07-16",
+    "task_id": "校园作业批改与学情分析软件-real-run-192936-2",
+    "software_name": "校园作业批改与学情分析软件",
+    "version_name": "V1.0",
+    "language": "Python/JavaScript/SQL",
+    "product_type": "教育软件",
+    "authenticity": {
+      "source_file_count": 284,
+      "source_hash": "242000838b8359a1a0c8e4321788a9602fae76a597bb2972206e399bb4c1c07e",
+      "blueprint_hash": "173a8ea9557875268b1e93611ad3ace95533eacb088a6ac974f095523df32b41",
+      "blueprint_operation_contract_required": true,
+      "blueprint_operation_contract_ready": true,
+      "blueprint_operation_contract_issues": [],
+      "blueprint_structured_operation_count": 24,
+      "blueprint_task_domain_ready": true,
+      "blueprint_task_domain_issues": [],
+      "ui_screenshot_render_mode": "project-server",
+      "ui_screenshot_base_url": "http://127.0.0.1:8080/ui-prototype",
+      "ui_project_server_started": true,
+      "ui_project_runtime_route_mode": "node-static",
+      "ui_project_runtime_command": "node web-console/src/server.js（包内 Python 缺少 FastAPI/Uvicorn 时使用生成项目备用入口）",
+      "ui_runtime_probe_ready": true,
+      "ui_runtime_probe_count": 4,
+      "ui_runtime_api_ready": true,
+      "ui_runtime_api_page_count": 35,
+      "ui_runtime_api_fetch_count": 41,
+      "ui_runtime_api_ok_fetch_count": 41,
+      "ui_source_evidence_ready": true,
+      "ui_source_evidence_module_count": 8,
+      "ui_source_evidence_file_hits": 80,
+      "ui_source_evidence_route_hits": 56,
+      "ui_source_evidence_service_hits": 32,
+      "ui_business_facing_screenshots": true,
+      "ui_screenshot_tech_leak_hits": "",
+      "ui_visible_text_clean": true,
+      "ui_visible_text_placeholder_hits": "",
+      "ui_visible_text_placeholder_details": "",
+      "ui_visible_content_summary_ready": true,
+      "ui_visible_content_summary_count": 35,
+      "ui_navigation_contract_ready": true,
+      "ui_navigation_contract_version": "navigation-contract-v1",
+      "ui_navigation_contract_count": 34,
+      "ui_navigation_level_count": 4,
+      "ui_secondary_navigation_page_count": 34,
+      "ui_back_navigation_page_count": 33,
+      "ui_navigation_contract_issues": [],
+      "ui_operation_result_evidence_ready": true,
+      "ui_operation_coverage_ready": true,
+      "ui_operation_coverage_required_per_module": 3,
+      "ui_operation_coverage_module_count": 8,
+      "ui_operation_coverage_min_count": 3,
+      "ui_operation_coverage_missing": [],
+      "ui_chart_context_ready": true,
+      "ui_route_topology_ready": true,
+      "ui_route_topology_required": false,
+      "ui_domain_profile_key": "general_business",
+      "ui_domain_profile_confidence": 0.6,
+      "ui_domain_profile_source": "generic-fallback",
+      "ui_domain_profile_evidence": "",
+      "ui_domain_profile_weak_evidence": "",
+      "ui_domain_profile_excluded_evidence": "",
+      "ui_domain_gate_keys": "",
+      "ui_domain_gate_reasons": "未启用交通线路拓扑门禁：当前领域不要求干线、支线接驳和服务时窗证据。",
+      "ui_realism_missing_evidence": "",
+      "ui_visual_identity_signature": "1d1f417be408309a2ee1",
+      "ui_similarity_gate_ready": true,
+      "ui_similarity_max_score": 0.0,
+      "ui_similarity_attempts": 1,
+      "ui_layout_role_count": 6,
+      "ui_package_page_max_similarity": 0.7854,
+      "ui_similarity_nearest_hash": "",
+      "ui_similarity_reason": "no_history_baseline",
+      "ui_page_composition_version": "page-composition-v1",
+      "ui_page_composition_ready": true,
+      "ui_page_composition_count": 35,
+      "ui_page_composition_family_count": 6,
+      "ui_page_composition_variant_count": 6,
+      "ui_page_composition_signature_count": 31,
+      "ui_page_composition_diversity_score": 0.9257,
+      "ui_page_composition_families": [
+        "analysis",
+        "authentication",
+        "entry-detail",
+        "kanban",
+        "records",
+        "result"
+      ],
+      "ui_page_composition_duplicate_groups": [
+        [
+          "class_course_operation_3_3",
+          "student_submission_operation_3_3"
+        ],
+        [
+          "assignment_publish_operation_2_2",
+          "student_submission_operation_2_2"
+        ],
+        [
+          "assignment_publish_operation_4_4",
+          "learning_report_operation_4_4"
+        ],
+        [
+          "student_submission_operation_4_4",
+          "grade_feedback_operation_3_3"
+        ]
+      ],
+      "ui_page_composition_issues": [],
+      "ui_ai_frontend_enabled": true,
+      "ui_ai_frontend_ready": true,
+      "ui_ai_frontend_source": "gpt-style-reference-image2-to-pagespec-react-vite",
+      "ui_ai_frontend_page_count": 35,
+      "ui_shared_confirmation_contract": "shared-confirm-dialog-v1",
+      "ui_shared_confirmation_page_count": 0,
+      "ui_shared_confirmation_ready": true,
+      "ui_visual_prompt_ready": true,
+      "ui_visual_reference_ready": true,
+      "ui_visual_reference_mode": "style_reference",
+      "ui_visual_style_reference_ready": true,
+      "ui_visual_reference_source": "gpt-style-reference-prompt+image2",
+      "ui_visual_reference_count": 1,
+      "ui_visual_reference_page_count": 35,
+      "ui_visual_reference_image_model": "gpt-image-2",
+      "ui_visual_reference_retry_count": 3,
+      "ui_visual_reference_failed_page": "",
+      "ui_visual_reference_error": "",
+      "ui_visual_reference_to_code_ready": true,
+      "ui_visual_reference_before_source_ready": true,
+      "source_visual_reference_contract": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\image-reliability-20261113-143452\\education\\output\\校园作业批改与学情分析软件-real-run-192936-2\\generated_source\\ui-visual-reference-contract.json",
+      "source_persistence_required": true,
+      "source_persistence_engine": "sqlite",
+      "source_persistence_ready": true,
+      "source_repository_file_count": 9,
+      "source_migration_file_count": 1,
+      "source_test_file_count": 2,
+      "source_module_key_hits": 8,
+      "source_module_title_hits": 8,
+      "manual_module_title_hits": 8,
+      "manual_business_object_hits": 0,
+      "manual_metric_hits": 0,
+      "ui_module_title_hits": 8,
+      "ui_business_object_hits": 0,
+      "ui_metric_hits": 0,
+      "info_name_match": true,
+      "info_version_match": true,
+      "score": 85,
+      "ready": true
+    },
+    "normative": {
+      "deliverable_count": 5,
+      "deliverable_kinds": [
+        "info_txt",
+        "manual_docx",
+        "manual_pdf",
+        "source_docx",
+        "source_pdf"
+      ],
+      "zip_exists": true,
+      "zip_entry_count": 5,
+      "zip_entries_match_deliverables": true,
+      "source_line_target_met": true,
+      "source_selection_rule_match": true,
+      "source_pdf_page_count_match": true,
+      "source_continuous_selection": true,
+      "source_lines_per_page": 50,
+      "source_presentation_filter_enabled": false,
+      "source_material_filler_line_count": 0,
+      "source_material_filler_line_ratio": 0.0,
+      "source_low_information_line_ratio": 0.0547,
+      "source_accessor_boilerplate_line_ratio": 0.0183,
+      "source_business_logic_line_ratio": 0.2697,
+      "source_selected_unique_file_count": 41,
+      "source_front_unique_file_count": 12,
+      "source_tail_unique_file_count": 29,
+      "source_max_selected_file_ratio": 0.089,
+      "source_unique_line_ratio": 0.2963,
+      "source_material_diversity_ready": true,
+      "manual_pdf_exists": true,
+      "source_pdf_exists": true,
+      "manual_pdf_layout_checked": true,
+      "source_pdf_layout_checked": true,
+      "manual_pdf_page_count": 31,
+      "source_pdf_page_count": 60,
+      "manual_pdf_is_a4": true,
+      "source_pdf_is_a4": true,
+      "manual_pdf_text_density_checked": true,
+      "manual_pdf_text_density_ready": true,
+      "manual_pdf_minimum_lines_per_text_page": 30,
+      "manual_pdf_text_density_page_count": 8,
+      "manual_pdf_low_text_density_page_count": 0,
+      "manual_pdf_low_text_density_pages": [],
+      "manual_pdf_text_density_soft_pass_count": 2,
+      "manual_pdf_text_density_soft_pass_pages": [
+        {
+          "page": 3,
+          "line_count": 29,
+          "character_count": 858,
+          "reason": "near_threshold"
+        },
+        {
+          "page": 30,
+          "line_count": 27,
+          "character_count": 957,
+          "reason": "content_sufficient_page"
+        }
+      ],
+      "manual_pdf_text_density_figure_pass_count": 0,
+      "manual_pdf_text_density_figure_pass_pages": [],
+      "manual_pdf_line_requirement_risk_count": 2,
+      "manual_pdf_line_requirement_risk_pages": [
+        {
+          "page": 3,
+          "line_count": 29,
+          "character_count": 858
+        },
+        {
+          "page": 30,
+          "line_count": 27,
+          "character_count": 957
+        }
+      ],
+      "manual_pdf_line_requirement_warning": true,
+      "manual_pdf_min_text_page_line_count": 27,
+      "manual_pdf_average_text_page_line_count": 30.88,
+      "pdf_conversion_method": "libreoffice",
+      "pdf_official_conversion_ready": true,
+      "manual_docx_is_a4": true,
+      "source_docx_is_a4": true,
+      "manual_docx_header_page_number_right": true,
+      "source_docx_header_page_number_right": true,
+      "manual_density_checked": true,
+      "manual_character_count": 15277,
+      "manual_paragraph_count": 333,
+      "manual_figure_count": 124,
+      "manual_figure_caption_count": 35,
+      "manual_operation_note_count": 5,
+      "manual_field_note_count": 65,
+      "manual_result_note_count": 40,
+      "manual_mechanical_label_count": 0,
+      "manual_repeated_phrase_count": 0,
+      "manual_generic_sentence_count": 0,
+      "manual_generic_sentence_ratio": 0.0,
+      "manual_semantic_anchor_count": 254,
+      "manual_semantic_anchor_ratio": 0.763,
+      "manual_template_risk_level": "low",
+      "manual_layout_profile": "global-adaptive-v1",
+      "manual_figure_paragraph_count": 35,
+      "manual_guarded_figure_count": 35,
+      "manual_guarded_caption_count": 35,
+      "manual_guarded_heading_count": 50,
+      "manual_numbered_step_count": 203,
+      "manual_pagination_constraints_ready": true,
+      "manual_numbered_steps_ready": true,
+      "manual_natural_style_ready": true,
+      "manual_average_chars_per_paragraph": 45.88,
+      "manual_operation_density_ready": false,
+      "manual_ui_consistency_checked": true,
+      "manual_ui_consistency_ready": true,
+      "manual_ui_semantic_ready": true,
+      "manual_ui_semantic_checked_count": 35,
+      "manual_ui_semantic_mismatch_count": 0,
+      "manual_ui_semantic_coverage_missing_count": 0,
+      "manual_ui_expected_renderer": "admin",
+      "manual_ui_renderer_mismatch_count": 0,
+      "manual_ui_renderer_mismatches": [],
+      "manual_ui_expected_figure_count": 35,
+      "manual_ui_actual_figure_count": 35,
+      "manual_ui_title_mismatch_count": 0,
+      "manual_ui_title_mismatches": [],
+      "manual_ui_button_mismatch_count": 0,
+      "manual_ui_button_mismatches": [],
+      "manual_ui_missing_button_coverage_count": 0,
+      "manual_ui_missing_button_coverage": [],
+      "manual_toc_page_numbers_ready": true,
+      "manual_toc_page_number_count": 15,
+      "placeholder_hits": [],
+      "manual_internal_generation_leak_hits": [],
+      "third_party_risk_hits": [],
+      "score": 100,
+      "ready": true
+    },
+    "source_files": [
+      {
+        "path": "app/__init__.py",
+        "suffix": ".py",
+        "lines": 1,
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+      },
+      {
+        "path": "app/core/__init__.py",
+        "suffix": ".py",
+        "lines": 1,
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+      },
+      {
+        "path": "app/core/database.py",
+        "suffix": ".py",
+        "lines": 28,
+        "sha256": "9139b203484fe573ae3e250983debb29615491faf311020db67a21f0095e5569"
+      },
+      {
+        "path": "app/core/migrations.py",
+        "suffix": ".py",
+        "lines": 13,
+        "sha256": "fe47f6cb7690bdb3309d05a807d80ca8ee3afda36d87d45025a520c19ee9db40"
+      },
+      {
+        "path": "app/main.py",
+        "suffix": ".py",
+        "lines": 18,
+        "sha256": "266ddf18639ad925dbcf0c18f617f835f3457e95d17f7745b8481280786aaaca"
+      },
+      {
+        "path": "app/models/assignment_publish_model.py",
+        "suffix": ".py",
+        "lines": 14,
+        "sha256": "ef868b532db52e3b5c077db8a1b611c332d2e857296fe17c56fc6580903eb24d"
+      },
+      {
+        "path": "app/models/class_course_model.py",
+        "suffix": ".py",
+        "lines": 14,
+        "sha256": "4eb15cc5edd5624f16f613c98773d88eafce648465405441947234f87d6f17b3"
+      },
+      {
+        "path": "app/models/grade_feedback_model.py",
+        "suffix": ".py",
+        "lines": 14,
+        "sha256": "e27904e8aba65b47aeecf2fb8789689537c4bc97f975d904529bb01daf64370f"
+      },
+      {
+        "path": "app/models/learning_report_model.py",
+        "suffix": ".py",
+        "lines": 14,
+        "sha256": "6e71f2cfdf2f2af04ef8fa88da67ef1b66bad9f06455625dd17da5d743c32073"
+      },
+      {
+        "path": "app/models/mistake_collection_model.py",
+        "suffix": ".py",
+        "lines": 14,
+        "sha256": "fd7e322ab724d0640fa2552d9bd8474aaed9fa4083154898475c51b1d47fb2eb"
+      },
+      {
+        "path": "app/models/student_submission_model.py",
+        "suffix": ".py",
+        "lines": 14,
+        "sha256": "6dc353f57fbe309843d08e5a6aa2b3ce00074bcae37687c97e4ee612fa9700e3"
+      },
+      {
+        "path": "app/models/submission_tracking_model.py",
+        "suffix": ".py",
+        "lines": 14,
+        "sha256": "720ba0e033524c28feed76b9f3fc5fc601be954eac732d2780ca064ce62532a7"
+      },
+      {
+        "path": "app/models/teacher_grading_model.py",
+        "suffix": ".py",
+        "lines": 14,
+        "sha256": "cfed7c3921e76b3d2325e10f49c5d647eef78d87b457a9bef327c4cfa0cbfb35"
+      },
+      {
+        "path": "app/repositories/__init__.py",
+        "suffix": ".py",
+        "lines": 1,
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+      },
+      {
+        "path": "app/repositories/assignment_publish_repository.py",
+        "suffix": ".py",
+        "lines": 71,
+        "sha256": "f281e23f54f8d35c8e5bb0d35da159fb00812dbcb4b6f48d4cf6337c488f0f40"
+      },
+      {
+        "path": "app/repositories/class_course_repository.py",
+        "suffix": ".py",
+        "lines": 71,
+        "sha256": "d5fc0609ce36f6683e66e176cb216f17c4f890eea1f5bea37fe1e4ce206da4cf"
+      },
+      {
+        "path": "app/repositories/grade_feedback_repository.py",
+        "suffix": ".py",
+        "lines": 71,
+        "sha256": "099740d2f7685b775bc1520b4eb4bc5e5254b11cece53e2f68b1b18dfa55f861"
+      },
+      {
+        "path": "app/repositories/learning_report_repository.py",
+        "suffix": ".py",
+        "lines": 71,
+        "sha256": "454671ce5e417a7f5109bffae328e44a251450415c28ae5220cd9f35e3519460"
+      },
+      {
+        "path": "app/repositories/mistake_collection_repository.py",
+        "suffix": ".py",
+        "lines": 71,
+        "sha256": "448ea3d37c0b6755b83b2b154181f4af6687e31961daa123340f5a634d954b8e"
+      },
+      {
+        "path": "app/repositories/student_submission_repository.py",
+        "suffix": ".py",
+        "lines": 71,
+        "sha256": "6ebd5588b502941711cd5c586479b3d58d722fae5a8c45a10d6314172b947b9b"
+      },
+      {
+        "path": "app/repositories/submission_tracking_repository.py",
+        "suffix": ".py",
+        "lines": 71,
+        "sha256": "4c6eb1dedf20dc00497806d23e4271789ce27f661abf55bebe3e15c0d6b3bf6a"
+      },
+      {
+        "path": "app/repositories/teacher_grading_repository.py",
+        "suffix": ".py",
+        "lines": 71,
+        "sha256": "b846d8b8ea1b529db98d6fc50a69d4ef59c7e400d5cac5126477233b8469fd86"
+      },
+      {
+        "path": "app/routers/assignment_publish_router.py",
+        "suffix": ".py",
+        "lines": 15,
+        "sha256": "87277fd9e004a976c7b87b0aab1c93dd6440e2fa5c4017a91aae7c3bae6c1396"
+      },
+      {
+        "path": "app/routers/class_course_router.py",
+        "suffix": ".py",
+        "lines": 15,
+        "sha256": "2cca1d7431066ffc4d7852ab7d4bce65b6b6bc94b73ab28063f38655a372ab47"
+      },
+      {
+        "path": "app/routers/grade_feedback_router.py",
+        "suffix": ".py",
+        "lines": 15,
+        "sha256": "f57fa23c879674c50d6fc0555c4c1eaabb1b443d1cc6aad289b00cbbf5568912"
+      },
+      {
+        "path": "app/routers/learning_report_router.py",
+        "suffix": ".py",
+        "lines": 15,
+        "sha256": "5db3fd8f882a7f647d294029be7d42f8aaa9a2d2fb6826a92dfa636ca948de38"
+      },
+      {
+        "path": "app/routers/mistake_collection_router.py",
+        "suffix": ".py",
+        "lines": 15,
+        "sha256": "aef7f6e5e549aabc85d8d807a83010891ba92ec4fe534717489af8dd9a7b4fa3"
+      },
+      {
+        "path": "app/routers/student_submission_router.py",
+        "suffix": ".py",
+        "lines": 15,
+        "sha256": "fdffd8d2384507bee71eb5a16b5d5cddcd291e52f6e87798f63fd8a3c6dd08fb"
+      },
+      {
+        "path": "app/routers/submission_tracking_router.py",
+        "suffix": ".py",
+        "lines": 15,
+        "sha256": "ffe251a1b29d03db38623a998414ff91df81d5ee7181739409dd91069a36a089"
+      },
+      {
+        "path": "app/routers/teacher_grading_router.py",
+        "suffix": ".py",
+        "lines": 15,
+        "sha256": "5cc394d0397d8c5ecb95959665b50dbb37e6a67c8652068a09977f6729d773c2"
+      },
+      {
+        "path": "app/runtime_routes.py",
+        "suffix": ".py",
+        "lines": 18,
+        "sha256": "e4497413a8d936b91370be763ba5cb3d0f5c50efa1790d68ff27d985697104f7"
+      },
+      {
+        "path": "app/services/assignment_publish_service.py",
+        "suffix": ".py",
+        "lines": 31,
+        "sha256": "82c0ea80c63d74bb15df8c1d21cfe8a952511f3e56f7122a74d9a516d24f852d"
+      },
+      {
+        "path": "app/services/assignment_publish_workflow_orchestrator.py",
+        "suffix": ".py",
+        "lines": 267,
+        "sha256": "6a4b674e48c2db6050e36c98b33ccbc3daf28eba395ab3c3413454197ffc6c10"
+      },
+      {
+        "path": "app/services/class_course_service.py",
+        "suffix": ".py",
+        "lines": 31,
+        "sha256": "acfce7d0a1f31d475c2254430162219c1ead8b014a46f815a4dbefa411dc76bb"
+      },
+      {
+        "path": "app/services/class_course_workflow_orchestrator.py",
+        "suffix": ".py",
+        "lines": 267,
+        "sha256": "62066f8136d7c58e8bb6f70a22f6a3b7ac872546ec9eec1bf42784ce79687a78"
+      },
+      {
+        "path": "app/services/grade_feedback_service.py",
+        "suffix": ".py",
+        "lines": 31,
+        "sha256": "07597ec22abb9701a6e1a764bdf0f4365b29721c056554b51f63754879142701"
+      },
+      {
+        "path": "app/services/grade_feedback_workflow_orchestrator.py",
+        "suffix": ".py",
+        "lines": 267,
+        "sha256": "99ef09ea421c400c3b3490fae69407a8124e6b92958992bb5448be5988bcad19"
+      },
+      {
+        "path": "app/services/learning_report_service.py",
+        "suffix": ".py",
+        "lines": 31,
+        "sha256": "824176627de47efd9fe0815cee728c7d91b4aa8a76ddaac1284f095f787c24fc"
+      },
+      {
+        "path": "app/services/learning_report_workflow_orchestrator.py",
+        "suffix": ".py",
+        "lines": 267,
+        "sha256": "ab9099127f9e9eb7470c4413232ea9269f2c9b3bf2d75b2d56604cb7fd12cbd2"
+      },
+      {
+        "path": "app/services/mistake_collection_service.py",
+        "suffix": ".py",
+        "lines": 31,
+        "sha256": "ee17b61f435d891da09b36bc1b079e0fcd143ae5fc14e185064aed05b002ebe6"
+      },
+      {
+        "path": "app/services/mistake_collection_workflow_orchestrator.py",
+        "suffix": ".py",
+        "lines": 267,
+        "sha256": "e42b75b944defb4f9fcb88359b4098b3412fabcad098c0f244d0480386f1d3ad"
+      },
+      {
+        "path": "app/services/student_submission_service.py",
+        "suffix": ".py",
+        "lines": 31,
+        "sha256": "40dcb6a8337510954fb8917e055f7f8f0467e4b5abd8763f7ad789d8de1b39ab"
+      },
+      {
+        "path": "app/services/student_submission_workflow_orchestrator.py",
+        "suffix": ".py",
+        "lines": 267,
+        "sha256": "70ec0929fada84f3bc044cc968a4a67cba43c61aada4b3c04574b445750322a1"
+      },
+      {
+        "path": "app/services/submission_tracking_service.py",
+        "suffix": ".py",
+        "lines": 31,
+        "sha256": "c84a8b5fade757308d40e9e204b73f3243e0a3d519bf44b6df725298ba39dc87"
+      },
+      {
+        "path": "app/services/submission_tracking_workflow_orchestrator.py",
+        "suffix": ".py",
+        "lines": 267,
+        "sha256": "b716e2b695212a87cbf8186fe650b92861942091e67c3a21e3890773e07c6a84"
+      },
+      {
+        "path": "app/services/teacher_grading_service.py",
+        "suffix": ".py",
+        "lines": 31,
+        "sha256": "c8db026efeade8229719be33e5f4feb7cd5dedc7043fe55b3163b0788946cf58"
+      },
+      {
+        "path": "app/services/teacher_grading_workflow_orchestrator.py",
+        "suffix": ".py",
+        "lines": 267,
+        "sha256": "1bc8db6f7466ad3725f26b8c8ce3d197c9b5819963f760f6b8d6161102ab08d8"
+      },
+      {
+        "path": "app/services/workflow_transition_support.py",
+        "suffix": ".py",
+        "lines": 31,
+        "sha256": "b120b07683ca7066c81b51a2310b62d0c0bebd22b9807c58d69b38ef922952b0"
+      },
+      {
+        "path": "frontend-app/index.html",
+        "suffix": ".html",
+        "lines": 1,
+        "sha256": "f190c0d0c4103e01be00b900d50005089803b27f2c677c11dcfed972b0e46eae"
+      },
+      {
+        "path": "frontend-app/src/screens/AssignmentPublish5f9a76.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "2a6bde49c99c328c3a54c47ea022d22013b250322f9282d8fe242571e7433de5"
+      },
+      {
+        "path": "frontend-app/src/screens/AssignmentPublishOperation22eedd6b.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "49cdda5b6b8e20e283695f961f29a989641076d317174ced2f8e9875e06a62b8"
+      },
+      {
+        "path": "frontend-app/src/screens/AssignmentPublishOperation3388bf42.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "38ca285e215b6224d33b1a6c50f115bbbb51c8d9b487ec8829b28ca7565c37d3"
+      },
+      {
+        "path": "frontend-app/src/screens/AssignmentPublishOperation44141339.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "1fa741df0f80458c85cbe807d4b2191b490e28206609c5fb72d1335cf968b38f"
+      },
+      {
+        "path": "frontend-app/src/screens/ClassCourse56a5e5.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "3aedd4e19c5b73c6446712ce1e585cd05b1083370c64f50a704e344d785511f2"
+      },
+      {
+        "path": "frontend-app/src/screens/ClassCourseOperation2243561c.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "81512f886308176518ca20a8ef7043069d419e9362e7c0625f43dd5513792f90"
+      },
+      {
+        "path": "frontend-app/src/screens/ClassCourseOperation33cc4cbe.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "98f0e36db42d5a75f07e51655b69025266aaf8de69d779413ecf6a2358bca966"
+      },
+      {
+        "path": "frontend-app/src/screens/ClassCourseOperation44586b77.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "0213a78eb734d4d83ccdbfb3783fa51ca3096c8eddb5f54fb8ad5518854152cb"
+      },
+      {
+        "path": "frontend-app/src/screens/Dashboard66cd96.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "2346772436f9dabeccc5d55e7fba9c2fc96b34af34ea5d2d08fa44ae80b6158d"
+      },
+      {
+        "path": "frontend-app/src/screens/GradeFeedback580d04.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "ca610f5f1886f1fb3644100b361f330722ce5a7a0595bc651914a3b7b0052107"
+      },
+      {
+        "path": "frontend-app/src/screens/GradeFeedbackOperation22b554bf.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "8d1a003001387ecf9bbaf381d1f490a153cafbbabf83afe67205eaf8c5e2cd9e"
+      },
+      {
+        "path": "frontend-app/src/screens/GradeFeedbackOperation33446582.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "a43505ea34c6de42b1f5e43914de28cbd5ace07b93c692a3fb9a20aef927b1c8"
+      },
+      {
+        "path": "frontend-app/src/screens/GradeFeedbackOperation44916901.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "72afbcd7a0b18dd25dd4b731245163bc27d03c643198c23e1d7fcf5dc69d5a04"
+      },
+      {
+        "path": "frontend-app/src/screens/LearningReport0e7cb5.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "2d5283f34b290f988fe21c415cd1d19a1e7be93a116b61aa884870a586aeb5c8"
+      },
+      {
+        "path": "frontend-app/src/screens/LearningReportOperation22447ea1.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "7650744fa31ab1b700b338cc73117dafa5b3aeeb03343706d3c4820eb3b4f533"
+      },
+      {
+        "path": "frontend-app/src/screens/LearningReportOperation3357c12d.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "767d936d485a71644a815ec29f0153fbb012ce1f2e45fabf7d22131a9963fdfb"
+      },
+      {
+        "path": "frontend-app/src/screens/LearningReportOperation448f4044.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "8ee95fc6d91598280d93ab1af9bb661872cc6b734e7e94734d99b607f1accc9c"
+      },
+      {
+        "path": "frontend-app/src/screens/Login428821.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "fdedddeef7e1a4ea184a8d83b36c9f198154397878e3ebc4e72ef21f8f7033cb"
+      },
+      {
+        "path": "frontend-app/src/screens/MistakeCollection3ddd0e.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "c4614453f4395f7dd73bba7d9c4743f3479b6e37cb267236ac5a7b08d436db19"
+      },
+      {
+        "path": "frontend-app/src/screens/MistakeCollectionOperation227d90b1.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "57e577eb8565ba04cd0c41dd3a0e13df7e9eaff82d0ff2674b0d42735fc93ab6"
+      },
+      {
+        "path": "frontend-app/src/screens/MistakeCollectionOperation3393108d.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "2176717be4f50102a8fa00c45c6b6d4360efb389d6792a622cf34f09a755d15e"
+      },
+      {
+        "path": "frontend-app/src/screens/MistakeCollectionOperation444c04fa.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "1f14ff0e534e13524ea00dfd499565ba55d88fb033feb854e84c0b9cab2b5eff"
+      },
+      {
+        "path": "frontend-app/src/screens/Statistics49d484.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "743718c972bef63558fc8cf821952ff3d8783378a21342f3cf9741c6c8861c04"
+      },
+      {
+        "path": "frontend-app/src/screens/StudentSubmission04e963.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "598a488ab915492b91979a085a079786fb3a01330a27a6cf4207fbebdcf78310"
+      },
+      {
+        "path": "frontend-app/src/screens/StudentSubmissionOperation22a3c7c5.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "0e4a6c6c4bfc9e77e76d6d34cecee4f98ce612e712269e87e29eb3e6ec0b0941"
+      },
+      {
+        "path": "frontend-app/src/screens/StudentSubmissionOperation33a4af14.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "cbeb08ca0c50afe4bdd98187feefac561923a1e89782272e6d94fbc23335c62b"
+      },
+      {
+        "path": "frontend-app/src/screens/StudentSubmissionOperation441b9fd4.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "35b37dd7c4bf0e1739f4f49355f89e3c7c461a7d934a3636dc35d23d6ca53426"
+      },
+      {
+        "path": "frontend-app/src/screens/SubmissionTracking700e45.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "8a782e51777888f23d14e75b252020d2d1b9199916b0921ef3b7c755de2ae9c2"
+      },
+      {
+        "path": "frontend-app/src/screens/SubmissionTrackingOperation22f683d3.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "4e349890aa04d42e16fc52a4a6c42fe1ba9215c21f67fd23228a335aed1377f4"
+      },
+      {
+        "path": "frontend-app/src/screens/SubmissionTrackingOperation332ddba8.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "c8337ea1f4c189198fb33dd2905b0d4288c5e113c00114e547e47b7951736fb4"
+      },
+      {
+        "path": "frontend-app/src/screens/SubmissionTrackingOperation447868cf.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "e80cd110de9b6e669ee061441a53be06f4aa23f703642be7114dc0fabc63b4e6"
+      },
+      {
+        "path": "frontend-app/src/screens/TeacherGrading053f04.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "e4056a6106d541ae63f22b0ce6abef39c77a85119787f6eaab10797b66c46c4b"
+      },
+      {
+        "path": "frontend-app/src/screens/TeacherGradingOperation229d15c4.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "db9e33741c5f35ca9c270bdf8bed52bd3575a71b7e18da5c60efdb5309960977"
+      },
+      {
+        "path": "frontend-app/src/screens/TeacherGradingOperation33fc2e23.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "6456f5265674e229c38ab7010bc107dc644d8629573bfed5f3f6f2a70474d7ca"
+      },
+      {
+        "path": "frontend-app/src/screens/TeacherGradingOperation44aeb88c.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "be1a13b7cb690c1ef74add73ea79b2e47b57be8383f7b7532e3dbd93ecc66fc4"
+      },
+      {
+        "path": "frontend-app/src/theme.css",
+        "suffix": ".css",
+        "lines": 96,
+        "sha256": "2b298b95aaf5713c4d30f9197f44af8bf19d73c672e68bbc9ba0ac8c8760e1df"
+      },
+      {
+        "path": "frontend-app/vite.config.js",
+        "suffix": ".js",
+        "lines": 1,
+        "sha256": "76deec342390454af9a9aea0f929280922b13e19eaf8b6e304d440aabd02ee11"
+      },
+      {
+        "path": "migrations/001_initial.sql",
+        "suffix": ".sql",
+        "lines": 127,
+        "sha256": "ca3ca50f309a7b358c4ee8f3c6c526dff71aa73ad6f23bf8b5c341f17042f28e"
+      },
+      {
+        "path": "tests/__init__.py",
+        "suffix": ".py",
+        "lines": 1,
+        "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+      },
+      {
+        "path": "tests/test_persistence.py",
+        "suffix": ".py",
+        "lines": 38,
+        "sha256": "37868abe9949ea21f572e340cea0cc7dbf724b605f9744a0e9eb74cd63ca7c06"
+      },
+      {
+        "path": "ui-prototype/assets/app.js",
+        "suffix": ".js",
+        "lines": 9,
+        "sha256": "0b2d0fc35b6dd2896095805bf055742fe3afbf5ef85e273feea761c92bbeb26d"
+      },
+      {
+        "path": "ui-prototype/assets/index.css",
+        "suffix": ".css",
+        "lines": 1,
+        "sha256": "83826ed64ef6c4bfedb1bc60e7a2045b2903a5287e8ac731a6806ef112859922"
+      },
+      {
+        "path": "ui-prototype/assignment_publish.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "1f0a68f6607f5a0eb43a9e63e23525dc859602fbe0cd1b8c1cf76c6cb7465785"
+      },
+      {
+        "path": "ui-prototype/assignment_publish_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "ea77ba63904d6b8db15861441f217a5dfdf09dc2e4cb67fa367abd23c13cab39"
+      },
+      {
+        "path": "ui-prototype/assignment_publish_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "36d7d1dfbe3f3f9333e169f03c3b2d63394063626d69414d5d2da9fd329a403b"
+      },
+      {
+        "path": "ui-prototype/assignment_publish_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "152c6be0e7c501b39820275f20b45c530a24688b0f0347069f7b0731edb4f2bd"
+      },
+      {
+        "path": "ui-prototype/class_course.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "3a6e0380895f2ed50b4262024b8e2b13c534fe835706647e21e3fe11bbfbb286"
+      },
+      {
+        "path": "ui-prototype/class_course_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "36884e25188f7bd75158f7ef34781ebc8f5690bee201461e52f4e39b04c6bb2d"
+      },
+      {
+        "path": "ui-prototype/class_course_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "e0771a8814c18a0c9aca5deabfc1d331ec256b26945f8263d523a9bef07e427e"
+      },
+      {
+        "path": "ui-prototype/class_course_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "5842ca8cd640a207e976ac568c69cd72c681e085cccc17f62bd3aeda65342f47"
+      },
+      {
+        "path": "ui-prototype/dashboard.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "803f24a2350e98976aae2f092cea4f575242f60343af7f747aa1188b7a335465"
+      },
+      {
+        "path": "ui-prototype/grade_feedback.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "57d6472761b28a05f03c25c012ccee105ec96db27847048c639eae8dd79e732b"
+      },
+      {
+        "path": "ui-prototype/grade_feedback_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "cd69d3af357cbe63bf45f361226140af80db130e26aff2393f1d7cd2d464b0df"
+      },
+      {
+        "path": "ui-prototype/grade_feedback_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "eefae380e7ae0883849cc22a6f5ccefa6432f27a6591648d1d9ce8d210fa67d3"
+      },
+      {
+        "path": "ui-prototype/grade_feedback_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "6474a689430dd7b1990deec908780dbf8c42d9c69ee6f83493e19155d246b662"
+      },
+      {
+        "path": "ui-prototype/index.html",
+        "suffix": ".html",
+        "lines": 83,
+        "sha256": "b6a450c9185fa0179ddccd5a52abff40b79bf07745563b85bfb8fac945b974c1"
+      },
+      {
+        "path": "ui-prototype/learning_report.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "c161ae59f052f2af17e5570af951db61a17426e27b8d8db1936dcd47b64f3095"
+      },
+      {
+        "path": "ui-prototype/learning_report_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "55c8e152e19d956901eb3053619d10ea4842965900bbe9ad81512609fcc9e7e2"
+      },
+      {
+        "path": "ui-prototype/learning_report_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "05868c56b092a446d54d31490822c1bb718fa8c4a064aae68cc1fce4c136beca"
+      },
+      {
+        "path": "ui-prototype/learning_report_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "bd0d46c3db7050b6396bc78e9e6d738069894175157527387b5fbc6c1f6b324d"
+      },
+      {
+        "path": "ui-prototype/login.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "548e0a2cf2a9123a8718731eee084deeee6e155d20062c59469027e9726c9ccd"
+      },
+      {
+        "path": "ui-prototype/mistake_collection.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "a43e8ddc6c1928c93096d0c33183c31368ce7d1c9a5c2d38156d5a7df5e5de39"
+      },
+      {
+        "path": "ui-prototype/mistake_collection_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "a64daa87349c45fcc52269b08fda77cc105685da699dfca5b770fd982f0486a1"
+      },
+      {
+        "path": "ui-prototype/mistake_collection_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "f16662fbed4891d936da8f6fa031dd511130de694ac111ac0b96b4b1263e83e9"
+      },
+      {
+        "path": "ui-prototype/mistake_collection_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "180d3d769d9b21d1779f9187f028eda397ee28daaabf9302554b50173dd8b924"
+      },
+      {
+        "path": "ui-prototype/react-app/dist/assets/app.js",
+        "suffix": ".js",
+        "lines": 9,
+        "sha256": "0b2d0fc35b6dd2896095805bf055742fe3afbf5ef85e273feea761c92bbeb26d"
+      },
+      {
+        "path": "ui-prototype/react-app/dist/assets/index.css",
+        "suffix": ".css",
+        "lines": 1,
+        "sha256": "83826ed64ef6c4bfedb1bc60e7a2045b2903a5287e8ac731a6806ef112859922"
+      },
+      {
+        "path": "ui-prototype/react-app/dist/index.html",
+        "suffix": ".html",
+        "lines": 3,
+        "sha256": "456087e19cd25169a16b230c525d92571e5ed7746753fd172e99baa91ea47056"
+      },
+      {
+        "path": "ui-prototype/react-app/index.html",
+        "suffix": ".html",
+        "lines": 1,
+        "sha256": "f190c0d0c4103e01be00b900d50005089803b27f2c677c11dcfed972b0e46eae"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/AssignmentPublish5f9a76.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "2a6bde49c99c328c3a54c47ea022d22013b250322f9282d8fe242571e7433de5"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/AssignmentPublishOperation22eedd6b.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "49cdda5b6b8e20e283695f961f29a989641076d317174ced2f8e9875e06a62b8"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/AssignmentPublishOperation3388bf42.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "38ca285e215b6224d33b1a6c50f115bbbb51c8d9b487ec8829b28ca7565c37d3"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/AssignmentPublishOperation44141339.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "1fa741df0f80458c85cbe807d4b2191b490e28206609c5fb72d1335cf968b38f"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/ClassCourse56a5e5.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "3aedd4e19c5b73c6446712ce1e585cd05b1083370c64f50a704e344d785511f2"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/ClassCourseOperation2243561c.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "81512f886308176518ca20a8ef7043069d419e9362e7c0625f43dd5513792f90"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/ClassCourseOperation33cc4cbe.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "98f0e36db42d5a75f07e51655b69025266aaf8de69d779413ecf6a2358bca966"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/ClassCourseOperation44586b77.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "0213a78eb734d4d83ccdbfb3783fa51ca3096c8eddb5f54fb8ad5518854152cb"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/Dashboard66cd96.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "2346772436f9dabeccc5d55e7fba9c2fc96b34af34ea5d2d08fa44ae80b6158d"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/GradeFeedback580d04.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "ca610f5f1886f1fb3644100b361f330722ce5a7a0595bc651914a3b7b0052107"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/GradeFeedbackOperation22b554bf.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "8d1a003001387ecf9bbaf381d1f490a153cafbbabf83afe67205eaf8c5e2cd9e"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/GradeFeedbackOperation33446582.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "a43505ea34c6de42b1f5e43914de28cbd5ace07b93c692a3fb9a20aef927b1c8"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/GradeFeedbackOperation44916901.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "72afbcd7a0b18dd25dd4b731245163bc27d03c643198c23e1d7fcf5dc69d5a04"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/LearningReport0e7cb5.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "2d5283f34b290f988fe21c415cd1d19a1e7be93a116b61aa884870a586aeb5c8"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/LearningReportOperation22447ea1.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "7650744fa31ab1b700b338cc73117dafa5b3aeeb03343706d3c4820eb3b4f533"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/LearningReportOperation3357c12d.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "767d936d485a71644a815ec29f0153fbb012ce1f2e45fabf7d22131a9963fdfb"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/LearningReportOperation448f4044.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "8ee95fc6d91598280d93ab1af9bb661872cc6b734e7e94734d99b607f1accc9c"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/Login428821.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "fdedddeef7e1a4ea184a8d83b36c9f198154397878e3ebc4e72ef21f8f7033cb"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/MistakeCollection3ddd0e.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "c4614453f4395f7dd73bba7d9c4743f3479b6e37cb267236ac5a7b08d436db19"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/MistakeCollectionOperation227d90b1.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "57e577eb8565ba04cd0c41dd3a0e13df7e9eaff82d0ff2674b0d42735fc93ab6"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/MistakeCollectionOperation3393108d.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "2176717be4f50102a8fa00c45c6b6d4360efb389d6792a622cf34f09a755d15e"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/MistakeCollectionOperation444c04fa.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "1f14ff0e534e13524ea00dfd499565ba55d88fb033feb854e84c0b9cab2b5eff"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/Statistics49d484.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "743718c972bef63558fc8cf821952ff3d8783378a21342f3cf9741c6c8861c04"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/StudentSubmission04e963.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "598a488ab915492b91979a085a079786fb3a01330a27a6cf4207fbebdcf78310"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/StudentSubmissionOperation22a3c7c5.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "0e4a6c6c4bfc9e77e76d6d34cecee4f98ce612e712269e87e29eb3e6ec0b0941"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/StudentSubmissionOperation33a4af14.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "cbeb08ca0c50afe4bdd98187feefac561923a1e89782272e6d94fbc23335c62b"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/StudentSubmissionOperation441b9fd4.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "35b37dd7c4bf0e1739f4f49355f89e3c7c461a7d934a3636dc35d23d6ca53426"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/SubmissionTracking700e45.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "8a782e51777888f23d14e75b252020d2d1b9199916b0921ef3b7c755de2ae9c2"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/SubmissionTrackingOperation22f683d3.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "4e349890aa04d42e16fc52a4a6c42fe1ba9215c21f67fd23228a335aed1377f4"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/SubmissionTrackingOperation332ddba8.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "c8337ea1f4c189198fb33dd2905b0d4288c5e113c00114e547e47b7951736fb4"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/SubmissionTrackingOperation447868cf.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "e80cd110de9b6e669ee061441a53be06f4aa23f703642be7114dc0fabc63b4e6"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/TeacherGrading053f04.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "e4056a6106d541ae63f22b0ce6abef39c77a85119787f6eaab10797b66c46c4b"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/TeacherGradingOperation229d15c4.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "db9e33741c5f35ca9c270bdf8bed52bd3575a71b7e18da5c60efdb5309960977"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/TeacherGradingOperation33fc2e23.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "6456f5265674e229c38ab7010bc107dc644d8629573bfed5f3f6f2a70474d7ca"
+      },
+      {
+        "path": "ui-prototype/react-app/src/screens/TeacherGradingOperation44aeb88c.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "be1a13b7cb690c1ef74add73ea79b2e47b57be8383f7b7532e3dbd93ecc66fc4"
+      },
+      {
+        "path": "ui-prototype/react-app/src/theme.css",
+        "suffix": ".css",
+        "lines": 96,
+        "sha256": "2b298b95aaf5713c4d30f9197f44af8bf19d73c672e68bbc9ba0ac8c8760e1df"
+      },
+      {
+        "path": "ui-prototype/react-app/vite.config.js",
+        "suffix": ".js",
+        "lines": 1,
+        "sha256": "76deec342390454af9a9aea0f929280922b13e19eaf8b6e304d440aabd02ee11"
+      },
+      {
+        "path": "ui-prototype/react-app/vite.runtime.config.js",
+        "suffix": ".js",
+        "lines": 1,
+        "sha256": "23e3a9d6bada92042cbb7ddbf2af0710be0706675b5213bcfe37bcc0ab9e1637"
+      },
+      {
+        "path": "ui-prototype/statistics.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "7577e6d538aa0a9ba3c9541ba4e1f295697c75429403b734d250e4d621eda4c4"
+      },
+      {
+        "path": "ui-prototype/student_submission.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "2b77600aadb0705f9a31e1eec2ba1a551068c0ff43346e3778064edc20bb8892"
+      },
+      {
+        "path": "ui-prototype/student_submission_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "a242de2ad6334c351ab7d07897257bd39520daa1fab6c01afb10529079d9ff38"
+      },
+      {
+        "path": "ui-prototype/student_submission_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "942f0810cbed29949e484dd03b18d2a437306b7cb9e79f72f00473a711530749"
+      },
+      {
+        "path": "ui-prototype/student_submission_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "8f93670a008a1091ab7a81c90c0704a56c287d9d83542a213a39dd2f8c3a31f8"
+      },
+      {
+        "path": "ui-prototype/submission_tracking.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "b43d5a1f171f8c5a809b13adba3056b207b0d699280a6f8fe476b62d6830058d"
+      },
+      {
+        "path": "ui-prototype/submission_tracking_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "f5dc228a18f923b6bf742500d97c1c87942ac696d2f5beb77c1c0c13f6a13973"
+      },
+      {
+        "path": "ui-prototype/submission_tracking_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "937df948504095968d177af689742582be1016242c18154bd0de967101da73cc"
+      },
+      {
+        "path": "ui-prototype/submission_tracking_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "d69cf458f6c4985b8927175834a30874ebe7e3b662fe823abf30817552e4c61d"
+      },
+      {
+        "path": "ui-prototype/teacher_grading.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "86849b05e631e38fb6adc1ad022a35eaf4bb3bdbea3a6e9d4b1bbf2777f117bb"
+      },
+      {
+        "path": "ui-prototype/teacher_grading_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "df9b538e5bd50605b9c07b0002e96a560858f4ab5b1cb613d0b447783c578d59"
+      },
+      {
+        "path": "ui-prototype/teacher_grading_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "aa67216deb2c09fb445518f52afae5b5a236771d92f3c6cfe791fbe6fddc57d4"
+      },
+      {
+        "path": "ui-prototype/teacher_grading_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "733431df18ca3c9bdddc8f2a5c54e1afb38ef68e27f8ea538f4020f55e50cc03"
+      },
+      {
+        "path": "web-console/index.html",
+        "suffix": ".html",
+        "lines": 11,
+        "sha256": "4fd15cd4ef4aa8bb99b5b5bf46a5bef11408dec3bec42cbf7d9fd2094e04dd7c"
+      },
+      {
+        "path": "web-console/src/models/assignment_publishRecord.js",
+        "suffix": ".js",
+        "lines": 19,
+        "sha256": "c221344b71b6e11174968f0e3f772992108d972877f6f22ac1b7e84d5f4c1b59"
+      },
+      {
+        "path": "web-console/src/models/class_courseRecord.js",
+        "suffix": ".js",
+        "lines": 19,
+        "sha256": "00c959e8c7a3cfe6eab6858b25cb667f025ce5a81a37775edb7d25c4ad3512fc"
+      },
+      {
+        "path": "web-console/src/models/grade_feedbackRecord.js",
+        "suffix": ".js",
+        "lines": 19,
+        "sha256": "da359ffc255d45b835c360af02f04fc213ad17ea6b6e21cef8fbd06ce270245f"
+      },
+      {
+        "path": "web-console/src/models/learning_reportRecord.js",
+        "suffix": ".js",
+        "lines": 19,
+        "sha256": "588cee8b46463eaddfcecc6cad959ac8cd2516eb9ed04d81b6fbe5451e5a1dce"
+      },
+      {
+        "path": "web-console/src/models/mistake_collectionRecord.js",
+        "suffix": ".js",
+        "lines": 19,
+        "sha256": "4af4686f0518b4839cf61be696eb6eacbb725833fe57725f3f9bf58bafac9770"
+      },
+      {
+        "path": "web-console/src/models/student_submissionRecord.js",
+        "suffix": ".js",
+        "lines": 19,
+        "sha256": "7141179d41e2a394a8ca1eadc3a43a3a2249c3727d6e53af4ab1485a677ad012"
+      },
+      {
+        "path": "web-console/src/models/submission_trackingRecord.js",
+        "suffix": ".js",
+        "lines": 19,
+        "sha256": "45fa13a7f36e050889f89a473d70316efd7608210e7bf96e2301c21116446432"
+      },
+      {
+        "path": "web-console/src/models/teacher_gradingRecord.js",
+        "suffix": ".js",
+        "lines": 19,
+        "sha256": "c781dcb7f09df9a88006207cc0d62caf69f0c10ada1194a345f887118b393025"
+      },
+      {
+        "path": "web-console/src/routes/assignment_publishRoute.js",
+        "suffix": ".js",
+        "lines": 33,
+        "sha256": "c9c8075bc4dd5fdd63dbc2fbc8ffbcefb596b4084ca64606b5a3147f7de39baf"
+      },
+      {
+        "path": "web-console/src/routes/class_courseRoute.js",
+        "suffix": ".js",
+        "lines": 33,
+        "sha256": "04a43e4fe713b3ce830dac4a03ca0d7466599f2178930319660ba8ce61043a47"
+      },
+      {
+        "path": "web-console/src/routes/grade_feedbackRoute.js",
+        "suffix": ".js",
+        "lines": 33,
+        "sha256": "a11b95f9706b4e2f9c88adbce3bb8df58fd99d7b2644ecbf6ab29585c9acbd36"
+      },
+      {
+        "path": "web-console/src/routes/learning_reportRoute.js",
+        "suffix": ".js",
+        "lines": 33,
+        "sha256": "e6365651c9e68eedc81587bcc7a349463aff153c0bdae5cd008606b0208ed129"
+      },
+      {
+        "path": "web-console/src/routes/mistake_collectionRoute.js",
+        "suffix": ".js",
+        "lines": 33,
+        "sha256": "492743dbd1858b6ce8287ea51ff99f116b61d16bc912d3494685286e1dc44867"
+      },
+      {
+        "path": "web-console/src/routes/student_submissionRoute.js",
+        "suffix": ".js",
+        "lines": 33,
+        "sha256": "06412487567ac8145d244a96ff81a9355bfdde6565d6956d6b823a808b94b913"
+      },
+      {
+        "path": "web-console/src/routes/submission_trackingRoute.js",
+        "suffix": ".js",
+        "lines": 33,
+        "sha256": "02f0c247a30d3684b7bc4473ffb170c0550f7a7eba14e66f5f6cea8ccef5a412"
+      },
+      {
+        "path": "web-console/src/routes/teacher_gradingRoute.js",
+        "suffix": ".js",
+        "lines": 33,
+        "sha256": "b3de6d66d9dcb058dc01ba58c9667c730b9f851d0b76cc4d2744b2cc2842beb7"
+      },
+      {
+        "path": "web-console/src/server.js",
+        "suffix": ".js",
+        "lines": 194,
+        "sha256": "46f3862944b323f5272d23ab64e021dcb2f0b3122d070a6253492270226e788b"
+      },
+      {
+        "path": "web-console/src/services/assignment_publishService.js",
+        "suffix": ".js",
+        "lines": 230,
+        "sha256": "1b303a3eab696570394a0b78b992ca29222c926cfbf3c997255917213f765166"
+      },
+      {
+        "path": "web-console/src/services/assignment_publishWorkflowOrchestrator.js",
+        "suffix": ".js",
+        "lines": 224,
+        "sha256": "578acc2b4a062af2c0489084eb031f429775bb55823d8b058825a2ecf6565469"
+      },
+      {
+        "path": "web-console/src/services/class_courseService.js",
+        "suffix": ".js",
+        "lines": 230,
+        "sha256": "6604aab1b4559e68bfa0d6d82a808abb74296852a077ec41cc77914a9e715f92"
+      },
+      {
+        "path": "web-console/src/services/class_courseWorkflowOrchestrator.js",
+        "suffix": ".js",
+        "lines": 224,
+        "sha256": "5a376476f4a3d209d9c831193c5212884b72d6590dc700e1e9b28341a445884b"
+      },
+      {
+        "path": "web-console/src/services/grade_feedbackService.js",
+        "suffix": ".js",
+        "lines": 230,
+        "sha256": "9edf9045c63fcffc839c72537289af7f3f011493497a1a86ee11685c2810cc17"
+      },
+      {
+        "path": "web-console/src/services/grade_feedbackWorkflowOrchestrator.js",
+        "suffix": ".js",
+        "lines": 224,
+        "sha256": "3866c1581bfc8b29adb8113de6fcb490079a57bd104248da54c61374ea0c1260"
+      },
+      {
+        "path": "web-console/src/services/learning_reportService.js",
+        "suffix": ".js",
+        "lines": 230,
+        "sha256": "25edff035461860d4a53b17a4725e9ce978dcfcd40b8522de70190fef471f518"
+      },
+      {
+        "path": "web-console/src/services/learning_reportWorkflowOrchestrator.js",
+        "suffix": ".js",
+        "lines": 224,
+        "sha256": "6ab6c727f5bcd562e09734210b95117f3055780d93beb7786c7eedfe494fa9b3"
+      },
+      {
+        "path": "web-console/src/services/mistake_collectionService.js",
+        "suffix": ".js",
+        "lines": 230,
+        "sha256": "eed53c8a8729bd536964614b1df442a45df88e82b61278751adac46ee0025940"
+      },
+      {
+        "path": "web-console/src/services/mistake_collectionWorkflowOrchestrator.js",
+        "suffix": ".js",
+        "lines": 224,
+        "sha256": "0c376e71267a86f932624ebecd1ba56dfee8338e2a5929eb5b79b75dcb667f90"
+      },
+      {
+        "path": "web-console/src/services/student_submissionService.js",
+        "suffix": ".js",
+        "lines": 230,
+        "sha256": "acbee75e0d6556584bb871fe2e2780567dad1556661750359aeddc724874f295"
+      },
+      {
+        "path": "web-console/src/services/student_submissionWorkflowOrchestrator.js",
+        "suffix": ".js",
+        "lines": 224,
+        "sha256": "e92aa05f28ef36db233a7b9e8aeb969e9e02dd7ae28190b71b2603509aa80c8f"
+      },
+      {
+        "path": "web-console/src/services/submission_trackingService.js",
+        "suffix": ".js",
+        "lines": 230,
+        "sha256": "1871f987e4e956563767a9d73f12a8f0d340bb9669df7af4de421c6593e94828"
+      },
+      {
+        "path": "web-console/src/services/submission_trackingWorkflowOrchestrator.js",
+        "suffix": ".js",
+        "lines": 224,
+        "sha256": "fbe921e6795ea06e969abf692e53d834aa1655581fefb08d90bb05ede34d1593"
+      },
+      {
+        "path": "web-console/src/services/teacher_gradingService.js",
+        "suffix": ".js",
+        "lines": 230,
+        "sha256": "266866aa44f8197941e22ca544a9b9d2235ceb3d43d72da96f4fc261510ae3a0"
+      },
+      {
+        "path": "web-console/src/services/teacher_gradingWorkflowOrchestrator.js",
+        "suffix": ".js",
+        "lines": 224,
+        "sha256": "a8b34411a0881d374551ab89005f257516994f3b6f86b44e3349504c634b36c4"
+      },
+      {
+        "path": "web-console/src/services/workflowTransitionSupport.js",
+        "suffix": ".js",
+        "lines": 36,
+        "sha256": "55258680480538edbe33df995f64560c005da09ff9b0cb5983a1a9c8de80fbae"
+      },
+      {
+        "path": "web-console/ui-prototype/assets/app.js",
+        "suffix": ".js",
+        "lines": 9,
+        "sha256": "0b2d0fc35b6dd2896095805bf055742fe3afbf5ef85e273feea761c92bbeb26d"
+      },
+      {
+        "path": "web-console/ui-prototype/assets/index.css",
+        "suffix": ".css",
+        "lines": 1,
+        "sha256": "83826ed64ef6c4bfedb1bc60e7a2045b2903a5287e8ac731a6806ef112859922"
+      },
+      {
+        "path": "web-console/ui-prototype/assignment_publish.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "1f0a68f6607f5a0eb43a9e63e23525dc859602fbe0cd1b8c1cf76c6cb7465785"
+      },
+      {
+        "path": "web-console/ui-prototype/assignment_publish_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "ea77ba63904d6b8db15861441f217a5dfdf09dc2e4cb67fa367abd23c13cab39"
+      },
+      {
+        "path": "web-console/ui-prototype/assignment_publish_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "36d7d1dfbe3f3f9333e169f03c3b2d63394063626d69414d5d2da9fd329a403b"
+      },
+      {
+        "path": "web-console/ui-prototype/assignment_publish_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "152c6be0e7c501b39820275f20b45c530a24688b0f0347069f7b0731edb4f2bd"
+      },
+      {
+        "path": "web-console/ui-prototype/class_course.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "3a6e0380895f2ed50b4262024b8e2b13c534fe835706647e21e3fe11bbfbb286"
+      },
+      {
+        "path": "web-console/ui-prototype/class_course_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "36884e25188f7bd75158f7ef34781ebc8f5690bee201461e52f4e39b04c6bb2d"
+      },
+      {
+        "path": "web-console/ui-prototype/class_course_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "e0771a8814c18a0c9aca5deabfc1d331ec256b26945f8263d523a9bef07e427e"
+      },
+      {
+        "path": "web-console/ui-prototype/class_course_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "5842ca8cd640a207e976ac568c69cd72c681e085cccc17f62bd3aeda65342f47"
+      },
+      {
+        "path": "web-console/ui-prototype/dashboard.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "803f24a2350e98976aae2f092cea4f575242f60343af7f747aa1188b7a335465"
+      },
+      {
+        "path": "web-console/ui-prototype/grade_feedback.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "57d6472761b28a05f03c25c012ccee105ec96db27847048c639eae8dd79e732b"
+      },
+      {
+        "path": "web-console/ui-prototype/grade_feedback_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "cd69d3af357cbe63bf45f361226140af80db130e26aff2393f1d7cd2d464b0df"
+      },
+      {
+        "path": "web-console/ui-prototype/grade_feedback_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "eefae380e7ae0883849cc22a6f5ccefa6432f27a6591648d1d9ce8d210fa67d3"
+      },
+      {
+        "path": "web-console/ui-prototype/grade_feedback_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "6474a689430dd7b1990deec908780dbf8c42d9c69ee6f83493e19155d246b662"
+      },
+      {
+        "path": "web-console/ui-prototype/index.html",
+        "suffix": ".html",
+        "lines": 83,
+        "sha256": "b6a450c9185fa0179ddccd5a52abff40b79bf07745563b85bfb8fac945b974c1"
+      },
+      {
+        "path": "web-console/ui-prototype/learning_report.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "c161ae59f052f2af17e5570af951db61a17426e27b8d8db1936dcd47b64f3095"
+      },
+      {
+        "path": "web-console/ui-prototype/learning_report_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "55c8e152e19d956901eb3053619d10ea4842965900bbe9ad81512609fcc9e7e2"
+      },
+      {
+        "path": "web-console/ui-prototype/learning_report_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "05868c56b092a446d54d31490822c1bb718fa8c4a064aae68cc1fce4c136beca"
+      },
+      {
+        "path": "web-console/ui-prototype/learning_report_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "bd0d46c3db7050b6396bc78e9e6d738069894175157527387b5fbc6c1f6b324d"
+      },
+      {
+        "path": "web-console/ui-prototype/login.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "548e0a2cf2a9123a8718731eee084deeee6e155d20062c59469027e9726c9ccd"
+      },
+      {
+        "path": "web-console/ui-prototype/mistake_collection.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "a43e8ddc6c1928c93096d0c33183c31368ce7d1c9a5c2d38156d5a7df5e5de39"
+      },
+      {
+        "path": "web-console/ui-prototype/mistake_collection_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "a64daa87349c45fcc52269b08fda77cc105685da699dfca5b770fd982f0486a1"
+      },
+      {
+        "path": "web-console/ui-prototype/mistake_collection_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "f16662fbed4891d936da8f6fa031dd511130de694ac111ac0b96b4b1263e83e9"
+      },
+      {
+        "path": "web-console/ui-prototype/mistake_collection_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "180d3d769d9b21d1779f9187f028eda397ee28daaabf9302554b50173dd8b924"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/dist/assets/app.js",
+        "suffix": ".js",
+        "lines": 9,
+        "sha256": "0b2d0fc35b6dd2896095805bf055742fe3afbf5ef85e273feea761c92bbeb26d"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/dist/assets/index.css",
+        "suffix": ".css",
+        "lines": 1,
+        "sha256": "83826ed64ef6c4bfedb1bc60e7a2045b2903a5287e8ac731a6806ef112859922"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/dist/index.html",
+        "suffix": ".html",
+        "lines": 3,
+        "sha256": "456087e19cd25169a16b230c525d92571e5ed7746753fd172e99baa91ea47056"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/index.html",
+        "suffix": ".html",
+        "lines": 1,
+        "sha256": "f190c0d0c4103e01be00b900d50005089803b27f2c677c11dcfed972b0e46eae"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/AssignmentPublish5f9a76.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "2a6bde49c99c328c3a54c47ea022d22013b250322f9282d8fe242571e7433de5"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/AssignmentPublishOperation22eedd6b.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "49cdda5b6b8e20e283695f961f29a989641076d317174ced2f8e9875e06a62b8"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/AssignmentPublishOperation3388bf42.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "38ca285e215b6224d33b1a6c50f115bbbb51c8d9b487ec8829b28ca7565c37d3"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/AssignmentPublishOperation44141339.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "1fa741df0f80458c85cbe807d4b2191b490e28206609c5fb72d1335cf968b38f"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/ClassCourse56a5e5.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "3aedd4e19c5b73c6446712ce1e585cd05b1083370c64f50a704e344d785511f2"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/ClassCourseOperation2243561c.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "81512f886308176518ca20a8ef7043069d419e9362e7c0625f43dd5513792f90"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/ClassCourseOperation33cc4cbe.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "98f0e36db42d5a75f07e51655b69025266aaf8de69d779413ecf6a2358bca966"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/ClassCourseOperation44586b77.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "0213a78eb734d4d83ccdbfb3783fa51ca3096c8eddb5f54fb8ad5518854152cb"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/Dashboard66cd96.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "2346772436f9dabeccc5d55e7fba9c2fc96b34af34ea5d2d08fa44ae80b6158d"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/GradeFeedback580d04.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "ca610f5f1886f1fb3644100b361f330722ce5a7a0595bc651914a3b7b0052107"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/GradeFeedbackOperation22b554bf.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "8d1a003001387ecf9bbaf381d1f490a153cafbbabf83afe67205eaf8c5e2cd9e"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/GradeFeedbackOperation33446582.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "a43505ea34c6de42b1f5e43914de28cbd5ace07b93c692a3fb9a20aef927b1c8"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/GradeFeedbackOperation44916901.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "72afbcd7a0b18dd25dd4b731245163bc27d03c643198c23e1d7fcf5dc69d5a04"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/LearningReport0e7cb5.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "2d5283f34b290f988fe21c415cd1d19a1e7be93a116b61aa884870a586aeb5c8"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/LearningReportOperation22447ea1.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "7650744fa31ab1b700b338cc73117dafa5b3aeeb03343706d3c4820eb3b4f533"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/LearningReportOperation3357c12d.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "767d936d485a71644a815ec29f0153fbb012ce1f2e45fabf7d22131a9963fdfb"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/LearningReportOperation448f4044.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "8ee95fc6d91598280d93ab1af9bb661872cc6b734e7e94734d99b607f1accc9c"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/Login428821.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "fdedddeef7e1a4ea184a8d83b36c9f198154397878e3ebc4e72ef21f8f7033cb"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/MistakeCollection3ddd0e.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "c4614453f4395f7dd73bba7d9c4743f3479b6e37cb267236ac5a7b08d436db19"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/MistakeCollectionOperation227d90b1.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "57e577eb8565ba04cd0c41dd3a0e13df7e9eaff82d0ff2674b0d42735fc93ab6"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/MistakeCollectionOperation3393108d.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "2176717be4f50102a8fa00c45c6b6d4360efb389d6792a622cf34f09a755d15e"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/MistakeCollectionOperation444c04fa.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "1f14ff0e534e13524ea00dfd499565ba55d88fb033feb854e84c0b9cab2b5eff"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/Statistics49d484.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "743718c972bef63558fc8cf821952ff3d8783378a21342f3cf9741c6c8861c04"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/StudentSubmission04e963.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "598a488ab915492b91979a085a079786fb3a01330a27a6cf4207fbebdcf78310"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/StudentSubmissionOperation22a3c7c5.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "0e4a6c6c4bfc9e77e76d6d34cecee4f98ce612e712269e87e29eb3e6ec0b0941"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/StudentSubmissionOperation33a4af14.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "cbeb08ca0c50afe4bdd98187feefac561923a1e89782272e6d94fbc23335c62b"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/StudentSubmissionOperation441b9fd4.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "35b37dd7c4bf0e1739f4f49355f89e3c7c461a7d934a3636dc35d23d6ca53426"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/SubmissionTracking700e45.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "8a782e51777888f23d14e75b252020d2d1b9199916b0921ef3b7c755de2ae9c2"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/SubmissionTrackingOperation22f683d3.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "4e349890aa04d42e16fc52a4a6c42fe1ba9215c21f67fd23228a335aed1377f4"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/SubmissionTrackingOperation332ddba8.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "c8337ea1f4c189198fb33dd2905b0d4288c5e113c00114e547e47b7951736fb4"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/SubmissionTrackingOperation447868cf.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "e80cd110de9b6e669ee061441a53be06f4aa23f703642be7114dc0fabc63b4e6"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/TeacherGrading053f04.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "e4056a6106d541ae63f22b0ce6abef39c77a85119787f6eaab10797b66c46c4b"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/TeacherGradingOperation229d15c4.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "db9e33741c5f35ca9c270bdf8bed52bd3575a71b7e18da5c60efdb5309960977"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/TeacherGradingOperation33fc2e23.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "6456f5265674e229c38ab7010bc107dc644d8629573bfed5f3f6f2a70474d7ca"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/screens/TeacherGradingOperation44aeb88c.css",
+        "suffix": ".css",
+        "lines": 78,
+        "sha256": "be1a13b7cb690c1ef74add73ea79b2e47b57be8383f7b7532e3dbd93ecc66fc4"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/src/theme.css",
+        "suffix": ".css",
+        "lines": 96,
+        "sha256": "2b298b95aaf5713c4d30f9197f44af8bf19d73c672e68bbc9ba0ac8c8760e1df"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/vite.config.js",
+        "suffix": ".js",
+        "lines": 1,
+        "sha256": "76deec342390454af9a9aea0f929280922b13e19eaf8b6e304d440aabd02ee11"
+      },
+      {
+        "path": "web-console/ui-prototype/react-app/vite.runtime.config.js",
+        "suffix": ".js",
+        "lines": 1,
+        "sha256": "23e3a9d6bada92042cbb7ddbf2af0710be0706675b5213bcfe37bcc0ab9e1637"
+      },
+      {
+        "path": "web-console/ui-prototype/statistics.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "7577e6d538aa0a9ba3c9541ba4e1f295697c75429403b734d250e4d621eda4c4"
+      },
+      {
+        "path": "web-console/ui-prototype/student_submission.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "2b77600aadb0705f9a31e1eec2ba1a551068c0ff43346e3778064edc20bb8892"
+      },
+      {
+        "path": "web-console/ui-prototype/student_submission_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "a242de2ad6334c351ab7d07897257bd39520daa1fab6c01afb10529079d9ff38"
+      },
+      {
+        "path": "web-console/ui-prototype/student_submission_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "942f0810cbed29949e484dd03b18d2a437306b7cb9e79f72f00473a711530749"
+      },
+      {
+        "path": "web-console/ui-prototype/student_submission_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "8f93670a008a1091ab7a81c90c0704a56c287d9d83542a213a39dd2f8c3a31f8"
+      },
+      {
+        "path": "web-console/ui-prototype/submission_tracking.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "b43d5a1f171f8c5a809b13adba3056b207b0d699280a6f8fe476b62d6830058d"
+      },
+      {
+        "path": "web-console/ui-prototype/submission_tracking_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "f5dc228a18f923b6bf742500d97c1c87942ac696d2f5beb77c1c0c13f6a13973"
+      },
+      {
+        "path": "web-console/ui-prototype/submission_tracking_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "937df948504095968d177af689742582be1016242c18154bd0de967101da73cc"
+      },
+      {
+        "path": "web-console/ui-prototype/submission_tracking_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "d69cf458f6c4985b8927175834a30874ebe7e3b662fe823abf30817552e4c61d"
+      },
+      {
+        "path": "web-console/ui-prototype/teacher_grading.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "86849b05e631e38fb6adc1ad022a35eaf4bb3bdbea3a6e9d4b1bbf2777f117bb"
+      },
+      {
+        "path": "web-console/ui-prototype/teacher_grading_operation_2_2.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "df9b538e5bd50605b9c07b0002e96a560858f4ab5b1cb613d0b447783c578d59"
+      },
+      {
+        "path": "web-console/ui-prototype/teacher_grading_operation_3_3.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "aa67216deb2c09fb445518f52afae5b5a236771d92f3c6cfe791fbe6fddc57d4"
+      },
+      {
+        "path": "web-console/ui-prototype/teacher_grading_operation_4_4.html",
+        "suffix": ".html",
+        "lines": 504,
+        "sha256": "733431df18ca3c9bdddc8f2a5c54e1afb38ef68e27f8ea538f4020f55e50cc03"
+      }
+    ],
+    "deliverables": [
+      {
+        "path": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\image-reliability-20261113-143452\\education\\output\\校园作业批改与学情分析软件-real-run-192936-2\\校园作业批改与学情分析软件.docx",
+        "name": "校园作业批改与学情分析软件.docx",
+        "kind": "manual_docx",
+        "exists": true,
+        "size": 5536178,
+        "sha256": "4fcdd6531a34b3c32b1557026887265e12928bf4be0b57852d9bf1620b6d3923"
+      },
+      {
+        "path": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\image-reliability-20261113-143452\\education\\output\\校园作业批改与学情分析软件-real-run-192936-2\\校园作业批改与学情分析软件.pdf",
+        "name": "校园作业批改与学情分析软件.pdf",
+        "kind": "manual_pdf",
+        "exists": true,
+        "size": 4012243,
+        "sha256": "de015135669c3c55c2da5c86180526e4eb671eb71407084d951f5bff256c2310"
+      },
+      {
+        "path": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\image-reliability-20261113-143452\\education\\output\\校园作业批改与学情分析软件-real-run-192936-2\\校园作业批改与学情分析软件.txt",
+        "name": "校园作业批改与学情分析软件.txt",
+        "kind": "info_txt",
+        "exists": true,
+        "size": 5953,
+        "sha256": "ad7eb2626237520093287221095c6606c355276376fbc1d120f1b6ae3f2aaa3b"
+      },
+      {
+        "path": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\image-reliability-20261113-143452\\education\\output\\校园作业批改与学情分析软件-real-run-192936-2\\校园作业批改与学情分析软件_代码-(Python_JavaScript_SQL).docx",
+        "name": "校园作业批改与学情分析软件_代码-(Python_JavaScript_SQL).docx",
+        "kind": "source_docx",
+        "exists": true,
+        "size": 66206,
+        "sha256": "99794877825de6220992a19442d21508c996f563748c80c550d70ec4aa27e8ae"
+      },
+      {
+        "path": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\image-reliability-20261113-143452\\education\\output\\校园作业批改与学情分析软件-real-run-192936-2\\校园作业批改与学情分析软件_代码-(Python_JavaScript_SQL).pdf",
+        "name": "校园作业批改与学情分析软件_代码-(Python_JavaScript_SQL).pdf",
+        "kind": "source_pdf",
+        "exists": true,
+        "size": 818499,
+        "sha256": "c6a9417b111915dd0dbc519455115bb70891f7862238ac0fc0d00574f81149c1"
+      }
+    ],
+    "zip": {
+      "exists": true,
+      "path": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\image-reliability-20261113-143452\\education\\output\\校园作业批改与学情分析软件-real-run-192936-2--材料包.zip",
+      "size": 8887595,
+      "entries": [
+        "校园作业批改与学情分析软件.docx",
+        "校园作业批改与学情分析软件.pdf",
+        "校园作业批改与学情分析软件.txt",
+        "校园作业批改与学情分析软件_代码-(Python_JavaScript_SQL).docx",
+        "校园作业批改与学情分析软件_代码-(Python_JavaScript_SQL).pdf"
+      ],
+      "sha256": "082b7864e1566ff2dfaaf8497e41062e0a7ed6d21cf4972708d490b26dc6e986"
+    },
+    "findings": [],
+    "ready_for_delivery": true
+  },
+  "manual_ui_consistency": {
+    "manual_ui_consistency_checked": true,
+    "manual_ui_consistency_ready": true,
+    "manual_ui_expected_figure_count": 35,
+    "manual_ui_actual_figure_count": 35,
+    "manual_ui_title_mismatch_count": 0,
+    "manual_ui_title_mismatches": [],
+    "manual_ui_button_mismatch_count": 0,
+    "manual_ui_button_mismatches": [],
+    "manual_ui_missing_button_coverage_count": 0,
+    "manual_ui_missing_button_coverage": [],
+    "manual_ui_semantic_checked_count": 35,
+    "manual_ui_semantic_mismatch_count": 0,
+    "manual_ui_semantic_mismatches": [],
+    "manual_ui_semantic_coverage_missing_count": 0,
+    "manual_ui_semantic_coverage_missing": [],
+    "manual_ui_semantic_ready": true,
+    "manual_ui_expected_renderer": "admin",
+    "manual_ui_renderer_mismatch_count": 0,
+    "manual_ui_renderer_mismatches": []
+  },
+  "stage_timings": {
+    "blueprint": 0.13,
+    "manual_content": 0.0,
+    "source": 45.34,
+    "screenshots": 519.61,
+    "manual_docx": 1.32,
+    "source_docx": 1.54,
+    "pdf": 15.44,
+    "info": 0.0,
+    "package": 0.33,
+    "validate": 0.9
+  },
+  "reported_text_usage": {
+    "prompt_tokens": 375834,
+    "completion_tokens": 32793,
+    "total_tokens": 408627
+  },
+  "tests": {
+    "development": {
+      "runtime": "3.14.4 (tags/v3.14.4:23116f9, Apr  7 2026, 14:10:54) [MSC v.1944 64 bit (AMD64)]",
+      "tests_run": 376,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": true,
+      "elapsed_seconds": 42.06,
+      "failure_details": []
+    },
+    "production": {
+      "runtime": "3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]",
+      "tests_run": 376,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "passed": true,
+      "elapsed_seconds": 40.89,
+      "failure_details": []
+    }
+  },
+  "standard_validation": {
+    "python_compile": true,
+    "electron_syntax": true,
+    "vite_build": true
+  },
+  "evidence_directory": "tmp\\image-reliability-20261113-143452",
+  "zip_path": "D:\\Gpt\\SOFT\\soft-copyright-generator\\tmp\\image-reliability-20261113-143452\\education\\output\\校园作业批改与学情分析软件-real-run-192936-2--材料包.zip"
+}

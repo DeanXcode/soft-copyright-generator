@@ -61,6 +61,7 @@ try {
   $resources += [pscustomobject]@{
     from = "libreoffice"
     to = "libreoffice"
+    filter = @("**/*", "!help/**")
   }
   $buildConfig.extraResources = $resources
   ConvertTo-JsonUtf8File $buildConfig $builderConfigPath

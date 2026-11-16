@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld("softCopyright", {
   generateMaterials: (payload) => ipcRenderer.invoke("generate-materials", payload),
   cancelGeneration: () => ipcRenderer.invoke("cancel-generation"),
   getGenerationStatus: () => ipcRenderer.invoke("get-generation-status"),
+  reportRendererError: (payload) => ipcRenderer.invoke("report-renderer-error", payload),
   inferFeatureHint: (payload) => ipcRenderer.invoke("infer-feature-hint", payload),
   getModelConfig: () => ipcRenderer.invoke("get-model-config"),
   listAvailableModels: () => ipcRenderer.invoke("list-available-models"),

@@ -7,6 +7,7 @@ from typing import Any
 
 from .llm.provider import LLMProvider, LocalTemplateProvider, TextRetryPolicy
 from .llm.trace import trace_event
+from .llm.json_response import parse_json_object
 
 
 DOMAIN_PROFILES = [
@@ -73,6 +74,11 @@ DOMAIN_PROFILES = [
         "keywords": ["课程资源", "学习任务", "作业收交", "批改进度", "学情分析", "错题记录", "班级管理", "学习报告"],
     },
     {
+        "id": "workforce_attendance",
+        "triggers": ["考勤", "打卡", "签到", "签退", "补卡", "请假", "出勤", "迟到", "早退"],
+        "keywords": ["员工档案", "班次排班", "上下班打卡", "补卡申请", "请假申请", "出勤统计", "异常考勤", "考勤规则"],
+    },
+    {
         "id": "finance",
         "triggers": ["金融", "贷款", "信贷", "支付", "清算", "账单", "授信", "风控"],
         "keywords": ["客户授信", "贷款申请", "额度测算", "还款计划", "交易流水", "清算批次", "风险评级", "账单统计"],
@@ -103,6 +109,9 @@ def harmonize_feature_hint(
     require_llm: bool = False,
     min_blueprint_modules: int = 0,
 ) -> tuple[str, dict]:
+    decisive_contract = decisive_feature_contract(software_name, provided)
+    if decisive_contract:
+        return decisive_contract
     llm_result, failure_message = infer_feature_hint_with_llm(
         software_name,
         product_type,
@@ -132,6 +141,9 @@ def harmonize_feature_hint(
     if not provided:
         result = inferred
         source = "auto-name"
+    elif profile_id == "name-derived":
+        result = _merge_hints(provided, inferred)
+        source = "provided-merged"
     elif profile_id and provided_profile and provided_profile != profile_id:
         result = inferred
         source = "auto-replaced-mismatch"
@@ -256,6 +268,12 @@ def _infer_lightweight_feature_hint_two_step(
     product_type: str,
     provided: str,
 ) -> dict[str, Any] | None:
+    # The desktop outline timeout is applied to each of the two lightweight
+    # requests.  Keep retries at the operation layer (the user can retry the
+    # outline) so a slow gateway response does not multiply into an opaque
+    # queue timeout.
+    step_timeout = _lightweight_step_timeout(provider)
+    step_retry_policy = TextRetryPolicy(max_retries=0)
     try:
         profile_content = provider.chat(
             [
@@ -275,7 +293,8 @@ def _infer_lightweight_feature_hint_two_step(
             max_tokens=700,
             response_format={"type": "json_object"},
             trace_label="feature_hint:profile",
-            retry_policy=TextRetryPolicy(max_retries=1),
+            timeout=step_timeout,
+            retry_policy=step_retry_policy,
         )
         profile = _normalize_domain_profile(_parse_json(profile_content))
     except Exception as exc:
@@ -302,7 +321,8 @@ def _infer_lightweight_feature_hint_two_step(
             max_tokens=1400,
             response_format={"type": "json_object"},
             trace_label="feature_hint:modules",
-            retry_policy=TextRetryPolicy(max_retries=1),
+            timeout=step_timeout,
+            retry_policy=step_retry_policy,
         )
         modules_data = _parse_json(modules_content)
     except Exception as exc:
@@ -314,6 +334,15 @@ def _infer_lightweight_feature_hint_two_step(
         "should_replace": True,
     }
     return _normalize_llm_result(combined)
+
+
+def _lightweight_step_timeout(provider: LLMProvider) -> int:
+    configured = getattr(getattr(provider, "config", None), "timeout", 60)
+    try:
+        configured_seconds = int(configured or 60)
+    except (TypeError, ValueError):
+        configured_seconds = 60
+    return max(30, min(120, configured_seconds))
 
 
 def _safe_llm_error_message(exc: Exception) -> str:
@@ -554,6 +583,80 @@ def _harmonize_llm_result(provided: str, result: dict[str, Any]) -> tuple[str, d
         "feature_hint_blueprint_modules": result.get("blueprint_modules") or [],
         "feature_hint_elapsed_seconds": result.get("elapsed_seconds", 0),
     }
+
+
+def decisive_feature_contract(software_name: str, provided: str = "") -> tuple[str, dict] | None:
+    """Return a deterministic semantic contract for an unambiguous software name."""
+    contract = _decisive_name_contract(software_name)
+    return _harmonize_llm_result(provided, contract) if contract else None
+
+
+def _decisive_name_contract(software_name: str) -> dict[str, Any] | None:
+    text = _clean_hint(software_name)
+    if not any(term in text for term in ("代理记账", "代账", "财税代办")):
+        return None
+
+    module_specs = (
+        ("client_ledger_setup", "客户建档", "客户与账套建档", "维护企业客户、服务合同、会计制度、纳税人资格和账套期间，校验统一社会信用代码与服务范围后启用账套，为后续票据、凭证、申报和报表建立唯一核算边界。", ["企业客户", "服务合同", "核算账套"], ["查询客户账套", "登记企业客户", "启用核算账套", "变更服务范围", "导出客户清单"], ["客户编码", "企业名称", "统一社会信用代码", "纳税人资格", "会计制度", "账套期间", "服务状态"], ["客户账套台", "客户建档详情"]),
+        ("invoice_document_intake", "票据采集", "票据与原始凭证采集", "接收客户提交的销项发票、进项发票、费用单据和银行回单，完成来源登记、影像关联、期间归属、重复票据校验与缺件标记，形成待制证原始凭证清单。", ["票据批次", "发票记录", "原始凭证"], ["查询票据批次", "导入票据影像", "校验重复票据", "标记缺失附件", "提交待制证清单"], ["票据编号", "票据类型", "开票日期", "含税金额", "税额", "所属期间", "附件状态"], ["票据采集台", "票据校验详情"]),
+        ("voucher_preparation_review", "会计核算", "记账凭证编制复核", "依据已验收票据和业务性质编制会计分录，维护摘要、科目、借贷金额和辅助核算项，通过借贷平衡与期间规则校验后提交复核并形成可追溯凭证。", ["记账凭证", "会计分录", "科目余额"], ["查询待制凭证", "编制会计分录", "校验借贷平衡", "提交凭证复核", "退回异常凭证"], ["凭证字号", "凭证日期", "会计科目", "摘要", "借方金额", "贷方金额", "复核状态"], ["凭证编制台", "凭证复核详情"]),
+        ("bank_reconciliation", "资金核对", "银行流水与账务对账", "导入客户银行流水并按金额、日期、对方户名和摘要匹配账务记录，对未达账项进行认领、调整或挂起，输出对账差异与处理结果。", ["银行流水", "账务记录", "未达账项"], ["查询对账批次", "导入银行流水", "匹配账务记录", "认领未达账项", "生成差异清单"], ["银行账号", "交易日期", "交易金额", "对方户名", "交易摘要", "匹配状态", "差异原因"], ["银行对账台", "未达账项详情"]),
+        ("period_close", "期末处理", "月末结转与关账", "在凭证复核、银行对账和税费计提完成后执行损益结转、余额试算和期间完整性检查，对异常科目退回调整，确认无误后关闭会计期间并保留关账证据。", ["会计期间", "结转任务", "试算平衡表"], ["查询期末任务", "执行损益结转", "检查试算平衡", "退回期末异常", "确认期间关账"], ["会计期间", "结转批次", "借方合计", "贷方合计", "异常科目数", "关账状态", "关账时间"], ["期末结账台", "试算平衡详情"]),
+        ("tax_declaration", "税务申报", "税费测算与申报管理", "按客户税种认定和申报周期汇总销项、进项、收入、成本及优惠数据，完成税额测算、申报表复核、申报回执登记和异常更正，跟踪各税种申报状态。", ["税种认定", "申报任务", "申报回执"], ["查询申报任务", "测算应纳税额", "复核申报表", "登记申报回执", "发起申报更正"], ["税款所属期", "税种", "计税依据", "应纳税额", "优惠金额", "申报状态", "回执编号"], ["税务申报台", "申报任务详情"]),
+        ("financial_reporting", "财务报告", "财务报表出具", "从已关账期间汇总资产负债、利润和现金流数据，执行报表勾稽与期初期末校验，生成客户财务报表、科目余额表及经营摘要并记录交付版本。", ["财务报表", "科目余额表", "报表版本"], ["查询报表期间", "生成财务报表", "校验报表勾稽", "发布报表版本", "导出客户报表"], ["报表期间", "资产总额", "负债总额", "营业收入", "利润总额", "勾稽状态", "版本号"], ["财务报表台", "报表校验详情"]),
+        ("service_delivery_archive", "服务交付", "代账任务交付归档", "汇总代账周期内的票据接收、凭证复核、对账、关账、申报和报表成果，核对服务清单与缺失事项，向客户交付结果并按账套和期间归档审计记录。", ["服务周期", "交付清单", "归档记录"], ["查询交付周期", "核对服务清单", "确认客户交付", "归档账务材料", "导出交付目录"], ["服务期间", "客户名称", "凭证数量", "申报完成数", "报表版本", "缺失事项", "归档状态"], ["服务交付台", "材料归档详情"]),
+    )
+    modules: list[dict[str, Any]] = []
+    for key, category, title, description, objects, operations, fields, pages in module_specs:
+        modules.append(
+            {
+                "key": key,
+                "category": category,
+                "title": title,
+                "description": description,
+                "entities": [f"{''.join(part.title() for part in key.split('_'))}Record", f"{''.join(part.title() for part in key.split('_'))}Trace"],
+                "operations": operations,
+                "operation_specs": _decisive_operation_specs(key, title, operations, fields),
+                "data_fields": fields,
+                "data_objects": objects,
+                "user_flow": [f"进入{pages[0]}", operations[0], operations[1], operations[2], f"查看{title}处理结果"],
+                "screens": pages,
+                "pages": pages,
+                "rules": [f"{title}数据必须归属于唯一企业客户和会计期间", f"{operations[1]}前必须通过必填字段与状态校验", f"{operations[2]}结果必须记录经办人、时间和审计证据"],
+            }
+        )
+    keywords = ["企业客户建档", "核算账套", "票据采集", "记账凭证", "银行对账", "月末结账", "税务申报", "财务报表", "服务交付", "材料归档"]
+    return {
+        "profile": "agency_accounting",
+        "domain": "企业代理记账与财税服务",
+        "target_users": ["代账会计", "复核会计", "税务专员", "财务主管", "客户对接人员"],
+        "keywords": keywords,
+        "feature_hint": "、".join(keywords),
+        "avoid_terms": ["个人消费记账", "个人账本", "游戏修改器", "游戏辅助工具", "月影题材内容", "消费级移动应用"],
+        "blueprint_modules": modules,
+        "should_replace": True,
+        "reason": "软件名称中的“代账”按企业代理记账和财税服务解释，品牌词不得改变核心业务领域。",
+        "elapsed_seconds": 0,
+    }
+
+
+def _decisive_operation_specs(key: str, title: str, operations: list[str], fields: list[str]) -> list[dict[str, Any]]:
+    categories = ("lookup", "mutation", "workflow")
+    return [
+        {
+            "action_key": f"{key}_{index}",
+            "label": label,
+            "category": categories[index - 1],
+            "role": "代账业务人员" if index < 3 else "复核会计",
+            "trigger": f"需要执行{label}时",
+            "input_fields": fields[:3],
+            "pre_state": f"{title}处于待处理状态",
+            "post_state": f"{label}已完成并更新业务状态",
+            "result_evidence": f"页面显示{label}结果、处理人、处理时间和审计记录",
+            "requires_confirmation": index == 3,
+        }
+        for index, label in enumerate(operations[:3], start=1)
+    ]
 
 
 def _normalize_llm_result(data: dict[str, Any]) -> dict[str, Any] | None:
@@ -801,18 +904,7 @@ def _keywords_from_modules(modules: list[dict[str, Any]]) -> list[str]:
 
 
 def _parse_json(content: str) -> dict[str, Any]:
-    cleaned = str(content or "").strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
-        cleaned = re.sub(r"```$", "", cleaned).strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start >= 0 and end > start:
-        cleaned = cleaned[start : end + 1]
-    data = json.loads(cleaned)
-    if not isinstance(data, dict):
-        raise ValueError("feature hint result is not a JSON object")
-    return data
+    return parse_json_object(content, label="feature_inference")
 
 
 def infer_feature_hint(software_name: str, product_type: str = "") -> tuple[str, str]:

@@ -18,10 +18,13 @@ export default function SettingsDrawer({
   onRefreshAccount,
   onRefreshModels
 }) {
+  modelConfig = normalizeSettingsModelConfig(modelConfig);
+  modelCatalog = normalizeSettingsModelCatalog(modelCatalog);
   const selectedTextProvider = textProviderChoices.find((item) => item.value === modelConfig.textProvider) || textProviderChoices[0];
   const providerFallbackModels = providerModelChoices[selectedTextProvider.value] || [selectedTextProvider.defaultModel];
-  const catalogModels = modelCatalog.provider === selectedTextProvider.value && modelCatalog.models.length
-    ? modelCatalog.models
+  const availableModels = modelCatalog.models;
+  const catalogModels = modelCatalog.provider === selectedTextProvider.value && availableModels.length
+    ? availableModels
     : [...new Set([modelConfig.modelName, modelConfig.outlineModelName, modelConfig.frontendModelName, ...providerFallbackModels].filter(Boolean))];
   return (
     <div
@@ -326,6 +329,35 @@ export default function SettingsDrawer({
       </aside>
     </div>
   );
+}
+
+function normalizeSettingsModelConfig(value) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    ...source,
+    mode: String(source.mode || "gpt"),
+    textProvider: String(source.textProvider || "custom"),
+    modelName: String(source.modelName || ""),
+    outlineModelName: String(source.outlineModelName || ""),
+    frontendModelName: String(source.frontendModelName || ""),
+    frontendWorkers: String(source.frontendWorkers || "auto"),
+    apiBaseUrl: String(source.apiBaseUrl || ""),
+    apiKey: String(source.apiKey || ""),
+    imageModelName: String(source.imageModelName || "gpt-image-2"),
+    imageApiBaseUrl: String(source.imageApiBaseUrl || ""),
+    imageApiKey: String(source.imageApiKey || "")
+  };
+}
+
+function normalizeSettingsModelCatalog(value) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    ...source,
+    status: String(source.status || "idle"),
+    provider: String(source.provider || ""),
+    models: Array.isArray(source.models) ? source.models.map((model) => String(model || "").trim()).filter(Boolean) : [],
+    message: String(source.message || "")
+  };
 }
 
 function SettingsSectionHeading({ icon, title, description }) {

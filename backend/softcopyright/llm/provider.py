@@ -24,6 +24,16 @@ class GeneratedImageQualityError(ValueError):
     """Raised when an image API returns a decodable but unusable placeholder."""
 
 
+class ImageProviderError(RuntimeError):
+    """Image failure with a bounded, inspectable retry outcome."""
+
+    def __init__(self, message: str, *, attempts: int, stop_reason: str, elapsed_seconds: float):
+        super().__init__(message)
+        self.attempts = attempts
+        self.stop_reason = stop_reason
+        self.elapsed_seconds = elapsed_seconds
+
+
 class TextErrorCategory(str, Enum):
     CONFIGURATION = "configuration_error"
     RATE_LIMIT = "rate_limit"
@@ -85,6 +95,12 @@ class TextProviderError(RuntimeError):
 
 class TextRequestCancelled(RuntimeError):
     pass
+
+
+class TextResponseError(ValueError):
+    def __init__(self, message: str, category: TextErrorCategory):
+        super().__init__(message)
+        self.category = category
 
 
 @dataclass
@@ -165,14 +181,19 @@ class OpenAICompatibleProvider(LLMProvider):
         if not self.config.api_key:
             raise ValueError("LLM api_key 不能为空")
 
-        url = base_url
-        if not url.endswith("/chat/completions"):
-            url = f"{url}/chat/completions"
+        endpoint_urls = _openai_endpoint_candidates(base_url, "/chat/completions")
+        endpoint_index = 0
+        url = endpoint_urls[endpoint_index]
+        adaptive_max_tokens = max(1, int(max_tokens or 1))
+        adaptive_max_token_cap = _env_int(
+            "SOFT_LLM_MAX_OUTPUT_TOKENS", 8192, minimum=1024, maximum=32768
+        )
+        adaptive_length_retries = 0
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            "max_tokens": adaptive_max_tokens,
             "stream": bool(self.config.stream) and not _messages_include_image(messages),
         }
         reasoning_effort = _normalize_reasoning_effort(self.config.reasoning_effort)
@@ -186,11 +207,15 @@ class OpenAICompatibleProvider(LLMProvider):
         policy = retry_policy or TextRetryPolicy(max_retries=self.config.retry_count)
         retry_budget = policy.normalized_retries()
         total_attempts = retry_budget + 1
+        compatibility_fallback_used = False
+        model_fallback_used = False
         effective_timeout = max(10, int(timeout or self.config.timeout or 120))
         stream_hard_timeout = _stream_hard_timeout_seconds(effective_timeout) if payload["stream"] else 0
-        for attempt in range(1, total_attempts + 1):
+        attempt = 1
+        while attempt <= total_attempts:
             _raise_if_text_cancelled(cancel_event)
             started_at = time.perf_counter()
+            response_metadata: dict[str, Any] = {}
             _notify_retry_policy(policy.on_attempt, attempt, retry_budget)
             trace_event(
                 "provider_request_begin",
@@ -200,8 +225,9 @@ class OpenAICompatibleProvider(LLMProvider):
                 provider=self.config.provider,
                 model=self.config.model,
                 timeout=effective_timeout,
-                max_tokens=max_tokens,
+                max_tokens=int(payload.get("max_tokens") or adaptive_max_tokens),
                 message_count=len(messages),
+                input_chars=sum(len(str(message.get("content", ""))) for message in messages),
                 response_format=bool(response_format),
                 multimodal=_messages_include_image(messages),
                 stream_hard_timeout=stream_hard_timeout,
@@ -211,11 +237,27 @@ class OpenAICompatibleProvider(LLMProvider):
                 session = _new_requests_session()
                 cancellation = _ResponseCancellation(cancel_event, session)
                 try:
-                    response = session.post(url, json=payload, headers=headers, timeout=effective_timeout, stream=True)
+                    response = session.post(url, json=dict(payload), headers=headers, timeout=effective_timeout, stream=True)
                     cancellation.bind(response)
                     response.raise_for_status()
+                    if _is_html_response(response) and endpoint_index + 1 < len(endpoint_urls):
+                        endpoint_index += 1
+                        url = endpoint_urls[endpoint_index]
+                        trace_event(
+                            "provider_request_endpoint_fallback",
+                            label=trace_label,
+                            attempt=attempt,
+                            from_url_path="/chat/completions",
+                            to_url_path="/v1/chat/completions",
+                            reason="endpoint returned HTML",
+                        )
+                        continue
                     stream_deadline = time.perf_counter() + stream_hard_timeout if stream_hard_timeout else None
-                    content = _extract_chat_content(response, deadline=stream_deadline, cancel_event=cancel_event)
+                    content = _extract_chat_content(
+                        response, deadline=stream_deadline, cancel_event=cancel_event,
+                        metadata=response_metadata,
+                    )
+                    _validate_chat_completion(response_metadata)
                     if not content:
                         raise ValueError("LLM response content is empty")
                 finally:
@@ -228,6 +270,7 @@ class OpenAICompatibleProvider(LLMProvider):
                     elapsed_seconds=round(time.perf_counter() - started_at, 3),
                     status_code=response.status_code,
                     content_chars=len(content or ""),
+                    **response_metadata,
                 )
                 _notify_retry_policy(policy.on_success, attempt, retry_budget)
                 return content
@@ -239,9 +282,15 @@ class OpenAICompatibleProvider(LLMProvider):
                     if cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set()
                     else classify_text_error(exc)
                 )
-                will_retry = attempt < total_attempts and policy.should_retry(category)
+                length_retry = (
+                    category != TextErrorCategory.CANCELLED
+                    and response_metadata.get("finish_reason") == "length"
+                    and adaptive_length_retries < 2
+                    and int(payload.get("max_tokens") or adaptive_max_tokens) < adaptive_max_token_cap
+                )
+                will_retry = length_retry or (attempt < total_attempts and policy.should_retry(category))
                 stop_reason = "retrying" if will_retry else _text_stop_reason(category, attempt, total_attempts)
-                safe_error = sanitize_error_message(exc, limit=500)
+                safe_error = _provider_error_detail(exc, limit=500)
                 trace_event(
                     "provider_request_error",
                     label=trace_label,
@@ -254,10 +303,76 @@ class OpenAICompatibleProvider(LLMProvider):
                     retry_budget=retry_budget,
                     will_retry=will_retry,
                     stop_reason=stop_reason,
+                    **response_metadata,
                 )
                 _notify_retry_policy(policy.on_error, category, attempt, retry_budget, will_retry, stop_reason)
+                # DeepSeek and some OpenAI-compatible gateways may stop a
+                # JSON response at the requested output limit.  A format
+                # retry with the same budget deterministically fails again;
+                # grow the budget in bounded steps while keeping the original
+                # request contract and strict completion validation.
+                if length_retry:
+                    previous_max_tokens = int(payload.get("max_tokens") or adaptive_max_tokens)
+                    next_max_tokens = min(
+                        adaptive_max_token_cap,
+                        max(previous_max_tokens * 2, previous_max_tokens + 1024),
+                    )
+                    if next_max_tokens > previous_max_tokens:
+                        adaptive_length_retries += 1
+                        payload["max_tokens"] = next_max_tokens
+                        total_attempts += 1
+                        trace_event(
+                            "provider_request_length_retry",
+                            label=trace_label,
+                            attempt=attempt,
+                            previous_max_tokens=previous_max_tokens,
+                            next_max_tokens=next_max_tokens,
+                            retry_number=adaptive_length_retries,
+                            max_retry_count=2,
+                        )
+                        attempt += 1
+                        continue
+                # A subset of OpenAI-compatible gateways advertises chat
+                # completions but rejects the optional JSON response_format.
+                # This is a narrowly-scoped compatibility fallback: only an
+                # explicit 400 mentioning that parameter is eligible, and it
+                # is attempted once. Authentication, model and permission
+                # errors remain fail-fast configuration errors.
+                if (
+                    not compatibility_fallback_used
+                    and response_format
+                    and _is_response_format_compatibility_error(exc)
+                ):
+                    compatibility_fallback_used = True
+                    payload.pop("response_format", None)
+                    total_attempts += 1
+                    trace_event(
+                        "provider_request_compatibility_fallback",
+                        label=trace_label,
+                        attempt=attempt,
+                        fallback="remove_response_format",
+                        reason=safe_error,
+                    )
+                    attempt += 1
+                    continue
+                pricing_fallback = _pricing_model_fallback(exc, current_model=str(payload.get("model") or ""))
+                if not model_fallback_used and pricing_fallback:
+                    model_fallback_used = True
+                    payload["model"] = pricing_fallback
+                    total_attempts += 1
+                    trace_event(
+                        "provider_request_model_fallback",
+                        label=trace_label,
+                        attempt=attempt,
+                        from_model=str(self.config.model or ""),
+                        to_model=pricing_fallback,
+                        reason=safe_error,
+                    )
+                    attempt += 1
+                    continue
                 if will_retry:
                     _wait_retry_delay(policy.delay_seconds(attempt), cancel_event)
+                    attempt += 1
                     continue
                 raise _text_provider_failure(
                     "LLM",
@@ -268,7 +383,7 @@ class OpenAICompatibleProvider(LLMProvider):
                     stop_reason=stop_reason,
                     status_code=status_code,
                 ) from exc
-        raise RuntimeError(f"LLM 请求失败：{sanitize_error_message(last_error)}")
+        raise RuntimeError(f"LLM 请求失败：{_provider_error_detail(last_error)}")
 
     def generate_image(
         self,
@@ -288,9 +403,9 @@ class OpenAICompatibleProvider(LLMProvider):
         if not model:
             raise ValueError("图片模型名称不能为空")
 
-        url = base_url
-        if not url.endswith("/images/generations"):
-            url = f"{url}/images/generations"
+        endpoint_urls = _openai_endpoint_candidates(base_url, "/images/generations")
+        endpoint_index = 0
+        url = endpoint_urls[endpoint_index]
         payload_base: dict[str, Any] = {
             "model": model,
             "n": 1,
@@ -300,7 +415,13 @@ class OpenAICompatibleProvider(LLMProvider):
         error_history: list[dict[str, Any]] = []
         timeout = int(getattr(self.config, "image_timeout", self.config.timeout) or self.config.timeout)
         total_attempts = max(1, getattr(self.config, "image_retry_count", self.config.retry_count) + 1)
-        for attempt in range(1, total_attempts + 1):
+        slow_failure_limit = _env_int("SOFT_LLM_IMAGE_SLOW_FAILURE_LIMIT", 2, minimum=1, maximum=6)
+        slow_failure_seconds = _env_int("SOFT_LLM_IMAGE_SLOW_FAILURE_SECONDS", 60, minimum=10, maximum=360)
+        slow_failures = 0
+        request_started_at = time.perf_counter()
+        attempt = 1
+        stop_reason = "retry_budget_exhausted"
+        while attempt <= total_attempts:
             started_at = time.perf_counter()
             prompt_for_attempt = _image_prompt_for_attempt(prompt, attempt)
             size_for_attempt = _image_size_for_attempt(size, attempt)
@@ -313,16 +434,33 @@ class OpenAICompatibleProvider(LLMProvider):
                 provider=self.config.provider,
                 model=model,
                 timeout=timeout,
+                slow_failure_limit=slow_failure_limit,
+                slow_failure_seconds=slow_failure_seconds,
                 size=size_for_attempt,
                 prompt_chars=len(prompt_for_attempt or ""),
             )
             try:
                 session = _new_requests_session()
+                response = None
                 try:
-                    response = session.post(url, json=payload, headers=headers, timeout=timeout)
+                    response = session.post(url, json=payload, headers=headers, timeout=(min(15, timeout), timeout))
                     response.raise_for_status()
+                    if _is_html_response(response) and endpoint_index + 1 < len(endpoint_urls):
+                        endpoint_index += 1
+                        url = endpoint_urls[endpoint_index]
+                        trace_event(
+                            "provider_image_endpoint_fallback",
+                            label=trace_label,
+                            attempt=attempt,
+                            from_url_path="/images/generations",
+                            to_url_path="/v1/images/generations",
+                            reason="endpoint returned HTML",
+                        )
+                        continue
                     data = response.json()
                 finally:
+                    if response is not None:
+                        response.close()
                     session.close()
                 saved = _save_image_response(data, output_path, timeout=timeout)
                 trace_event(
@@ -334,22 +472,43 @@ class OpenAICompatibleProvider(LLMProvider):
                     model=model,
                     source=saved.get("source", ""),
                     bytes=saved.get("bytes", 0),
+                    total_elapsed_seconds=round(time.perf_counter() - request_started_at, 3),
                 )
                 return {
                     "model": model,
                     "path": str(output_path),
                     "size": size_for_attempt,
+                    "attempts": attempt,
+                    "elapsed_seconds": round(time.perf_counter() - request_started_at, 3),
                     **saved,
                 }
             except Exception as exc:
                 last_error = exc
                 status_code = getattr(getattr(exc, "response", None), "status_code", None)
-                safe_error = sanitize_error_message(exc, limit=500)
+                safe_error = _provider_error_detail(exc, limit=500)
+                elapsed_seconds = time.perf_counter() - started_at
+                retryable = _should_retry_provider_error(exc)
+                slow_failure = (
+                    retryable
+                    and not isinstance(exc, GeneratedImageQualityError)
+                    and elapsed_seconds >= slow_failure_seconds
+                )
+                slow_failures = slow_failures + 1 if slow_failure else 0
+                if not retryable:
+                    stop_reason = "non_retryable_error"
+                elif slow_failures >= slow_failure_limit:
+                    stop_reason = "consecutive_slow_failures"
+                elif attempt >= total_attempts:
+                    stop_reason = "retry_budget_exhausted"
+                else:
+                    stop_reason = "retrying"
+                will_retry = stop_reason == "retrying"
                 error_history.append(
                     {
                         "attempt": attempt,
                         "status_code": status_code,
                         "size": size_for_attempt,
+                        "error_type": type(exc).__name__,
                         "error": safe_error,
                     }
                 )
@@ -357,17 +516,28 @@ class OpenAICompatibleProvider(LLMProvider):
                     "provider_image_request_error",
                     label=trace_label,
                     attempt=attempt,
-                    elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                    elapsed_seconds=round(elapsed_seconds, 3),
+                    total_elapsed_seconds=round(time.perf_counter() - request_started_at, 3),
                     status_code=status_code,
                     error_type=type(exc).__name__,
                     error=safe_error,
+                    slow_failure_streak=slow_failures,
+                    will_retry=will_retry,
+                    stop_reason=stop_reason,
                 )
-                if attempt < total_attempts and _should_retry_provider_error(exc):
+                if will_retry:
                     time.sleep(_retry_delay_seconds(attempt))
+                    attempt += 1
                     continue
                 break
-        raise RuntimeError(
-            _image_failure_message(last_error, model=model, attempts=attempt, error_history=error_history)
+        message = _image_failure_message(last_error, model=model, attempts=attempt, error_history=error_history)
+        if stop_reason == "consecutive_slow_failures":
+            message += f" 连续 {slow_failures} 次图片请求长时间失败，已停止重复等待；请稍后从已保存进度继续。"
+        raise ImageProviderError(
+            message,
+            attempts=attempt,
+            stop_reason=stop_reason,
+            elapsed_seconds=round(time.perf_counter() - request_started_at, 3),
         )
 
 
@@ -764,6 +934,29 @@ def _new_requests_session() -> requests.Session:
     return session
 
 
+def _openai_endpoint_candidates(base_url: str, suffix: str) -> list[str]:
+    normalized = str(base_url or "").rstrip("/")
+    if not normalized:
+        return []
+    if normalized.endswith(suffix):
+        return [normalized]
+    candidates = [f"{normalized}{suffix}"]
+    if "/v1" not in normalized.lower().split("?", 1)[0]:
+        candidates.append(f"{normalized}/v1{suffix}")
+    return list(dict.fromkeys(candidates))
+
+
+def _is_html_response(response: requests.Response) -> bool:
+    content_type = str(getattr(response, "headers", {}).get("content-type", "")).lower()
+    if "text/html" in content_type:
+        return True
+    try:
+        prefix = bytes(getattr(response, "content", b"") or b"")[:128].lstrip().lower()
+    except Exception:
+        return False
+    return prefix.startswith(b"<!doctype html") or prefix.startswith(b"<html")
+
+
 def _messages_include_image(messages: list[dict[str, Any]]) -> bool:
     for message in messages:
         content = message.get("content") if isinstance(message, dict) else None
@@ -834,7 +1027,7 @@ def _notify_retry_policy(callback: Any | None, *args: Any) -> None:
 
 
 def classify_text_error(exc: Exception) -> TextErrorCategory:
-    if isinstance(exc, TextProviderError):
+    if isinstance(exc, (TextProviderError, TextResponseError)):
         return exc.category
     if isinstance(exc, TextRequestCancelled):
         return TextErrorCategory.CANCELLED
@@ -866,6 +1059,7 @@ def classify_text_error(exc: Exception) -> TextErrorCategory:
         marker in text
         for marker in (
             "connection reset",
+            "connection broken",
             "connection aborted",
             "connection closed",
             "remote end closed",
@@ -877,11 +1071,75 @@ def classify_text_error(exc: Exception) -> TextErrorCategory:
         )
     ):
         return TextErrorCategory.CONNECTION
+    if "connection broken" in text or "connectionreseterror" in text:
+        return TextErrorCategory.CONNECTION
     if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)) or "json" in text or "parse" in text:
         return TextErrorCategory.FORMAT
     if isinstance(exc, ValueError):
         return TextErrorCategory.QUALITY
     return TextErrorCategory.GATEWAY
+
+
+def _provider_error_detail(exc: Exception, *, limit: int = 500) -> str:
+    """Include a short, sanitized gateway body for actionable HTTP errors."""
+    detail = str(exc or "")
+    response = getattr(exc, "response", None)
+    body = ""
+    try:
+        body = str(getattr(response, "text", "") or "").strip()
+    except Exception:
+        body = ""
+    if body and body not in detail:
+        detail = f"{detail}: {body}"
+    return sanitize_error_message(detail, limit=limit)
+
+
+def _is_response_format_compatibility_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code is None or int(status_code) != 400:
+        return False
+    try:
+        text = str(getattr(response, "text", "") or "").lower()
+    except Exception:
+        text = str(exc or "").lower()
+    if not text:
+        text = str(exc or "").lower()
+    markers = (
+        "response_format",
+        "json_object",
+        "structured output",
+        "response format",
+        "unknown parameter",
+        "unrecognized request argument",
+        "unsupported parameter",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _pricing_model_fallback(exc: Exception, *, current_model: str) -> str:
+    """Return an explicitly configured fallback for an unusable model route."""
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code not in {400, 404}:
+        return ""
+    try:
+        text = str(getattr(response, "text", "") or "").lower()
+    except Exception:
+        text = str(exc or "").lower()
+    pricing_error = "no effective pricing" in text or "effective pricing" in text
+    unsupported_error = any(marker in text for marker in ("model not supported", "暂不支持", "请更换模型", "unsupported model"))
+    if not pricing_error and not unsupported_error:
+        return ""
+    candidates = (
+        os.getenv("SOFT_MODEL_GPT_FRONTEND_FALLBACK_NAME", "").strip(),
+        os.getenv("SOFT_MODEL_GPT_NAME", "").strip(),
+        os.getenv("SOFT_PROVIDER_CUSTOM_MODEL", "").strip(),
+    )
+    for candidate in candidates:
+        if candidate and candidate != current_model:
+            return candidate
+    return ""
 
 
 def _text_stop_reason(category: TextErrorCategory, attempt: int, total_attempts: int) -> str:
@@ -904,7 +1162,7 @@ def _text_provider_failure(
     stop_reason: str,
     status_code: int | None,
 ) -> TextProviderError:
-    detail = sanitize_error_message(exc)
+    detail = _provider_error_detail(exc)
     return TextProviderError(
         f"{provider_name} 请求失败：{detail}（错误类别 {category.value}，已请求 {attempts} 次，重试预算 {retry_budget}，停止原因 {stop_reason}）",
         category=category,
@@ -994,13 +1252,24 @@ def _image_failure_message(
         if item.get("status_code") is not None
     ]
     status_summary = f"，状态序列 {' → '.join(str(item) for item in statuses)}" if statuses else ""
+    quality_failures = sum(
+        1 for item in (error_history or []) if str(item.get("error_type") or "") == "GeneratedImageQualityError"
+    )
+    mixed_summary = ""
+    if quality_failures and statuses:
+        mixed_summary = f"；其中 {quality_failures} 次返回图片但未通过本地质量校验，{len(statuses)} 次返回 HTTP {'/'.join(str(item) for item in statuses)}"
     transient_statuses = {429, 500, 502, 503, 504, 520, 522, 523, 524}
-    if status_code in transient_statuses or any(item in transient_statuses for item in statuses):
+    if statuses and not quality_failures and any(item in transient_statuses for item in statuses):
         return (
             f"图片生成请求失败：图片模型 {model} 的上游服务临时不可用{retry_text}{status_summary}。"
-            "正式流程不会使用模板或中间图兜底；请稍后保留蓝图重试，或检查图片模型配置 "
-            "SOFT_MODEL_GPT_IMAGE_NAME / SOFT_MODEL_GPT_IMAGE_BASE_URL 是否指向可用的 gpt-image-2 图片服务；"
+            "正式流程不会使用模板或中间图兜底；请稍后保留蓝图重试，或检查图片模型和图片渠道是否可用；"
             "如果连续返回 502/524，通常需要更换、充值或修复 NewAPI 图片上游渠道。"
+            f" 原始摘要：{detail}"
+        )
+    if quality_failures:
+        return (
+            f"图片生成请求失败：图片模型 {model} 已请求 {attempts} 次{mixed_summary}。"
+            "已保留最后一张图片供本地重新校验；请保留蓝图重试，合格图片将直接复用，不会重复请求 image2。"
             f" 原始摘要：{detail}"
         )
     if status_code in {400, 401, 403, 404}:
@@ -1109,8 +1378,17 @@ def _inspect_generated_image(raw: bytes) -> dict[str, Any]:
         and luminance_stddev >= 12
         and dominant_ratio <= 0.78
     )
+    light_structured_ui_soft_pass = (
+        content_area_ratio >= 0.75
+        and 0.08 <= ink_ratio <= 0.65
+        and active_bucket_count >= 8
+        and luminance_stddev >= 14
+        and dominant_ratio <= 0.9
+        and int(ui_edge_metrics["axis_edge_score"]) >= 3
+        and int(ui_edge_metrics["axis_edge_total"]) >= 50
+    )
     if (
-        not (complex_ui_soft_pass or dense_dark_ui_soft_pass)
+        not (complex_ui_soft_pass or dense_dark_ui_soft_pass or light_structured_ui_soft_pass)
         and int(ui_edge_metrics["axis_edge_score"]) < 8
         and int(ui_edge_metrics["axis_edge_total"]) < 260
     ):
@@ -1127,6 +1405,7 @@ def _inspect_generated_image(raw: bytes) -> dict[str, Any]:
             "luminance_stddev": round(luminance_stddev, 3),
             "complex_ui_soft_pass": bool(complex_ui_soft_pass),
             "dense_dark_ui_soft_pass": bool(dense_dark_ui_soft_pass),
+            "light_structured_ui_soft_pass": bool(light_structured_ui_soft_pass),
             **ui_edge_metrics,
         },
     }
@@ -1212,13 +1491,15 @@ def _extract_chat_content(
     response: requests.Response,
     deadline: float | None = None,
     cancel_event: Any | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     _raise_if_text_cancelled(cancel_event)
     content_type = str(response.headers.get("content-type", "")).lower()
     if "text/event-stream" in content_type:
-        return _extract_sse_content(response, deadline=deadline, cancel_event=cancel_event)
+        return _extract_sse_content(response, deadline=deadline, cancel_event=cancel_event, metadata=metadata)
     data = response.json()
     _raise_if_text_cancelled(cancel_event)
+    _update_chat_metadata(data, metadata)
     return _extract_message_content(data)
 
 
@@ -1226,8 +1507,32 @@ def _extract_sse_content(
     response: requests.Response,
     deadline: float | None = None,
     cancel_event: Any | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     pieces: list[str] = []
+    details = metadata if metadata is not None else {}
+    details.update(stream=True, done_marker=False, malformed_sse_records=0)
+    event_lines: list[str] = []
+
+    def consume_event() -> bool:
+        data_text = "\n".join(event_lines).strip()
+        event_lines.clear()
+        if not data_text:
+            return False
+        if data_text == "[DONE]":
+            details["done_marker"] = True
+            return True
+        try:
+            chunk = json.loads(data_text)
+        except json.JSONDecodeError:
+            details["malformed_sse_records"] += 1
+            return False
+        _update_chat_metadata(chunk, details)
+        piece = _extract_message_content(chunk, allow_delta=True)
+        if piece:
+            pieces.append(piece)
+        return False
+
     for raw_line in response.iter_lines(decode_unicode=False):
         _raise_if_text_cancelled(cancel_event)
         if deadline is not None and time.perf_counter() > deadline:
@@ -1237,21 +1542,66 @@ def _extract_sse_content(
         else:
             line = str(raw_line or "").strip()
         if not line:
+            if consume_event():
+                break
             continue
         if line.startswith("data:"):
             data_text = line[5:].strip()
-            if not data_text or data_text == "[DONE]":
-                if data_text == "[DONE]":
+            # Some compatible gateways omit the blank separator between
+            # complete JSON events. Accept those, while retaining support for
+            # a JSON event split over multiple data lines.
+            if event_lines:
+                try:
+                    json.loads("\n".join(event_lines))
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if consume_event():
+                        break
+            if data_text == "[DONE]":
+                if event_lines:
+                    consume_event()
+                event_lines.append(data_text)
+                if consume_event():
                     break
-                continue
-            try:
-                chunk = json.loads(data_text)
-            except json.JSONDecodeError:
-                continue
-            piece = _extract_message_content(chunk, allow_delta=True)
-            if piece:
-                pieces.append(piece)
+            else:
+                event_lines.append(data_text)
+    if event_lines:
+        consume_event()
+    _raise_if_text_cancelled(cancel_event)
     return "".join(pieces)
+
+
+def _update_chat_metadata(data: Any, metadata: dict[str, Any] | None) -> None:
+    if not isinstance(data, dict):
+        return
+    if data.get("error"):
+        raise TextResponseError("LLM 响应包含上游错误事件", TextErrorCategory.GATEWAY)
+    if metadata is None:
+        return
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        reason = choices[0].get("finish_reason")
+        if reason:
+            # Do not copy arbitrary upstream strings or content into traces.
+            metadata["finish_reason"] = reason if reason in {"stop", "length", "content_filter", "tool_calls", "function_call"} else "other"
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        metadata["usage"] = {
+            key: value for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+            if isinstance(value := usage.get(key), int) and value >= 0
+        }
+
+
+def _validate_chat_completion(metadata: dict[str, Any]) -> None:
+    if metadata.get("stream") and (
+        metadata.get("malformed_sse_records")
+        or not (metadata.get("done_marker") or metadata.get("finish_reason"))
+    ):
+        raise TextResponseError("LLM 流式响应不完整或存在损坏事件", TextErrorCategory.CONNECTION)
+    reason = metadata.get("finish_reason")
+    if reason in {"length", "content_filter", "tool_calls", "function_call", "other"}:
+        raise TextResponseError(f"LLM JSON/text 响应未正常完成（finish_reason={reason}）", TextErrorCategory.FORMAT)
 
 
 def _extract_message_content(data: Any, allow_delta: bool = False) -> str:

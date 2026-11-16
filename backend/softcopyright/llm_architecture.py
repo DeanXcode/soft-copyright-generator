@@ -16,6 +16,7 @@ from .architecture import (
 from .blueprint import ProductBlueprint
 from .llm.provider import LLMProvider, LocalTemplateProvider, TextProviderError, TextRetryPolicy
 from .llm.trace import trace_event
+from .llm.json_response import parse_json_object
 from .models import GenerationTask
 
 
@@ -195,9 +196,9 @@ def _chat_json(
                 content_chars=len(content or ""),
             )
             return data
-        except TextProviderError:
-            raise
         except Exception as exc:
+            if isinstance(exc, TextProviderError) and exc.category.value != "format_error":
+                raise
             last_error = exc
             trace_event(
                 "chat_json_error",
@@ -222,18 +223,7 @@ def _chat_json(
 
 
 def _parse_json(content: str) -> dict[str, Any]:
-    cleaned = content.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
-        cleaned = re.sub(r"```$", "", cleaned).strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start >= 0 and end > start:
-        cleaned = cleaned[start : end + 1]
-    data = json.loads(cleaned)
-    if not isinstance(data, dict):
-        raise ValueError("技术架构响应不是 JSON 对象")
-    return data
+    return parse_json_object(content, label="architecture")
 
 
 def _clean_text(value: str, limit: int) -> str:

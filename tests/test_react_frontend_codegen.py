@@ -1,15 +1,21 @@
 import json
+import base64
 from functools import partial
 from http.server import SimpleHTTPRequestHandler
 from pathlib import Path
 import re
 from tempfile import TemporaryDirectory
 import threading
+from types import SimpleNamespace
 from unittest.mock import patch
 import unittest
 
 from backend.softcopyright.ai_frontend_codegen import (
+    MODEL_GENERATED_REACT_VERSION,
     _build_react_vite_bundle,
+    _frontend_page_cache_ready,
+    _page_spec_renderer_migration_ready,
+    _model_react_composition_contract,
     _react_codegen_worker_setting,
     _runtime_guard_style,
     _sanitize_cached_react_component,
@@ -21,10 +27,17 @@ from backend.softcopyright.ai_frontend_codegen import (
     _scope_react_css,
     _sanitize_react_visible_terms,
     _shared_confirm_dialog_css,
+    _shared_app_shell_source,
+    _style_reference_prompt_text,
+    _validate_model_navigation_markup,
     generate_ai_frontend_pages,
 )
 from backend.softcopyright.blueprint import FeatureModule, ProductBlueprint
-from backend.softcopyright.generator import _ui_placeholder_hits, _ui_screenshot_html_quality
+from backend.softcopyright.generator import (
+    _ui_placeholder_hits,
+    _ui_screenshot_html_quality,
+    _ui_screenshot_placeholder_details,
+)
 from backend.softcopyright.llm.provider import (
     LLMConfig,
     OpenAICompatibleProvider,
@@ -119,6 +132,48 @@ class _ReactProvider:
             )
         scope = re.search(r'className="screen-root ([^"]+)"', prompt).group(1)
         creative_key = re.search(r'data-page-structure="([^"]+)"', prompt).group(1)
+        if "横屏桌面设计文件浏览器" in prompt:
+            rows = "".join(
+                f'<button className="design-file-row" data-navigation-secondary-item="file-{index}" data-navigation-page-key="design_resources"><span>◇</span><b>设计文件 {index}</b><small>刚刚更新</small></button>'
+                for index in range(1, 9)
+            )
+            jsx = (
+                f'<div className="screen-root {scope} generated-design-browser" data-page-structure="{creative_key}">'
+                '<header className="browser-tabs"><button data-navigation-primary-item="dashboard" data-navigation-page-key="dashboard">☰</button><div className="active-tab" data-navigation-primary-item="design_resources" data-navigation-page-key="design_resources"><b>Figma浏览器</b><span>×</span></div><button data-navigation-primary-item="statistics" data-navigation-page-key="statistics">+</button></header>'
+                '<nav className="browser-toolbar"><button data-navigation-back-target="dashboard">←</button><button data-navigation-breadcrumb-item="software" data-navigation-page-key="dashboard">团队</button><button data-navigation-breadcrumb-item="project" data-navigation-page-key="design_resources">项目</button><label><span>⌕</span><input placeholder="搜索设计资源" /></label><button>⋯</button></nav>'
+                '<main className="design-browser-workspace"><aside className="design-file-tree"><h2>团队资源</h2>'
+                f'{rows}</aside><section className="design-canvas"><header><h1>设计资源导航</h1><button>打开设计文件</button></header>'
+                '<div className="canvas-board"><article><i></i><strong>会员中心</strong><span>1280 × 720</span></article>'
+                '<article><i></i><strong>订单工作台</strong><span>1440 × 900</span></article></div><footer>画布 · 100%</footer></section>'
+                '<aside className="design-inspector"><nav><b>设计</b><span>原型</span><span>检查</span></nav>'
+                '<section className="runtime-record-panel"><h2>属性</h2><p>文件状态 <strong>可评审</strong></p><p>待处理评论 <strong>3</strong></p></section></aside></main></div>'
+            )
+            css = (
+                f'.{scope}{{height:100%;display:grid;grid-template-rows:36px 42px minmax(0,1fr);background:#e7e8ea;color:#25272b;overflow:hidden;}}'
+                f'.{scope} *{{box-sizing:border-box;min-width:0;}}.{scope} button,.{scope} input{{font:inherit;}}'
+                f'.{scope} .browser-tabs{{display:grid;grid-template-columns:38px minmax(180px,260px) 38px;align-items:center;background:#e8eaed;border-bottom:1px solid #d1d4d8;}}'
+                f'.{scope} .browser-tabs button,.{scope} .browser-toolbar button{{height:100%;border:0;background:transparent;}}'
+                f'.{scope} .active-tab{{height:31px;margin-top:5px;padding:0 10px;display:flex;align-items:center;justify-content:space-between;border-radius:6px 6px 0 0;background:#fff;font-size:11px;overflow:hidden;}}'
+                f'.{scope} .browser-toolbar{{display:grid;grid-template-columns:34px 34px 34px minmax(0,1fr) 34px;gap:2px;padding:5px 8px;background:#fff;border-bottom:1px solid #d7d9dc;}}'
+                f'.{scope} .browser-toolbar label{{display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;border-radius:6px;background:#f1f3f4;overflow:hidden;}}.{scope} .browser-toolbar input{{height:30px;border:0;background:transparent;}}'
+                f'.{scope} .design-browser-workspace{{min-height:0;display:grid;grid-template-columns:210px minmax(0,1fr) 238px;overflow:hidden;}}'
+                f'.{scope} .design-file-tree,.{scope} .design-inspector{{padding:12px;background:#fff;overflow:hidden auto;}}.{scope} .design-file-tree{{border-right:1px solid #d5d7da;}}.{scope} .design-inspector{{border-left:1px solid #d5d7da;}}'
+                f'.{scope} .design-file-tree h2,.{scope} .design-inspector h2{{font-size:12px;}}.{scope} .design-file-row{{width:100%;padding:8px;display:grid;grid-template-columns:18px minmax(0,1fr);border:0;border-radius:4px;background:transparent;text-align:left;}}'
+                f'.{scope} .design-file-row small{{grid-column:2;color:#777;font-size:9px;}}.{scope} .design-canvas{{min-height:0;display:grid;grid-template-rows:48px minmax(0,1fr) 30px;overflow:hidden;}}'
+                f'.{scope} .design-canvas>header{{padding:0 14px;display:flex;align-items:center;justify-content:space-between;background:#fff;}}.{scope} .design-canvas h1{{font-size:13px;overflow-wrap:anywhere;}}'
+                f'.{scope} .canvas-board{{padding:28px;display:grid;grid-template-columns:1fr 1fr;gap:26px;overflow:auto;}}.{scope} .canvas-board article{{min-height:180px;padding:12px;display:grid;grid-template-rows:1fr auto auto;background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.14);}}'
+                f'.{scope} .canvas-board i{{background:#e9f2ff;}}.{scope} .design-canvas footer{{padding:7px 12px;background:#fff;text-align:right;font-size:9px;}}.{scope} .design-inspector nav{{display:flex;gap:18px;border-bottom:1px solid #ddd;padding-bottom:10px;font-size:10px;}}'
+                f'.{scope} .runtime-record-panel p{{display:flex;justify-content:space-between;gap:8px;font-size:10px;overflow-wrap:anywhere;}}'
+            )
+            return json.dumps(
+                {
+                    "jsx": jsx,
+                    "css": css,
+                    "composition_family": "design-browser",
+                    "composition_variant": "file-tree-canvas-inspector",
+                },
+                ensure_ascii=False,
+            )
         cards = "".join(
             f'<article className="work-card card-{index}"><strong>巡检任务 {index}</strong><span>设备状态正常</span><button>查看记录</button></article>'
             for index in range(1, 9)
@@ -158,6 +213,52 @@ class _ReactProvider:
 
 
 class ReactVisibleTermSanitizerTests(unittest.TestCase):
+    def test_old_pagespec_cache_is_renderer_migratable_without_being_current(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            component_path = root / "Screen.jsx"
+            css_path = root / "Screen.css"
+            spec_path = root / "Screen.page-spec.json"
+            meta_path = root / "Screen.meta.json"
+            creative_key = "cached-creative-key"
+            component_path.write_text("x" * 1000, encoding="utf-8")
+            css_path.write_text("x" * 600, encoding="utf-8")
+            spec_path.write_text(
+                json.dumps({"schema_version": "page-spec-v1", "page_key": "screen"}),
+                encoding="utf-8",
+            )
+            meta_path.write_text(
+                json.dumps(
+                    {
+                        "creative_key": creative_key,
+                        "page_key": "screen",
+                        "engine": "page-spec-v1",
+                        "cache_key": "old-renderer-cache-key",
+                        "page_spec_schema_version": "page-spec-v1",
+                        "component_library_version": "page-components-v1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertFalse(
+                _frontend_page_cache_ready(
+                    component_path=component_path,
+                    css_path=css_path,
+                    spec_path=spec_path,
+                    meta_path=meta_path,
+                    creative_key=creative_key,
+                    legacy=False,
+                )
+            )
+            self.assertTrue(
+                _page_spec_renderer_migration_ready(
+                    spec_path=spec_path,
+                    meta_path=meta_path,
+                    creative_key=creative_key,
+                )
+            )
+
     def test_frontend_worker_setting_defaults_to_auto_two_and_keeps_legacy_numbers(self):
         with patch.dict("os.environ", {}, clear=False):
             with patch("os.getenv", return_value="auto"):
@@ -254,6 +355,28 @@ class UiVisibleLeakDetectionTests(unittest.TestCase):
 
         self.assertEqual(hits, [])
         self.assertNotIn("内部角色标识", _ui_placeholder_hits("成果文件 texture_manifest.json 已校验"))
+
+    def test_legitimate_business_record_reference_is_not_a_generic_record_name(self):
+        text = "记录撤销前后状态、影响门禁点、阻断生效时间、操作主体和关联业务记录"
+
+        self.assertNotIn("泛化记录名", _ui_placeholder_hits(text))
+
+    def test_generic_record_name_reports_page_and_matched_text(self):
+        item = UiScreenshot(
+            key="generic-record",
+            title="记录列表",
+            caption="记录列表",
+            html_path="",
+            visible_content_summary={"visible_text": "当前对象 业务记录1 待处理"},
+        )
+        with TemporaryDirectory() as temp_dir:
+            html_path = Path(temp_dir) / "generic-record.html"
+            html_path.write_text("<main>当前对象 业务记录1 待处理</main>", encoding="utf-8")
+            item.html_path = str(html_path)
+            details = _ui_screenshot_placeholder_details({item.key: item})
+
+        self.assertIn("泛化记录名", _ui_placeholder_hits("业务记录1"))
+        self.assertIn("generic-record:泛化记录名:业务记录1", details)
 
 
 def _mock_provider_chat(operation, kwargs):
@@ -381,6 +504,240 @@ class _StreamingSession:
 
 
 class ReactFrontendCodegenTests(unittest.TestCase):
+    def test_model_generated_react_has_independent_cache_and_composition_contract(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            component_path = root / "Screen.jsx"
+            css_path = root / "Screen.css"
+            spec_path = root / "Screen.page-spec.json"
+            meta_path = root / "Screen.meta.json"
+            component_path.write_text("x" * 1000, encoding="utf-8")
+            css_path.write_text("x" * 600, encoding="utf-8")
+            spec_path.write_text(json.dumps({"schema_version": "page-spec-v1", "page_key": "screen"}), encoding="utf-8")
+            meta_path.write_text(
+                json.dumps({"creative_key": "same-key", "page_key": "screen", "engine": "page-spec-v1"}),
+                encoding="utf-8",
+            )
+
+            self.assertFalse(
+                _frontend_page_cache_ready(
+                    component_path=component_path,
+                    css_path=css_path,
+                    spec_path=spec_path,
+                    meta_path=meta_path,
+                    creative_key="same-key",
+                    legacy=True,
+                    react_engine=MODEL_GENERATED_REACT_VERSION,
+                )
+            )
+
+        first = _model_react_composition_contract(
+            {"composition_family": "design-browser", "composition_variant": "file-grid"},
+            screenshot=SimpleNamespace(page_kind="module", interaction_surface="workspace", interaction_mode="browse"),
+            creative_key="page-a",
+        )
+        second = _model_react_composition_contract(
+            {"composition_family": "design-browser", "composition_variant": "canvas-review"},
+            screenshot=SimpleNamespace(page_kind="operation", interaction_surface="canvas", interaction_mode="workflow"),
+            creative_key="page-b",
+        )
+        self.assertEqual(first["version"], "model-react-composition-v1")
+        self.assertNotEqual(first["variant"], second["variant"])
+        self.assertNotEqual(first["signature"], second["signature"])
+
+    def test_model_generated_navigation_requires_visible_contract_nodes(self):
+        contract = {
+            "primary_items": [{"key": "a"}, {"key": "b"}],
+            "secondary_items": [{"key": "c"}, {"key": "d"}],
+            "breadcrumb": [{"key": "home"}, {"key": "current"}],
+            "back_target": {"page_key": "home"},
+        }
+        incomplete = '<div data-navigation-primary-item="a"></div>'
+        with self.assertRaisesRegex(ValueError, "导航契约节点"):
+            _validate_model_navigation_markup(incomplete, contract)
+
+    def test_shared_shell_has_design_viewer_browser_chrome(self):
+        source = _shared_app_shell_source()
+
+        self.assertIn('if (config?.industry_subtype_key === "design_viewer") return <div className="model-react-contract"', source)
+        self.assertIn("data-navigation-contract", source)
+        self.assertNotIn('data-browser-workspace="true"', source)
+        self.assertNotIn("shared-browser-tabs", source)
+
+    def test_design_viewer_image2_prompt_requires_desktop_browser_workspace(self):
+        task = GenerationTask(
+            software_name="Figma浏览器",
+            product_type="APP",
+            feature_hint="设计文件、页面画板、图层组件和设计评审",
+            seed="figma-image2-desktop",
+        )
+        module = SimpleNamespace(
+            title="设计资源导航",
+            description="浏览设计文件和页面画板",
+            operations=["打开设计文件", "查询访问状态"],
+            data_fields=["文件名称", "访问状态"],
+        )
+        blueprint = SimpleNamespace(
+            business_objects=["设计文件", "页面画板", "图层组件"],
+            report_metrics=["可访问文件数"],
+        )
+        ui_blueprint = SimpleNamespace(renderer="admin")
+        design_brief = {
+            "industry_subtype_key": "design_viewer",
+            "product_experience_spec": {"terminal": "桌面设计资源工作区"},
+        }
+        prompt = _style_reference_prompt_text(
+            {"layout_brief": "桌面设计资源工作区", "visual_prompt": "紧凑专业", "visual_tokens": ["文件树", "画布"]},
+            task=task,
+            blueprint=blueprint,
+            ui_blueprint=ui_blueprint,
+            screenshot=SimpleNamespace(title="设计资源导航", key="design_resources"),
+            module=module,
+            design_brief=design_brief,
+        )
+
+        self.assertIn("横向桌面设计文件浏览器", prompt)
+        self.assertIn("文档标签栏", prompt)
+        self.assertIn("资源路径/搜索栏", prompt)
+        self.assertIn("右侧属性评论版本检查器", prompt)
+        self.assertIn("禁止手机底部导航", prompt)
+        self.assertNotIn("浏览器地址栏、代码窗口", prompt)
+
+    def test_design_viewer_build_renders_browser_workspace_without_overflow(self):
+        temp_root = Path("tmp")
+        temp_root.mkdir(exist_ok=True)
+        with patch.dict("os.environ", {"SOFT_AI_FRONTEND_MODE": "react-vite"}), TemporaryDirectory(dir=temp_root) as temporary_directory:
+            root = Path(temporary_directory)
+            task = GenerationTask(
+                software_name="Figma浏览器",
+                product_type="APP",
+                feature_hint="设计文件、页面画板、图层组件、原型演示和设计评审",
+                seed="figma-browser-workspace",
+            )
+            module = FeatureModule(
+                key="design_resources",
+                title="设计资源导航",
+                description="浏览团队项目、设计文件、页面画板和图层组件。",
+                entities=["设计文件", "页面画板", "图层组件"],
+                operations=["查询文件访问状态", "打开设计文件", "切换文件版本"],
+                data_fields=["文件名称", "所属项目", "更新时间", "访问状态"],
+                pages=["移动端设计系统升级", "会员中心设计评审", "订单履约工作台"],
+            )
+            blueprint = ProductBlueprint(
+                software_name=task.software_name,
+                version=task.version,
+                language="JavaScript",
+                product_type=task.product_type,
+                industry="设计协作",
+                purpose="支持设计资源浏览与评审。",
+                summary="桌面设计文件浏览与协作评审工作台。",
+                modules=[module],
+                roles=["UI/UX设计师"],
+                pages=["设计资源导航"],
+                dev_environment={},
+                runtime_environment={},
+                report_metrics=["可访问文件数"],
+                industry_subtype_key="design_viewer",
+            )
+            ui_blueprint = UiBlueprint(
+                renderer="admin",
+                visual_style="桌面设计资源浏览器",
+                source="llm",
+                screens=[UiScreenBlueprint("design_resources", "设计资源导航", "浏览设计文件", "admin_table")],
+                design_brief={
+                    "industry_subtype_key": "design_viewer",
+                    "visual_identity_spec": {
+                        "identity_signature": "figma-browser-workspace",
+                        "nav_model": "top_tabs",
+                        "workspace_shape": "design_viewer",
+                    },
+                },
+            )
+            screenshots = [
+                UiScreenshot(
+                    "design_resources",
+                    "Figma文件接入-查询名称非常长的文件访问状态",
+                    "浏览设计文件",
+                    str(root / "design_resources.html"),
+                    page_kind="module",
+                    module_key="design_resources",
+                )
+            ]
+            reference_path = root / "style_reference.png"
+            reference_path.write_bytes(
+                base64.b64decode(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+                )
+            )
+            provider = _ReactProvider()
+            report = generate_ai_frontend_pages(
+                task=task,
+                blueprint=blueprint,
+                ui_blueprint=ui_blueprint,
+                screenshots=screenshots,
+                provider=provider,
+                require_llm=True,
+                visual_reference_report={
+                    "ready": True,
+                    "style_reference": {"ready": True, "image_path": str(reference_path)},
+                },
+            )
+            self.assertTrue(report["ready"])
+            self.assertEqual(report["frontend_generation_mode"], "model-generated-react")
+            self.assertEqual(report["model_generated_react_page_count"], 1)
+            self.assertEqual(report["page_spec_count"], 0)
+            self.assertEqual(report["legacy_react_page_count"], 0)
+            self.assertEqual(report["pages"][0]["engine"], MODEL_GENERATED_REACT_VERSION)
+            self.assertEqual(report["pages"][0]["composition_contract"]["family"], "design-browser")
+            self.assertEqual(report["pages"][0]["composition_contract"]["variant"], "file-tree-canvas-inspector")
+            self.assertEqual(report["source"], "gpt-image2-to-model-generated-react-vite")
+            frontend_engine = json.loads((root / "react-app" / ".frontend-engine.json").read_text(encoding="utf-8"))
+            self.assertEqual(frontend_engine["frontend_generation_mode"], "model-generated-react")
+            self.assertEqual(frontend_engine["react_engine_version"], MODEL_GENERATED_REACT_VERSION)
+            self.assertEqual(frontend_engine["page_spec_schema_version"], "")
+            self.assertEqual(len(list((root / "react-app" / "src" / "screens").glob("*.page-spec.json"))), 0)
+            self.assertEqual(len(provider.messages), 1)
+            model_content = provider.messages[0][-1]["content"]
+            self.assertIsInstance(model_content, list)
+            self.assertEqual(model_content[0]["type"], "text")
+            self.assertEqual(model_content[1]["type"], "image_url")
+            self.assertTrue(model_content[1]["image_url"]["url"].startswith("data:image/"))
+            handler = partial(_QuietHandler, directory=str(root))
+            server = create_safe_threading_http_server("127.0.0.1", handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                from playwright.sync_api import sync_playwright
+
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.launch(headless=True)
+                    page = browser.new_page(viewport={"width": 1360, "height": 820})
+                    errors = []
+                    page.on("pageerror", lambda error: errors.append(str(error)))
+                    page.goto(f"http://127.0.0.1:{server.server_port}/design_resources.html", wait_until="networkidle")
+                    self.assertEqual(page.locator(".generated-design-browser:visible").count(), 1, errors)
+                    self.assertTrue(page.locator(".browser-tabs").is_visible())
+                    self.assertTrue(page.locator(".browser-toolbar").is_visible())
+                    self.assertTrue(page.locator(".design-file-tree").is_visible())
+                    self.assertTrue(page.locator(".design-canvas").is_visible())
+                    self.assertTrue(page.locator(".design-inspector").is_visible())
+                    self.assertEqual(page.locator('[data-navigation-contract="navigation-contract-v1"]').count(), 1)
+                    self.assertGreaterEqual(page.locator("[data-navigation-primary-item]:visible").count(), 2)
+                    self.assertGreaterEqual(page.locator("[data-navigation-secondary-item]:visible").count(), 2)
+                    self.assertGreaterEqual(page.locator("[data-navigation-breadcrumb-item]:visible").count(), 2)
+                    self.assertEqual(page.locator(".shared-app-mobile-nav:visible").count(), 0)
+                    body_text = page.locator("body").inner_text()
+                    for decorative in ("模块工作台", "业务操作", "较上一周期保持稳定", "按计划完成现场处理"):
+                        self.assertNotIn(decorative, body_text)
+                    self.assertEqual(
+                        page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth"),
+                        True,
+                    )
+                    browser.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_react_page_css_selectors_are_fully_scoped_and_idempotent(self):
         source = """.screen-page{display:grid}.metric-card,.table td{color:#123}
         @media(max-width:900px){.metric-card{font-size:12px}}
@@ -595,7 +952,9 @@ class ReactFrontendCodegenTests(unittest.TestCase):
             self.assertLessEqual(len(provider.page_calls), 2)
             self.assertTrue(all(count <= 3 for count in provider.page_calls.values()))
             stats = getattr(raised.exception, "frontend_stats")
-            self.assertEqual(stats["frontend_effective_workers"], 2)
+            # An immediate failure may stop submission before worker two is
+            # scheduled. This metric records observed, not configured, work.
+            self.assertIn(stats["frontend_effective_workers"], (1, 2))
             self.assertTrue(stats["frontend_concurrency_degraded"])
             self.assertEqual(stats["frontend_concurrency_degrade_reason"], "gateway_error")
             self.assertGreaterEqual(stats["frontend_cancelled_page_count"], 4)
@@ -818,12 +1177,28 @@ class ReactFrontendCodegenTests(unittest.TestCase):
             self.assertIn("SharedAppShell", app_source)
             self.assertIn("SharedConfirmDialog", app_source)
             self.assertIn('data-shared-confirmation-contract="v1"', app_source)
+            self.assertIn('"navigation_contract"', app_source)
+            self.assertIn('"schema_version": "navigation-contract-v1"', app_source)
             self.assertIn("任务首页", app_source)
             self.assertIn("现场巡检任务", app_source)
             self.assertIn('"nav_model": "top_tabs"', app_source)
             self.assertEqual(report["shared_confirmation_contract"], "shared-confirm-dialog-v1")
             self.assertEqual(report["shared_confirmation_page_count"], 1)
             self.assertTrue(report["shared_confirmation_ready"])
+            self.assertEqual(report["navigation_contract_version"], "navigation-contract-v1")
+            self.assertEqual(report["navigation_contract_count"], 3)
+            self.assertTrue(report["navigation_contract_ready"])
+            shell_source = (root / "react-app" / "src" / "SharedAppShell.jsx").read_text(encoding="utf-8")
+            self.assertIn("data-navigation-contract", shell_source)
+            self.assertIn("data-navigation-secondary-item", shell_source)
+            self.assertIn("data-navigation-back-target", shell_source)
+            self.assertIn("navigateToPage", shell_source)
+            self.assertIn("config?.page_files?.[pageKey]", shell_source)
+            self.assertIn("window.location.assign(target)", shell_source)
+            self.assertIn('"page_files":', app_source)
+            theme_source = (root / "react-app" / "src" / "theme.css").read_text(encoding="utf-8")
+            self.assertIn("grid-template-columns:minmax(260px,340px) minmax(0,1fr) minmax(160px,220px)", theme_source)
+            self.assertIn(".shared-app-context em{display:none}", theme_source)
             self.assertTrue((root / "assets" / "app.js").exists())
             self.assertIn("soft-react-screen", (root / "home.html").read_text(encoding="utf-8"))
             self.assertIn('data-renderer="mobile_app"', (root / "home.html").read_text(encoding="utf-8"))

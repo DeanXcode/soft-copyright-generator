@@ -1,0 +1,170 @@
+{
+  "tested_at": "2026-11-12T10:26:59.508837+08:00",
+  "requests": [
+    {
+      "label": "installed-key-check",
+      "model": "gpt-6-sol",
+      "max_tokens": 128,
+      "stream": false,
+      "key_configured": true,
+      "http_status": 200,
+      "content_type": "application/json",
+      "finish_reasons": [
+        "stop"
+      ],
+      "usage": {
+        "prompt_tokens": 4409,
+        "completion_tokens": 12,
+        "total_tokens": 4421
+      },
+      "content_chars": 11,
+      "raw_json_valid": true,
+      "product_parser_valid": true,
+      "identity_required_fields_present": null,
+      "content_file": "installed-key-check-content.txt",
+      "elapsed_seconds": 4.47
+    },
+    {
+      "label": "repository-key-check",
+      "model": "gpt-5.5",
+      "max_tokens": 128,
+      "stream": false,
+      "key_configured": true,
+      "exception_type": "ConnectTimeout",
+      "elapsed_seconds": 15.05
+    },
+    {
+      "label": "installed-image-models-auth",
+      "model": "gpt-image-2",
+      "http_status": 200,
+      "image_model_listed": true,
+      "elapsed_seconds": 0.45
+    },
+    {
+      "label": "installed-image-models-noauth",
+      "model": "gpt-image-2",
+      "http_status": 401,
+      "elapsed_seconds": 0.75
+    },
+    {
+      "label": "installed-identity-1500-stream",
+      "model": "gpt-6-sol",
+      "max_tokens": 1500,
+      "stream": true,
+      "key_configured": true,
+      "http_status": 200,
+      "content_type": "text/event-stream",
+      "finish_reasons": [
+        "stop"
+      ],
+      "usage": {
+        "prompt_tokens": 6978,
+        "completion_tokens": 993,
+        "total_tokens": 7971,
+        "prompt_tokens_details": {
+          "cached_tokens": 5376
+        }
+      },
+      "done_marker": true,
+      "malformed_sse_records": 0,
+      "content_chars": 1912,
+      "raw_json_valid": false,
+      "raw_json_error": "Expecting property name enclosed in double quotes: line 73 column 3 (char 1912)",
+      "product_parser_valid": false,
+      "product_parser_error": "Expecting ',' delimiter: line 58 column 6 (char 1717)",
+      "content_file": "installed-identity-1500-stream-content.txt",
+      "elapsed_seconds": 11.25
+    },
+    {
+      "label": "installed-identity-4000-stream",
+      "model": "gpt-6-sol",
+      "max_tokens": 4000,
+      "stream": true,
+      "key_configured": true,
+      "http_status": 200,
+      "content_type": "text/event-stream",
+      "finish_reasons": [
+        "stop"
+      ],
+      "usage": {
+        "prompt_tokens": 6978,
+        "completion_tokens": 1070,
+        "total_tokens": 8048,
+        "prompt_tokens_details": {
+          "cached_tokens": 5376
+        }
+      },
+      "done_marker": true,
+      "malformed_sse_records": 0,
+      "content_chars": 2090,
+      "raw_json_valid": false,
+      "raw_json_error": "Expecting property name enclosed in double quotes: line 77 column 3 (char 2090)",
+      "product_parser_valid": false,
+      "product_parser_error": "Expecting ',' delimiter: line 62 column 6 (char 1904)",
+      "content_file": "installed-identity-4000-stream-content.txt",
+      "elapsed_seconds": 13.09
+    },
+    {
+      "label": "installed-exact-identity-1500-stream",
+      "model": "gpt-6-sol",
+      "max_tokens": 1500,
+      "stream": true,
+      "key_configured": true,
+      "http_status": 200,
+      "content_type": "text/event-stream",
+      "finish_reasons": [
+        "stop"
+      ],
+      "usage": {
+        "prompt_tokens": 6139,
+        "completion_tokens": 1634,
+        "total_tokens": 7773,
+        "completion_tokens_details": {
+          "reasoning_tokens": 107
+        }
+      },
+      "done_marker": true,
+      "malformed_sse_records": 0,
+      "content_chars": 2732,
+      "raw_json_valid": true,
+      "product_parser_valid": true,
+      "identity_required_fields_present": true,
+      "content_file": "installed-exact-identity-1500-stream-content.txt",
+      "elapsed_seconds": 61.06
+    },
+    {
+      "label": "installed-exact-identity-4000-nonstream",
+      "model": "gpt-6-sol",
+      "max_tokens": 4000,
+      "stream": false,
+      "key_configured": true,
+      "http_status": 200,
+      "content_type": "application/json",
+      "finish_reasons": [
+        "stop"
+      ],
+      "usage": {
+        "prompt_tokens": 6139,
+        "completion_tokens": 1632,
+        "total_tokens": 7771,
+        "prompt_tokens_details": {
+          "cached_tokens": 5376
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 101
+        }
+      },
+      "content_chars": 2700,
+      "raw_json_valid": true,
+      "product_parser_valid": true,
+      "identity_required_fields_present": true,
+      "content_file": "installed-exact-identity-4000-nonstream-content.txt",
+      "elapsed_seconds": 62.84
+    }
+  ],
+  "comparison": {
+    "same_text_key": false,
+    "same_text_endpoint": false
+  },
+  "complete": true
+}
